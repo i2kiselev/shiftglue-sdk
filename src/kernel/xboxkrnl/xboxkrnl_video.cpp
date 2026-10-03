@@ -25,6 +25,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
@@ -518,6 +519,7 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
+  perf::TraceCriticalPath("guest_swap", 0, int64_t(frontbuffer_physical_address));
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

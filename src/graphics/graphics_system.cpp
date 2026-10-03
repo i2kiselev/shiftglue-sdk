@@ -44,7 +44,7 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
 REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
-    .range(0, 240);
+    .range(0, 1000);
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
