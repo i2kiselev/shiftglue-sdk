@@ -608,6 +608,11 @@ void Window::OnMinimized(WindowDestructionReceiver& destruction_receiver) {
 }
 
 void Window::OnRestored(WindowDestructionReceiver& destruction_receiver) {
+  // A minimized window's surface has no area, so the presenter has left it,
+  // and a restore to the same size is not reported as a resize.
+  if (presenter_surface_) {
+    presenter_->OnSurfaceResizeFromUIThread();
+  }
   if (!CanSendEventsToListeners()) {
     return;
   }
