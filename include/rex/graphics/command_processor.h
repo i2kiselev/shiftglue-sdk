@@ -149,6 +149,10 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  // Logs the draws of the current frame as fh1_debug_log_draws does (the
+  // frame whose resolves are dumped on request).
+  void SetDebugLogDrawsFrame(bool enabled) { debug_log_draws_frame_ = enabled; }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -352,6 +356,7 @@ class CommandProcessor {
   std::atomic<uint32_t> draw_resolution_scale_{1};
   // The next draw's index in its frame (fh1_debug_skip_draws, fh1_debug_log_draws).
   uint32_t debug_frame_draw_index_ = 0;
+  bool debug_log_draws_frame_ = false;
   uint64_t observation_frame_sequence_ = 1;
   bool paused_ = false;
 

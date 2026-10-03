@@ -1891,7 +1891,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         return ranges;
       }();
       const uint32_t draw_index = debug_frame_draw_index_++;
-      if (REXCVAR_GET(fh1_debug_log_draws)) {
+      if (REXCVAR_GET(fh1_debug_log_draws) || debug_log_draws_frame_) {
         const RegisterFile& regs = *register_file_;
         std::string textures;
         if (active_pixel_shader_ && active_pixel_shader_->is_ucode_analyzed()) {

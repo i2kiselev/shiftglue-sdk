@@ -280,7 +280,7 @@ bool VulkanSharedMemory::UploadRanges(
                      (upload_page_ranges.back().first + upload_page_ranges.back().second -
                       upload_page_ranges.front().first)
                          << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_memory_upload");
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;

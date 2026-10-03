@@ -2058,8 +2058,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                                              uniform_fetch_constants_,
                                                              id_vector_temp_),
                                  spv::NoPrecision));
+        // Word 1 of the uploaded constant (format and address on the guest,
+        // which no texture fetch reads) holds the host's scale for the
+        // texture's number format: 1, or the component range for the integer
+        // format, since the host samples fixed-point textures as normalized.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 1) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 1) & 3)));
+        spv::Id number_format_scale = builder_->createUnaryOp(
+            spv::OpBitcast, type_float_,
+            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                             uniform_fetch_constants_,
+                                                             id_vector_temp_),
+                                 spv::NoPrecision));
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
-            type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+            type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, number_format_scale,
             builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {

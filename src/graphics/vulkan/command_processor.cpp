@@ -3457,16 +3457,20 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   return true;
 }
 
-bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass, const char* cause) {
   assert_true(submission_open_);
   SplitPendingBarrier();
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
-      EndRenderPass();
+      EndRenderPass(cause);
     }
     return false;
   }
-  EndRenderPass();
+  if (!cause) {
+    cause = pending_barriers_image_memory_barriers_.empty() ? "end_buffer_barrier"
+                                                            : "end_image_barrier";
+  }
+  EndRenderPass(cause);
   barrier_batch_count_ += pending_barriers_.size();
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
@@ -3666,7 +3670,7 @@ void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
   if (in_render_pass_ && current_fh1_rendering_id_ == id) {
     return;
   }
-  EndRenderPass();
+  EndRenderPass("end_next_rendering");
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   ++rendering_begin_count_;
   current_render_pass_ = VK_NULL_HANDLE;
@@ -3744,11 +3748,16 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
   }
 }
 
-void VulkanCommandProcessor::EndRenderPass() {
+void VulkanCommandProcessor::EndRenderPass(const char* cause) {
   assert_true(submission_open_);
+  // Draw scopes have bit 63 clear; transfer and clear scopes set it.
+  const bool draw_rendering = int64_t(current_fh1_rendering_id_) > 0;
   current_fh1_rendering_id_ = 0;
   if (!in_render_pass_) {
     return;
+  }
+  if (draw_rendering && fh1_native_executor_) {
+    fh1_native_executor_->CountRenderingEnd(cause ? cause : "end_other");
   }
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
@@ -4797,7 +4806,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
 
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-      SubmitBarriers(true);
+      SubmitBarriers(true, "end_index_copy");
 
       VkBufferCopy guest_dma_index_copy_region = {};
       guest_dma_index_copy_region.srcOffset = primitive_processing_result.guest_index_base;
@@ -5595,7 +5604,7 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
     return false;
   }
 
-  EndRenderPass();
+  EndRenderPass("end_query");
 
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   command_buffer.CmdVkResetQueryPool(occlusion_query_pool_, host_index, 1);
@@ -5620,7 +5629,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
     return false;
   }
 
-  EndRenderPass();
+  EndRenderPass("end_query");
 
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   command_buffer.CmdVkEndQuery(occlusion_query_pool_, host_index);
@@ -7450,6 +7459,35 @@ void GatherFloatConstants(uint8_t* out, const uint64_t (&bitmap)[4], const uint3
   }
 }
 
+// What a shader multiplies a fetch from this constant by: the host samples
+// fixed-point textures as normalized, so the integer number format needs the
+// component range back. Exactly: a variance shadow map read through the
+// integer format turns a 2^15 for 32767 into visible error.
+float HostFetchNumberFormatScale(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  if (!fetch.num_format) {
+    return 1.0f;
+  }
+  uint32_t bits;
+  switch (fetch.format) {
+    case xenos::TextureFormat::k_8:
+    case xenos::TextureFormat::k_8_8:
+    case xenos::TextureFormat::k_8_8_8_8:
+      bits = 8;
+      break;
+    case xenos::TextureFormat::k_16:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_16_16:
+      bits = 16;
+      break;
+    default:
+      return 1.0f;
+  }
+  if (fetch.sign_x == xenos::TextureSign::kSigned) {
+    --bits;
+  }
+  return float((uint32_t(1) << bits) - 1);
+}
+
 }  // namespace
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
@@ -7606,6 +7644,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
+      // Word 1 of a texture fetch constant carries the number format scale to
+      // the shaders (SpirvShaderTranslator's texture fetch); vertex fetch
+      // constants, which share the registers, are left as they are.
+      for (uint32_t i = 0; i < xenos::kTextureFetchConstantCount; ++i) {
+        const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(i);
+        if (fetch.type == xenos::FetchConstantType::kVertex ||
+            fetch.type == xenos::FetchConstantType::kInvalidVertex) {
+          continue;
+        }
+        const float scale = HostFetchNumberFormatScale(fetch);
+        std::memcpy(mapping + sizeof(uint32_t) * (6 * i + 1), &scale, sizeof(scale));
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
     }

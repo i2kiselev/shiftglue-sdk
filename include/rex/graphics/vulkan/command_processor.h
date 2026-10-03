@@ -204,7 +204,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                               bool skip_if_equal = true);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
-  bool SubmitBarriers(bool force_end_render_pass);
+  // `cause` names what ends an executor draw rendering, for its stats.
+  bool SubmitBarriers(bool force_end_render_pass, const char* cause = nullptr);
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -255,7 +256,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
-  void EndRenderPass();
+  void EndRenderPass(const char* cause = nullptr);
 
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {

@@ -500,7 +500,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
           false);
     }
-    command_processor_.SubmitBarriers(true);
+    command_processor_.SubmitBarriers(true, "end_texture_load");
     DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
     VkClearColorValue null_image_clear_color = kInvalidTextureFetchFallbackColor;
     for (size_t i = 0; i < rex::countof(null_images); ++i) {
@@ -1650,7 +1650,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
       }
-      command_processor_.SubmitBarriers(true);
+      command_processor_.SubmitBarriers(true, "end_texture_load");
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
       command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTextureLoadEnd,
                                     texture_key.base_page);
@@ -1752,7 +1752,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                             sizeof(load_constants_float_convert.host_offset),
                                             &load_constants_float_convert.host_offset);
         }
-        command_processor_.SubmitBarriers(true);
+        command_processor_.SubmitBarriers(true, "end_texture_load");
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
@@ -1784,7 +1784,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_texture_load");
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       level_last - level_first + 1);

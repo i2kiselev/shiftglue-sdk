@@ -1103,7 +1103,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t 
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
       VK_ACCESS_SHADER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_executor");
   bool any_stencil = false;
   for (size_t i = first; i < end; ++i) any_stencil |= pending_transfers_[i].stencil;
   for (size_t i = first; i < end;) {
@@ -1629,6 +1629,10 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     height = SurfaceHeight(pitch_tiles, msaa) * scale_;
   }
   const uint64_t id = DrawRenderingId(bound_bits_);
+  // Why the draw begins a rendering: a transfer or clear scope came between,
+  // barriers ended the same targets' rendering, or the targets changed.
+  Count(!rendering_id_ ? "rendering_after_own_scope"
+                       : rendering_id_ == id ? "rendering_interrupted" : "rendering_new_targets");
   if (attachment_barriers_skipped_) {
     attachment_barriers_skipped_ = false;
     // Pending barriers (such as texture loads) end the rendering.
@@ -1762,7 +1766,7 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
   }
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   TransitionForSampling(surface, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_executor");
   VkDescriptorImageInfo images[2] = {
       {VK_NULL_HANDLE, surface.sampled_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
       {VK_NULL_HANDLE, surface.stencil_view ? surface.stencil_view : surface.sampled_view,
@@ -1831,10 +1835,23 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
   if (scale_ == 1 && written_length && IsOneOffResolve(written_address, written_length)) {
     QueueResolveReadback(written_address, written_length);
   }
-  if (written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty() &&
-      (!REXCVAR_GET(fh1_resolve_dump_frame) ||
-       frame_ == uint64_t(REXCVAR_GET(fh1_resolve_dump_frame)))) {
-    DumpResolveOutput(written_address, written_length);
+  if (written_length && !REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
+    const int32_t dump_frame = REXCVAR_GET(fh1_resolve_dump_frame);
+    if (dump_frame < 0 && dump_trigger_checked_frame_ != frame_) {
+      // A negative frame dumps the frame after a file named "trigger" appears
+      // in the directory, so a running game can be asked for one frame.
+      dump_trigger_checked_frame_ = frame_;
+      const auto trigger = std::filesystem::path(REXCVAR_GET(fh1_resolve_dump_dir)) / "trigger";
+      std::error_code error;
+      if (std::filesystem::remove(trigger, error)) {
+        dump_trigger_frame_ = frame_;
+        command_processor_.SetDebugLogDrawsFrame(true);
+      }
+    }
+    if (!dump_frame || frame_ == uint64_t(dump_frame) ||
+        (dump_frame < 0 && frame_ == dump_trigger_frame_)) {
+      DumpResolveOutput(written_address, written_length);
+    }
   }
   return true;
 }
@@ -1854,7 +1871,7 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
     return;
   }
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_executor");
   const VkBufferCopy region = {address, 0, length};
   command_processor_.deferred_command_buffer().CmdVkCopyBuffer(config_.memory->buffer(), buffer,
                                                                1, &region);
@@ -1879,10 +1896,12 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // As the D3D12 executor: the first frames of each run of resolves to a new,
-  // large range are read back (car thumbnails the game saves).
+  // large range are read back (car thumbnails the game saves). 64 KB takes in
+  // the 32x512 blurred asphalt strips FM4 renders at race load and compresses
+  // on the CPU for its road detail texture.
   constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
                      kNewFrames = 120;
-  constexpr uint32_t kMinLength = 256 * 1024;
+  constexpr uint32_t kMinLength = 64 * 1024;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
   if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
     if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
@@ -1903,7 +1922,7 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
     return Skip("resolve_readback_buffer");
   }
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);
-  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriers(true, "end_executor");
   const VkBufferCopy region = {address, 0, length};
   command_processor_.deferred_command_buffer().CmdVkCopyBuffer(config_.memory->buffer(),
                                                                readback.buffer, 1, &region);
@@ -1959,9 +1978,23 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   const auto& depth_info = plan.depth_info;
 
   if (plan.skip) {
+    if (reported_resolve_skips_.emplace(plan.kind, plan.skip).second) {
+      REXGPU_WARN("FH1 native executor (Vulkan): resolve {} skipped: {}", plan.kind, plan.skip);
+    }
     Skip(plan.skip);
     succeeded = false;
   } else if (plan.copy) {
+    if (REXCVAR_GET(fh1_native_gpu_profile)) {
+      const auto& dest = resolve_info.copy_dest_info;
+      const std::string detail = fmt::format(
+          "{} {}x{} number={} exp_bias={} endian={} swap={} pitch={} at {:08X}", plan.kind,
+          x1 - x0, y1 - y0, uint32_t(dest.copy_dest_number), int32_t(dest.copy_dest_exp_bias),
+          uint32_t(dest.copy_dest_endian), uint32_t(dest.copy_dest_swap), plan.dest_pitch,
+          resolve_info.copy_dest_extent_start);
+      if (reported_resolve_skips_.emplace(detail, "").second) {
+        REXGPU_INFO("FH1 native executor (Vulkan): resolve {}", detail);
+      }
+    }
     const uint32_t extent_start = resolve_info.copy_dest_extent_start;
     const uint32_t extent_length = resolve_info.copy_dest_extent_length;
     // The shader addresses guest memory from dest_base; the descriptor starts
@@ -2125,6 +2158,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
   GpuEndFrame();
   GpuDrain();
+  if (frame_ == dump_trigger_frame_) command_processor_.SetDebugLogDrawsFrame(false);
   frame_ = frame;
   if (frame % 600 == 0) LogStats(frame);
 }

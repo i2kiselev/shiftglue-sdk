@@ -78,6 +78,8 @@ class Fh1NativeExecutor {
   void FlushResolveReadbacks();
   void OnSwap(uint64_t frame);
   void LogStats(uint64_t frame);
+  // Counts what ended a draw rendering (a stat name).
+  void CountRenderingEnd(const char* cause) { Count(cause); }
   // Texture loads (untile and copy) timed with the GPU profile, split by
   // whether a resolve wrote the texture's memory.
   uint32_t BeginTextureLoadGpuTiming() { return GpuBegin(); }
@@ -368,6 +370,11 @@ class Fh1NativeExecutor {
   uint64_t resolves_ = 0;
   // Tile passes per source -> destination surface pair while profiling.
   std::map<std::string, uint64_t> transfer_volume_;
+  // Resolve kinds already reported as skipped, so each is logged once.
+  std::map<std::string, const char*> reported_resolve_skips_;
+  // fh1_resolve_dump_frame < 0: the frame a trigger file asked to dump.
+  uint64_t dump_trigger_checked_frame_ = UINT64_MAX;
+  uint64_t dump_trigger_frame_ = UINT64_MAX;
 };
 
 }  // namespace rex::graphics::vulkan
