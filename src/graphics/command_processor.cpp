@@ -1894,17 +1894,30 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
       if (REXCVAR_GET(fh1_debug_log_draws) || debug_log_draws_frame_) {
         const RegisterFile& regs = *register_file_;
         std::string textures;
-        if (active_pixel_shader_ && active_pixel_shader_->is_ucode_analyzed()) {
-          for (const auto& binding : active_pixel_shader_->texture_bindings()) {
+        // Each shader's textures (vertex shader's as vt) and its float
+        // constants 0-3 and 252-255 (vc, pc).
+        for (const Shader* shader : {active_pixel_shader_, active_vertex_shader_}) {
+          if (!shader || !shader->is_ucode_analyzed()) continue;
+          const bool is_vertex = shader->type() == xenos::ShaderType::kVertex;
+          for (const auto& binding : shader->texture_bindings()) {
             const auto fetch = regs.GetTextureFetch(binding.fetch_constant);
             const uint32_t* words =
                 &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
             textures += fmt::format(
-                " t{}={:08X}:{}x{}:f{}:e{}:type{}:[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-                binding.fetch_constant, fetch.base_address << 12, fetch.size_2d.width + 1,
-                fetch.size_2d.height + 1, uint32_t(fetch.format), uint32_t(fetch.exp_adjust),
-                uint32_t(fetch.type), words[0], words[1], words[2], words[3], words[4], words[5]);
+                " {}t{}={:08X}:{}x{}:f{}:e{}:type{}:[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                is_vertex ? "v" : "", binding.fetch_constant, fetch.base_address << 12,
+                fetch.size_2d.width + 1, fetch.size_2d.height + 1, uint32_t(fetch.format),
+                uint32_t(fetch.exp_adjust), uint32_t(fetch.type), words[0], words[1], words[2],
+                words[3], words[4], words[5]);
           }
+          textures += is_vertex ? " vc=[" : " pc=[";
+          for (uint32_t constant : {0u, 1u, 2u, 3u, 252u, 253u, 254u, 255u}) {
+            const float* value = reinterpret_cast<const float*>(
+                &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * ((is_vertex ? 0 : 256) + constant)]);
+            textures += fmt::format("{}c{}:{:g},{:g},{:g},{:g}", constant ? " " : "", constant,
+                                    value[0], value[1], value[2], value[3]);
+          }
+          textures += "]";
         }
         REXGPU_INFO(
             "FH1 debug draw {} mode={} prim={} indices={} vs={:016X} ps={:016X} color0={:08X} "
