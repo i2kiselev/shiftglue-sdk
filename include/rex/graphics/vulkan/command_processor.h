@@ -600,6 +600,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
+  // Takes the counts of ended queries whose submission has completed.
+  void CollectOcclusionQueryResults();
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
@@ -952,6 +954,16 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint8_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
   bool occlusion_query_resources_available_ = false;
+  // A query's count is read once its submission has completed rather than
+  // waited for: the report gets the count of the previous query that ended at
+  // the same report address (a frame earlier for a query issued every frame).
+  struct PendingOcclusionQuery {
+    uint32_t host_index;
+    uint32_t sample_count_address;
+    uint64_t submission;
+  };
+  std::vector<PendingOcclusionQuery> pending_occlusion_queries_;
+  std::unordered_map<uint32_t, uint64_t> occlusion_query_results_;
 
   static constexpr uint32_t kFrameTimingQueriesPerFrame = 2;
   VkQueryPool frame_timing_query_pool_ = VK_NULL_HANDLE;
@@ -968,6 +980,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
+    // The submission ended inside the guest's query, and the host query with
+    // it: this run's count is lost.
+    bool host_ended = false;
   } active_occlusion_query_;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
