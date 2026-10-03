@@ -189,6 +189,13 @@ class Fh1NativeExecutor {
                                 bool stencil_written);
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
+  // Whether a draw replaces its color targets (all channels, no blending), as
+  // the title's clears do.
+  bool DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const;
+  // Whether the draw may replace everything it covers in its targets, so that
+  // its rectangles are worth deriving and its claims are not reused.
+  bool MayOverwrite(const Fh1DrawInfo& draw, uint32_t used_bits) const;
+  bool ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t length);
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
                      uint32_t column_end, uint32_t row_end);
   void TransferTiles(Surface& dest, const TileRun& run);
@@ -321,6 +328,7 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
+  bool color_overwrite_claims_ = true;
   // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x
   // stored as 4x, 3 every guest sample in one host sample.
   static uint32_t HostSampleMode(const Surface& surface);

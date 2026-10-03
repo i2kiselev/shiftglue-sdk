@@ -1236,6 +1236,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   const uint32_t load_gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginTextureLoadGpuTiming() : UINT32_MAX;
   const bool loaded = LoadTextureDataFromResidentMemoryUntimed(texture, load_base, load_mips);
+  if (command_processor_.debug_log_draws_frame()) {
+    const TextureKey key = texture.key();
+    REXGPU_INFO("FH1 debug texture load {:08X} {}x{} format={} scaled={} resolve_sourced={} "
+                "base={} mips={}",
+                key.base_page << 12, key.GetWidth(), key.GetHeight(), uint32_t(key.format),
+                bool(key.scaled_resolve), loading_resolve_sourced(), load_base, load_mips);
+  }
   if (gpu_profile_executor) {
     gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
   }

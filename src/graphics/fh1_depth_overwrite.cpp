@@ -26,11 +26,14 @@ void Fh1DepthOverwrite::PositionSink::Export(ucode::ExportRegister export_regist
 }
 
 bool Fh1DepthOverwrite::Derive(const Fh1DrawInfo& draw, bool half_pixel_offset,
-                               bool& stencil_overwritten) {
+                               bool& stencil_overwritten, bool color_only) {
   const RegisterFile& regs = register_file_;
   const reg::RB_DEPTHCONTROL depth_control = draw.normalized_depth_control;
-  if (!draw.vertex_shader || !depth_control.z_enable || !depth_control.z_write_enable ||
-      depth_control.zfunc != xenos::CompareFunction::kAlways) {
+  if (!draw.vertex_shader) return false;
+  if (color_only) {
+    if (depth_control.z_enable || depth_control.stencil_enable) return false;
+  } else if (!depth_control.z_enable || !depth_control.z_write_enable ||
+             depth_control.zfunc != xenos::CompareFunction::kAlways) {
     return false;
   }
   // Stencil must not fail anywhere; it is either rewritten or kept.

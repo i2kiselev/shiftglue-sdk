@@ -1908,7 +1908,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         }
         REXGPU_INFO(
             "FH1 debug draw {} mode={} prim={} indices={} vs={:016X} ps={:016X} color0={:08X} "
-            "surface={:08X} mask={:08X} blend0={:08X} depth={:08X} vte={:08X} "
+            "surface={:08X} mask={:08X} blend0={:08X} depth={:08X} depth_info={:08X} vte={:08X} "
             "window_scissor={:08X}/{:08X} copy_dest={:08X} copy_info={:08X} copy_ctrl={:08X}{}",
             draw_index, regs[XE_GPU_REG_RB_MODECONTROL] & 7, uint32_t(vgt_draw_initiator.prim_type),
             uint32_t(vgt_draw_initiator.num_indices),
@@ -1916,8 +1916,8 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash() : 0,
             regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_SURFACE_INFO],
             regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_BLENDCONTROL0],
-            regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_PA_CL_VTE_CNTL],
-            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+            regs[XE_GPU_REG_RB_DEPTHCONTROL], regs[XE_GPU_REG_RB_DEPTH_INFO],
+            regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
             regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
             regs[XE_GPU_REG_RB_COPY_CONTROL], textures);
       }

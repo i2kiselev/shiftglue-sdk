@@ -26,6 +26,10 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "single-sampled images (Vulkan): every guest sample of a pixel is its one "
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, true, "GPU",
+                    "Claim the tiles a rectangle overwrites in color, with or without depth (the "
+                    "title's clears), without transferring their previous contents (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
@@ -285,6 +289,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
   single_sample_msaa_ = scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample);
+  color_overwrite_claims_ = REXCVAR_GET(fh1_color_overwrite_claims);
   if (single_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
   }
@@ -948,6 +953,10 @@ void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, co
     if (!source_stencil) Count("transfer_stencil_skipped");
   }
   counters_.Count("transfer_tile_passes", uint64_t(tile_count) * pass_count);
+  if (command_processor_.debug_log_draws_frame()) {
+    REXGPU_INFO("FH1 debug transfer {}->{} tiles={} passes={}", source->key.Describe(),
+                dest.key.Describe(), tile_count, pass_count);
+  }
   if (gpu_query_pool_ != VK_NULL_HANDLE) {
     transfer_volume_[source->key.Describe() + "->" + dest.key.Describe()] +=
         uint64_t(tile_count) * pass_count;
@@ -1368,6 +1377,84 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
   Count("depth_overwrite_claim");
 }
 
+bool Fh1NativeExecutor::DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const {
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!(used_bits & (1u << (1 + i)))) continue;
+    if (((draw.normalized_color_mask >> (4 * i)) & 0xF) != 0xF) return false;
+    const auto blend =
+        register_file_.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (blend.color_srcblend != xenos::BlendFactor::kOne ||
+        blend.color_destblend != xenos::BlendFactor::kZero ||
+        blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blend.alpha_srcblend != xenos::BlendFactor::kOne ||
+        blend.alpha_destblend != xenos::BlendFactor::kZero ||
+        blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Fh1NativeExecutor::MayOverwrite(const Fh1DrawInfo& draw, uint32_t used_bits) const {
+  const reg::RB_DEPTHCONTROL depth_control = draw.normalized_depth_control;
+  if (used_bits & 1) {
+    return (color_overwrite_claims_ || used_bits == 1) && depth_control.z_enable &&
+           depth_control.z_write_enable &&
+           depth_control.zfunc == xenos::CompareFunction::kAlways;
+  }
+  // Depth and stencil off: a rectangle list that replaces its color targets.
+  return color_overwrite_claims_ && used_bits && !depth_control.z_enable &&
+         !depth_control.stencil_enable &&
+         register_file_.Get<reg::VGT_DRAW_INITIATOR>().prim_type ==
+             xenos::PrimitiveType::kRectangleList &&
+         DrawOverwritesColor(draw, used_bits);
+}
+
+bool Fh1NativeExecutor::ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t length) {
+  if (key.Is64bpp()) return false;
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  for (const auto& rect : depth_overwrite_.rects()) {
+    const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
+    const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
+    if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
+      return false;
+    }
+  }
+  const uint32_t packed_key = key.Pack();
+  for (const auto& rect : depth_overwrite_.rects()) {
+    const uint32_t column_first = uint32_t(rect.outer[0]) / tile_width;
+    const uint32_t column_end = (uint32_t(rect.outer[2]) + tile_width - 1) / tile_width;
+    const uint32_t row_first = uint32_t(rect.outer[1]) / tile_height;
+    const uint32_t row_end = (uint32_t(rect.outer[3]) + tile_height - 1) / tile_height;
+    uint32_t inner_column_first = (uint32_t(rect.inner[0]) + tile_width - 1) / tile_width;
+    uint32_t inner_column_end = uint32_t(rect.inner[2]) / tile_width;
+    uint32_t inner_row_first = (uint32_t(rect.inner[1]) + tile_height - 1) / tile_height;
+    uint32_t inner_row_end = uint32_t(rect.inner[3]) / tile_height;
+    if (inner_column_first >= inner_column_end || inner_row_first >= inner_row_end) {
+      inner_column_first = inner_column_end = column_first;
+      inner_row_first = inner_row_end = row_first;
+    }
+    // Tiles the draw covers whole take no transfer; the rest of its bounds do.
+    for (uint32_t row = inner_row_first; row < inner_row_end; ++row) {
+      ClaimTiles(key.base_tiles + row * key.pitch_tiles + inner_column_first,
+                 inner_column_end - inner_column_first, packed_key, false);
+    }
+    ClaimTileRect(key, column_first, row_first, column_end, inner_row_first);
+    ClaimTileRect(key, column_first, inner_row_end, column_end, row_end);
+    ClaimTileRect(key, column_first, inner_row_first, inner_column_first, inner_row_end);
+    ClaimTileRect(key, inner_column_end, inner_row_first, column_end, inner_row_end);
+    for (uint32_t row = row_first; row < row_end; ++row) {
+      MarkTileStencil(key.base_tiles + row * key.pitch_tiles + column_first,
+                      column_end - column_first, true);
+    }
+  }
+  Count("color_overwrite_draw");
+  return true;
+}
+
 void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
   // The extent estimate reads vertices when clipping is off.
@@ -1386,11 +1473,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
     return;
   }
   PrepareTargetsImpl(draw);
-  const bool may_overwrite_depth =
-      pending_used_bits_ == 1 && draw.normalized_depth_control.z_enable &&
-      draw.normalized_depth_control.z_write_enable &&
-      draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
-  if (memo_allowed && !may_overwrite_depth) {
+  if (memo_allowed && !MayOverwrite(draw, pending_used_bits_)) {
     memo.state_epoch = draw.state_epoch;
     memo.vertex_shader = draw.vertex_shader;
     memo.depth_control = draw.normalized_depth_control.value;
@@ -1448,10 +1531,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   const uint32_t surface_height = SurfaceHeight(pitch_tiles, msaa);
   const bool depth_stencil_written =
       (used_bits & 1) && DrawMayWriteNonzeroStencil(draw.normalized_depth_control);
-  const bool may_overwrite_depth =
-      used_bits == 1 && draw.normalized_depth_control.z_enable &&
-      draw.normalized_depth_control.z_write_enable &&
-      draw.normalized_depth_control.zfunc == xenos::CompareFunction::kAlways;
+  const bool may_overwrite = MayOverwrite(draw, used_bits);
   PrepareSignature signature;
   signature.generation = tiles_.generation();
   signature.used_bits = used_bits;
@@ -1464,7 +1544,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   // the whole surface, the draw's extent need not even be estimated. Draws
   // alternating between a few target sets all hit.
   const PrepareSignature* same_targets = nullptr;
-  if (!may_overwrite_depth) {
+  if (!may_overwrite) {
     for (const PrepareSignature& recent : recent_prepares_) {
       if (recent.length_tiles && signature.SameTargets(recent)) {
         same_targets = &recent;
@@ -1494,9 +1574,10 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   }
   std::sort(bases.begin(), bases.end());
   bool stencil_overwritten = false;
-  const bool depth_overwritten =
-      used_bits == 1 &&
-      depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten);
+  const bool overwritten =
+      may_overwrite && (used_bits == 1 || DrawOverwritesColor(draw, used_bits)) &&
+      depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten,
+                              !(used_bits & 1));
   for (size_t i = 0; i < bases.size(); ++i) {
     const SurfaceKey& key = keys[bases[i].second];
     const uint32_t next_base = i + 1 < bases.size()
@@ -1504,15 +1585,17 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
-    if (depth_overwritten &&
-        ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)) {
+    if (overwritten &&
+        (key.is_depth
+             ? ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)
+             : ClaimColorOverwriteTiles(key, length))) {
       continue;
     }
     ClaimTiles(key.base_tiles, length, key.Pack());
     if (!key.is_depth || depth_stencil_written) MarkTileStencil(key.base_tiles, length, true);
   }
   FlushTransfers();
-  if (used_bits == signature.used_bits && !may_overwrite_depth) {
+  if (used_bits == signature.used_bits && !may_overwrite) {
     // Entries of an older generation never match, so no invalidation is
     // needed; the same targets take their old entry's place.
     signature.generation = tiles_.generation();

@@ -52,7 +52,10 @@ class Fh1DepthOverwrite {
   // Finds the draw's rectangles into rects(). False when the draw is not a
   // depth overwrite the interpreter can follow. `stencil_overwritten`: whether
   // the draw also rewrites all stencil bits with one reference value.
-  bool Derive(const Fh1DrawInfo& draw, bool half_pixel_offset, bool& stencil_overwritten);
+  // `color_only` instead takes a draw with depth and stencil off, for the
+  // rectangles whose color the caller knows it replaces.
+  bool Derive(const Fh1DrawInfo& draw, bool half_pixel_offset, bool& stencil_overwritten,
+              bool color_only = false);
   const std::vector<Rect>& rects() const { return rects_; }
 
  private:

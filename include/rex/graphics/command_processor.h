@@ -152,6 +152,7 @@ class CommandProcessor {
   // Logs the draws of the current frame as fh1_debug_log_draws does (the
   // frame whose resolves are dumped on request).
   void SetDebugLogDrawsFrame(bool enabled) { debug_log_draws_frame_ = enabled; }
+  bool debug_log_draws_frame() const { return debug_log_draws_frame_; }
 
  protected:
   struct IndexBufferInfo {
