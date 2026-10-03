@@ -33,6 +33,9 @@ class Fh1EdramTiles {
   }
 
   uint32_t Owner(uint32_t tile) const { return owners_[tile & kTileMask]; }
+  bool OwnsAny(uint32_t key) const {
+    return std::find(owners_.begin(), owners_.end(), key) != owners_.end();
+  }
   bool StencilNonzero(uint32_t tile) const { return stencil_nonzero_[tile & kTileMask] != 0; }
   // Bumped whenever ownership or stencil state changes.
   uint64_t generation() const { return generation_; }

@@ -113,7 +113,11 @@ class Fh1NativeExecutor {
     bool stencil_nonzero = false;
     uint32_t samples = 1;
     uint32_t width = 0;
+    // The rows the image holds: those claimed for the surface so far, not the
+    // whole of EDRAM at its pitch (SurfaceHeight).
     uint32_t height = 0;
+    VkDeviceSize memory_size = 0;
+    uint64_t last_used_frame = 0;
   };
   struct SourceRect {
     Surface* surface = nullptr;
@@ -163,9 +167,21 @@ class Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
-  Surface* GetOrCreateSurface(const SurfaceKey& key);
+  // The surface with an image of at least `height` guest rows.
+  Surface* GetOrCreateSurface(const SurfaceKey& key, uint32_t height);
   Surface* FindSurface(uint32_t packed_key);
+  bool CreateSurfaceImage(const SurfaceKey& key, uint32_t height, Surface& surface_out);
+  // Moves the surface to a taller image, keeping its contents, when it holds
+  // fewer rows than `height`.
+  bool EnsureSurfaceHeight(Surface& surface, uint32_t height);
+  void DestroySurfaceImage(Surface& surface);
   void DestroySurface(Surface& surface);
+  // Outgrown or released images and buffers no submission in flight uses any
+  // more.
+  void DestroyRetired(uint64_t completed_submission);
+  // Drops surfaces nothing has looked up for a while that own no tiles, such
+  // as another screen's targets.
+  void ReleaseIdleSurfaces();
   // Layout, stage and access transition (a barrier pushed to the command
   // processor).
   void Transition(Surface& surface, VkImageLayout layout, VkPipelineStageFlags stage,
@@ -254,6 +270,8 @@ class Fh1NativeExecutor {
     Surface* surface = nullptr;
   };
   SurfaceFront surface_front_[16];
+  // Outgrown and released images by the submission that may still use them.
+  std::vector<std::pair<uint64_t, Surface>> retired_surfaces_;
   uint32_t scale_ = 1;
   bool initialized_ = false;
 
@@ -279,8 +297,13 @@ class Fh1NativeExecutor {
   VkBuffer transfer_words_ = VK_NULL_HANDLE;
   VkDeviceMemory transfer_words_memory_ = VK_NULL_HANDLE;
   VkDeviceSize transfer_words_size_ = 0;
-  // Outgrown buffers may still be in use by submitted commands.
-  std::vector<std::pair<VkBuffer, VkDeviceMemory>> retired_buffers_;
+  // Outgrown buffers by the submission that may still use them.
+  struct RetiredBuffer {
+    uint64_t submission;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+  };
+  std::vector<RetiredBuffer> retired_buffers_;
 
   std::vector<PendingTransfer> pending_transfers_;
   std::vector<PendingReadback> pending_readbacks_;

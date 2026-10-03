@@ -385,6 +385,7 @@ void Fh1NativeExecutor::Shutdown() {
   initialized_ = false;
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
+  DestroyRetired(UINT64_MAX);
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
   for (auto& by_words : compute_pipelines_) {
@@ -409,8 +410,6 @@ void Fh1NativeExecutor::Shutdown() {
   };
   destroy_buffer(transfer_words_, transfer_words_memory_);
   transfer_words_size_ = 0;
-  for (auto& [buffer, memory] : retired_buffers_) destroy_buffer(buffer, memory);
-  retired_buffers_.clear();
   for (PendingReadback& readback : pending_readbacks_) {
     destroy_buffer(readback.buffer, readback.memory);
   }
@@ -431,6 +430,25 @@ void Fh1NativeExecutor::DestroySurface(Surface& surface) {
   for (SurfaceFront& front : surface_front_) {
     front = SurfaceFront();
   }
+  DestroySurfaceImage(surface);
+}
+
+void Fh1NativeExecutor::DestroyRetired(uint64_t completed_submission) {
+  std::erase_if(retired_surfaces_, [&](std::pair<uint64_t, Surface>& retired) {
+    if (retired.first > completed_submission) return false;
+    DestroySurfaceImage(retired.second);
+    return true;
+  });
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  std::erase_if(retired_buffers_, [&](const RetiredBuffer& retired) {
+    if (retired.submission > completed_submission) return false;
+    vulkan_device->functions().vkDestroyBuffer(vulkan_device->device(), retired.buffer, nullptr);
+    vulkan_device->functions().vkFreeMemory(vulkan_device->device(), retired.memory, nullptr);
+    return true;
+  });
+}
+
+void Fh1NativeExecutor::DestroySurfaceImage(Surface& surface) {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -478,6 +496,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) 
   SurfaceFront& front = surface_front_[(packed_key ^ (packed_key >> 7) ^ (packed_key >> 15)) &
                                        (std::size(surface_front_) - 1)];
   if (front.packed_key == packed_key) {
+    front.surface->last_used_frame = frame_;
     return front.surface;
   }
   auto it = surfaces_.find(packed_key);
@@ -486,7 +505,29 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) 
   }
   front.packed_key = packed_key;
   front.surface = &it->second;
+  front.surface->last_used_frame = frame_;
   return front.surface;
+}
+
+void Fh1NativeExecutor::ReleaseIdleSurfaces() {
+  constexpr uint64_t kIdleFrames = 600;
+  bool released = false;
+  for (auto it = surfaces_.begin(); it != surfaces_.end();) {
+    // A surface that owns tiles holds their only copy.
+    if (frame_ < it->second.last_used_frame + kIdleFrames || tiles_.OwnsAny(it->first)) {
+      ++it;
+      continue;
+    }
+    retired_surfaces_.emplace_back(command_processor_.GetCurrentSubmission(), it->second);
+    it = surfaces_.erase(it);
+    released = true;
+    Count("surface_released");
+  }
+  if (!released) return;
+  // Preparations that found their surfaces in place must look again.
+  for (SurfaceFront& front : surface_front_) front = SurfaceFront();
+  prepare_memo_.state_epoch = 0;
+  for (PrepareSignature& recent : recent_prepares_) recent = PrepareSignature();
 }
 
 VkImageAspectFlags Fh1NativeExecutor::AspectMask(const Surface& surface) const {
@@ -560,17 +601,20 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view) 
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
 }
 
-Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key) {
-  const uint32_t packed = key.Pack();
-  if (Surface* existing = FindSurface(packed)) return existing;
+bool Fh1NativeExecutor::CreateSurfaceImage(const SurfaceKey& key, uint32_t height,
+                                           Surface& surface_out) {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >>
+                               uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
   Surface surface;
   surface.key = key;
   surface.width = key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
-  surface.height = SurfaceHeight(key.pitch_tiles, key.msaa);
+  surface.height = std::min(std::max(height + tile_height - 1, tile_height) / tile_height *
+                                tile_height,
+                            SurfaceHeight(key.pitch_tiles, key.msaa));
   surface.samples = single_sample_msaa_ ? 1u
                     : key.msaa == uint32_t(xenos::MsaaSamples::k2X) && !config_.msaa_2x_supported
                         ? 4u
@@ -585,7 +629,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   }
   if (surface.format == VK_FORMAT_UNDEFINED || !surface.width || !surface.height) {
     Skip("surface_format");
-    return nullptr;
+    return false;
   }
   VkImageCreateInfo image_info = {};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -599,16 +643,19 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   image_info.arrayLayers = 1;
   image_info.samples = VkSampleCountFlagBits(surface.samples);
   image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+  // Transfer usage: a surface that grows is copied into its taller image.
+  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                      (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                                    : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
   image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, image_info,
                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-                                                        surface.image, surface.memory)) {
+                                                        surface.image, surface.memory, nullptr,
+                                                        &surface.memory_size)) {
     Skip("surface_create");
-    return nullptr;
+    return false;
   }
   auto create_view = [&](VkFormat format, VkImageAspectFlags aspect, VkImageView& view_out) {
     VkImageViewCreateInfo view_info = {};
@@ -634,10 +681,22 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
     surface.sampled_view = surface.uint_view ? surface.uint_view : surface.view;
   }
   if (!views_created) {
-    DestroySurface(surface);
+    DestroySurfaceImage(surface);
     Skip("surface_view_create");
-    return nullptr;
+    return false;
   }
+  surface_out = surface;
+  return true;
+}
+
+Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceKey& key,
+                                                                  uint32_t height) {
+  const uint32_t packed = key.Pack();
+  if (Surface* existing = FindSurface(packed)) {
+    return EnsureSurfaceHeight(*existing, height) ? existing : nullptr;
+  }
+  Surface surface;
+  if (!CreateSurfaceImage(key, height, surface)) return nullptr;
   Surface& stored = surfaces_.emplace(packed, surface).first->second;
   // Render targets must be initialized before use; zero is also what the
   // stencil tracking assumes for a new surface.
@@ -653,12 +712,57 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
   return &stored;
 }
 
+bool Fh1NativeExecutor::EnsureSurfaceHeight(Surface& surface, uint32_t height) {
+  if (height <= surface.height) return true;
+  height = std::min(height, SurfaceHeight(surface.key.pitch_tiles, surface.key.msaa));
+  if (height <= surface.height) return true;
+  Surface grown;
+  if (!CreateSurfaceImage(surface.key, height, grown)) return false;
+  grown.stencil_nonzero = surface.stencil_nonzero;
+  auto& command_buffer = command_processor_.deferred_command_buffer();
+  // A rendering scope is identified by its surfaces' keys, not their images.
+  command_processor_.EndRenderPass("end_executor");
+  // The new rows start as a new surface's do, zeroed.
+  TransitionForAttachment(grown);
+  BeginSurfaceRendering(grown, false);
+  VkClearAttachment clear = {};
+  clear.aspectMask = AspectMask(grown);
+  VkClearRect clear_rect = {};
+  clear_rect.rect.offset.y = int32_t(surface.height * scale_);
+  clear_rect.rect.extent = {grown.width * scale_, (grown.height - surface.height) * scale_};
+  clear_rect.layerCount = 1;
+  command_buffer.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+  Transition(surface, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  Transition(grown, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true, "end_executor");
+  VkImageCopy region = {};
+  region.srcSubresource = {AspectMask(surface), 0, 0, 1};
+  region.dstSubresource = region.srcSubresource;
+  region.extent = {surface.width * scale_, surface.height * scale_, 1};
+  command_buffer.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  retired_surfaces_.emplace_back(command_processor_.GetCurrentSubmission(), surface);
+  surface = grown;
+  Count("surface_grown");
+  return true;
+}
+
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
                                    bool transfer) {
   const auto runs = tiles_.Claim(base, length, packed_key, transfer);
-  if (runs.empty()) return;
   Surface* dest = FindSurface(packed_key);
   if (!dest) return;
+  // A surface's image holds every row it owns tiles in.
+  const SurfaceKey& key = dest->key;
+  const uint32_t pitch = key.pitch_tiles << uint32_t(key.Is64bpp());
+  const uint32_t end =
+      ((base - key.base_tiles) & (xenos::kEdramTileCount - 1)) +
+      std::min(length, xenos::kEdramTileCount);
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >>
+                               uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  EnsureSurfaceHeight(*dest, (end + pitch - 1) / pitch * tile_height);
   for (const TileRun& run : runs) TransferTiles(*dest, run);
 }
 
@@ -906,14 +1010,17 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
     }
     return;
   }
-  const uint32_t previous_owner = claim.previous_owner;
-  if (previous_owner == kNoOwner) return;
   Surface* dest = FindSurface(packed_key);
   if (!dest) return;
   const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
   const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  if (column_first < column_end && row_first < row_end) {
+    EnsureSurfaceHeight(*dest, row_end * tile_height);
+  }
+  const uint32_t previous_owner = claim.previous_owner;
+  if (previous_owner == kNoOwner) return;
   const Rect rect = {int32_t(column_first * tile_width), int32_t(row_first * tile_height),
                      int32_t(std::min(column_end * tile_width, dest->width)),
                      int32_t(std::min(row_end * tile_height, dest->height))};
@@ -1075,7 +1182,8 @@ bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
                             dest.samples * sizeof(uint32_t);
   if (transfer_words_ && transfer_words_size_ >= size) return true;
   if (transfer_words_) {
-    retired_buffers_.emplace_back(transfer_words_, transfer_words_memory_);
+    retired_buffers_.push_back(
+        {command_processor_.GetCurrentSubmission(), transfer_words_, transfer_words_memory_});
     transfer_words_ = VK_NULL_HANDLE;
     transfer_words_memory_ = VK_NULL_HANDLE;
   }
@@ -1562,22 +1670,41 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i])) used_bits &= ~(1u << i);
+    // A draw whose rectangles get derived below needs their rows only.
+    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], may_overwrite ? 0 : height_used)) {
+      used_bits &= ~(1u << i);
+    }
   }
   pending_used_bits_ = used_bits;
   if (depth_stencil_written && (used_bits & 1)) {
     FindSurface(keys[0].Pack())->stencil_nonzero = true;
+  }
+  bool stencil_overwritten = false;
+  const bool overwritten =
+      may_overwrite && (used_bits == 1 || DrawOverwritesColor(draw, used_bits)) &&
+      depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten,
+                              !(used_bits & 1));
+  if (may_overwrite) {
+    // Every target holds the rows the draw can reach, whatever its claim.
+    uint32_t draw_height = height_used;
+    if (overwritten) {
+      draw_height = 0;
+      for (const auto& rect : depth_overwrite_.rects()) {
+        draw_height = std::max(draw_height, uint32_t(std::max(rect.outer[3], 0)));
+      }
+      draw_height = std::min(draw_height, height_used);
+    }
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(used_bits & (1u << i))) continue;
+      if (!EnsureSurfaceHeight(*FindSurface(keys[i].Pack()), draw_height)) used_bits &= ~(1u << i);
+    }
+    pending_used_bits_ = used_bits;
   }
   std::vector<std::pair<uint32_t, uint32_t>> bases;
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     if (used_bits & (1u << i)) bases.emplace_back(keys[i].base_tiles, i);
   }
   std::sort(bases.begin(), bases.end());
-  bool stencil_overwritten = false;
-  const bool overwritten =
-      may_overwrite && (used_bits == 1 || DrawOverwritesColor(draw, used_bits)) &&
-      depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten,
-                              !(used_bits & 1));
   for (size_t i = 0; i < bases.size(); ++i) {
     const SurfaceKey& key = keys[bases[i].second];
     const uint32_t next_base = i + 1 < bases.size()
@@ -2184,7 +2311,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
   auto clear = [&](const SurfaceKey& key, uint32_t value, uint32_t value_lo) {
-    Surface* surface = GetOrCreateSurface(key);
+    Surface* surface = GetOrCreateSurface(key, uint32_t(y1));
     if (!surface) return Skip("resolve_clear_surface");
     const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
     const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
@@ -2241,17 +2368,30 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   if (!initialized_) return;
   GpuEndFrame();
   GpuDrain();
+  DestroyRetired(command_processor_.GetCompletedSubmission());
   if (frame_ == dump_trigger_frame_) command_processor_.SetDebugLogDrawsFrame(false);
   frame_ = frame;
+  if (frame % 64 == 0) ReleaseIdleSurfaces();
   if (frame % 600 == 0) LogStats(frame);
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
+  VkDeviceSize surface_bytes = 0;
+  for (const auto& [packed, surface] : surfaces_) surface_bytes += surface.memory_size;
   REXGPU_INFO(
-      "FH1 native executor (Vulkan) frame={} draws={} resolves={} surfaces={} skips={{{}}} "
-      "stats={{{}}}",
-      frame, draws_, resolves_, surfaces_.size(), counters_.FormatSkips(),
+      "FH1 native executor (Vulkan) frame={} draws={} resolves={} surfaces={} surface_mb={} "
+      "skips={{{}}} stats={{{}}}",
+      frame, draws_, resolves_, surfaces_.size(), surface_bytes >> 20, counters_.FormatSkips(),
       counters_.FormatStats());
+  if (gpu_query_pool_ != VK_NULL_HANDLE) {
+    std::string list;
+    for (const auto& [packed, surface] : surfaces_) {
+      list += fmt::format(" {}:{}/{}rows:{}mb", surface.key.Describe(), surface.height,
+                          SurfaceHeight(surface.key.pitch_tiles, surface.key.msaa),
+                          surface.memory_size >> 20);
+    }
+    REXGPU_INFO("FH1 native executor (Vulkan) surfaces:{}", list);
+  }
   if (gpu_frames_) {
     const double tick_ns = command_processor_.GetVulkanDevice()->properties().timestampPeriod;
     const double scale = tick_ns / 1e6 / double(gpu_frames_);
