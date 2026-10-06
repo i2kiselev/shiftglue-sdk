@@ -11,11 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -73,6 +76,21 @@ REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
 REXCVAR_DEFINE_BOOL(fh1_debug_log_draws, false, "GPU",
                     "Diagnostics: log every draw's index in its frame, primitive type, index "
                     "count and vertex and pixel shader hashes (for frame replays)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_log_ps, "", "GPU",
+                      "Diagnostics: a pixel shader hash (hex); every draw with it logs its "
+                      "float constants 0-7, its window scissor and a microsecond timestamp")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DEFINE_STRING(fh1_debug_log_vs, "", "GPU",
+                      "Diagnostics: a vertex shader hash (hex); in a frame whose draws are "
+                      "logged, every draw with it also logs its nonzero float constants and "
+                      "vertex fetch constants 90-95, and with fh1_resolve_dump_dir writes "
+                      "their buffers there as vb_<draw>_<constant>_<address>.bin")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_vs_constant, "", "GPU",
+                      "Diagnostics: <vertex shader hash>:c<constant>=x,y,z,w replaces one float "
+                      "constant of that vertex shader in each of its draws")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -230,6 +248,11 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
   return REXCVAR_GET(readback_memexport);
 }
 #endif  // REX_HAS_VULKAN
+
+void CommandProcessor::SetPixelShaderConstantOverride(
+    const PixelShaderConstantOverride& constant_override) {
+  CallInThread([this, constant_override]() { pixel_shader_constant_override_ = constant_override; });
+}
 
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
   if (swap_post_effect_desired_ == swap_post_effect) {
@@ -1891,6 +1914,24 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         return ranges;
       }();
       const uint32_t draw_index = debug_frame_draw_index_++;
+      static const uint64_t log_ps = std::strtoull(REXCVAR_GET(fh1_debug_log_ps).c_str(), nullptr, 16);
+      if (log_ps && active_pixel_shader_ && active_pixel_shader_->ucode_data_hash() == log_ps) {
+        const RegisterFile& regs = *register_file_;
+        const float* c = reinterpret_cast<const float*>(
+            &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
+        REXGPU_INFO(
+            "FH1 debug ps t={} draw={} scissor={:08X}/{:08X} c0={:g},{:g},{:g},{:g} "
+            "c1={:g},{:g},{:g},{:g} c2={:g},{:g},{:g},{:g} c3={:g},{:g},{:g},{:g} "
+            "c4={:g},{:g},{:g},{:g} c5={:g},{:g},{:g},{:g} c6={:g},{:g},{:g},{:g} "
+            "c7={:g},{:g},{:g},{:g}",
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            draw_index, regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], c[0], c[1], c[2], c[3], c[4], c[5], c[6],
+            c[7], c[8], c[9], c[10], c[11], c[12], c[13], c[14], c[15], c[16], c[17], c[18], c[19],
+            c[20], c[21], c[22], c[23], c[24], c[25], c[26], c[27], c[28], c[29], c[30], c[31]);
+      }
       if (REXCVAR_GET(fh1_debug_log_draws) || debug_log_draws_frame_) {
         const RegisterFile& regs = *register_file_;
         std::string textures;
@@ -1933,7 +1974,47 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
             regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_INFO],
             regs[XE_GPU_REG_RB_COPY_CONTROL], textures);
+        static const uint64_t log_vs =
+            std::strtoull(REXCVAR_GET(fh1_debug_log_vs).c_str(), nullptr, 16);
+        if (log_vs && active_vertex_shader_ && active_vertex_shader_->ucode_data_hash() == log_vs) {
+          std::string values;
+          const float* c = reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+          for (uint32_t i = 0; i < 256; ++i) {
+            const float* v = c + 4 * i;
+            if (v[0] != 0.0f || v[1] != 0.0f || v[2] != 0.0f || v[3] != 0.0f) {
+              values += fmt::format(" c{}={:g},{:g},{:g},{:g}", i, v[0], v[1], v[2], v[3]);
+            }
+          }
+          const std::string dump_dir = REXCVAR_GET(fh1_resolve_dump_dir);
+          for (uint32_t i = 90; i < 96; ++i) {
+            const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(i);
+            values += fmt::format(" vf{}={:08X}/{:08X}", i, fetch.dword_0, fetch.dword_1);
+            if (!dump_dir.empty() && fetch.type == xenos::FetchConstantType::kVertex && fetch.size) {
+              std::ofstream(std::filesystem::path(dump_dir) /
+                                fmt::format("vb_{:04}_{}_{:08X}.bin", draw_index, i,
+                                            fetch.address << 2),
+                            std::ios::binary)
+                  .write(memory_->TranslatePhysical<const char*>(fetch.address << 2),
+                         std::streamsize(fetch.size) * 4);
+            }
+          }
+          REXGPU_INFO("FH1 debug vs draw {}{}", draw_index, values);
+        }
       }
+      static const auto vs_constant = [] {
+        uint64_t hash = 0;
+        uint32_t constant = 0;
+        std::array<float, 4> value = {};
+        const std::string text = REXCVAR_GET(fh1_debug_vs_constant);
+        if (!text.empty() &&
+            (std::sscanf(text.c_str(), "%llx:c%u=%f,%f,%f,%f",
+                         reinterpret_cast<unsigned long long*>(&hash), &constant, &value[0],
+                         &value[1], &value[2], &value[3]) != 6 ||
+             constant > 255)) {
+          hash = 0;
+        }
+        return std::make_tuple(hash, constant, value);
+      }();
       static const auto null_fetch = [] {
         uint32_t draw = UINT32_MAX, fetch = 0;
         const std::string value = REXCVAR_GET(fh1_debug_null_fetch);
@@ -1952,6 +2033,30 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         const uint32_t null_fetch_register =
             XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + null_fetch.second * 6;
         const uint32_t saved_fetch_word = register_file_->values[null_fetch_register];
+        const bool override_constant =
+            pixel_shader_constant_override_.shader_hash && active_pixel_shader_ &&
+            active_pixel_shader_->ucode_data_hash() == pixel_shader_constant_override_.shader_hash;
+        const uint32_t override_register =
+            XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * pixel_shader_constant_override_.constant;
+        std::array<uint32_t, 4> saved_constant;
+        if (override_constant) {
+          for (uint32_t i = 0; i < 4; ++i) {
+            saved_constant[i] = register_file_->values[override_register + i];
+            WriteRegister(override_register + i,
+                          std::bit_cast<uint32_t>(pixel_shader_constant_override_.value[i]));
+          }
+        }
+        const auto& [vs_constant_hash, vs_constant_index, vs_constant_value] = vs_constant;
+        const bool override_vs_constant = vs_constant_hash && active_vertex_shader_ &&
+                                          active_vertex_shader_->ucode_data_hash() == vs_constant_hash;
+        const uint32_t vs_constant_register = XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * vs_constant_index;
+        std::array<uint32_t, 4> saved_vs_constant;
+        if (override_vs_constant) {
+          for (uint32_t i = 0; i < 4; ++i) {
+            saved_vs_constant[i] = register_file_->values[vs_constant_register + i];
+            WriteRegister(vs_constant_register + i, std::bit_cast<uint32_t>(vs_constant_value[i]));
+          }
+        }
         if (draw_index == null_fetch.first) {
           // A vertex type in a texture slot is invalid even with
           // gpu_allow_invalid_fetch_constants, which binds the invalid type.
@@ -1963,6 +2068,16 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
                                    is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
         if (draw_index == null_fetch.first) {
           WriteRegister(null_fetch_register, saved_fetch_word);
+        }
+        if (override_constant) {
+          for (uint32_t i = 0; i < 4; ++i) {
+            WriteRegister(override_register + i, saved_constant[i]);
+          }
+        }
+        if (override_vs_constant) {
+          for (uint32_t i = 0; i < 4; ++i) {
+            WriteRegister(vs_constant_register + i, saved_vs_constant[i]);
+          }
         }
       }
       if (!draw_succeeded) {

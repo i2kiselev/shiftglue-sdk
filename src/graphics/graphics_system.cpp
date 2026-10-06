@@ -15,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,11 @@
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
 
+REXCVAR_DEFINE_STRING(gpu_pixel_shader_constant_override, "", "GPU",
+                      "Replaces one float constant of one pixel shader in each of its draws: "
+                      "<shader hash>:c<constant>=x,y,z,w (hexadecimal hash, constant 0-255), "
+                      "or empty for none");
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
@@ -59,6 +65,23 @@ constexpr double Fh1GuestVblankHzForRenderLimit(uint32_t render_fps_limit,
 
 static_assert(Fh1GuestVblankHzForRenderLimit(0, 144.0) == 288.0);
 static_assert(Fh1GuestVblankHzForRenderLimit(60, 144.0) == 120.0);
+
+rex::graphics::CommandProcessor::PixelShaderConstantOverride ParsePixelShaderConstantOverride(
+    const std::string& text) {
+  rex::graphics::CommandProcessor::PixelShaderConstantOverride parsed;
+  unsigned long long hash = 0;
+  uint32_t constant = 0;
+  if (!text.empty() &&
+      (std::sscanf(text.c_str(), "%llx:c%u=%f,%f,%f,%f", &hash, &constant, &parsed.value[0],
+                   &parsed.value[1], &parsed.value[2], &parsed.value[3]) != 6 ||
+       constant > 255)) {
+    REXGPU_WARN("gpu_pixel_shader_constant_override: cannot read \"{}\"", text);
+    return {};
+  }
+  parsed.shader_hash = hash;
+  parsed.constant = constant;
+  return parsed;
+}
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     const std::string& effect_name) {
@@ -186,6 +209,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
       command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(std::string(value)));
     }
   });
+
+  command_processor_->SetPixelShaderConstantOverride(
+      ParsePixelShaderConstantOverride(REXCVAR_GET(gpu_pixel_shader_constant_override)));
+  cvar::RegisterChangeCallback(
+      "gpu_pixel_shader_constant_override", [this](std::string_view, std::string_view value) {
+        if (command_processor_) {
+          command_processor_->SetPixelShaderConstantOverride(
+              ParsePixelShaderConstantOverride(std::string(value)));
+        }
+      });
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
