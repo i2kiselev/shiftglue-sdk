@@ -30,6 +30,11 @@ REXCVAR_DEFINE_BOOL(fh1_color_overwrite_claims, true, "GPU",
                     "Claim the tiles a rectangle overwrites in color, with or without depth (the "
                     "title's clears), without transferring their previous contents (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_scrambled_stencil_claims, true, "GPU",
+                    "Let a depth overwrite that keeps stencil (the title's shadow map clear) "
+                    "claim tiles whose stencil came from another sample layout, zeroing it "
+                    "instead of transferring it (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
@@ -284,12 +289,17 @@ Fh1NativeExecutor::Fh1NativeExecutor(VulkanCommandProcessor& command_processor,
 
 Fh1NativeExecutor::~Fh1NativeExecutor() { Shutdown(); }
 
+bool Fh1NativeExecutor::IsSingleSampleMsaaOutdated() const {
+  return single_sample_msaa_ != (scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample));
+}
+
 bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   config_ = config;
   if (!config_.memory || !config_.textures || !config_.render_targets) return false;
   scale_ = config_.textures->draw_resolution_scale_x();
   single_sample_msaa_ = scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample);
   color_overwrite_claims_ = REXCVAR_GET(fh1_color_overwrite_claims);
+  scrambled_stencil_claims_ = REXCVAR_GET(fh1_scrambled_stencil_claims);
   if (single_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
   }
@@ -1458,13 +1468,18 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
   if (!stencil_overwritten) {
     for (uint32_t row = row_first; row < row_end; ++row) {
       for (uint32_t column = column_first; column < column_end; ++column) {
-        if (tiles_.StencilNonzero(key.base_tiles + row * key.pitch_tiles + column)) return;
+        const uint32_t tile = key.base_tiles + row * key.pitch_tiles + column;
+        if (tiles_.StencilNonzero(tile) && !StencilScrambled(key, tiles_.Owner(tile))) return;
       }
     }
   }
   for (uint32_t row = row_first; row < row_end; ++row) {
     ClaimTiles(key.base_tiles + row * key.pitch_tiles + column_first, column_end - column_first,
                packed_key, false);
+    if (!stencil_overwritten) {
+      MarkTileStencil(key.base_tiles + row * key.pitch_tiles + column_first,
+                      column_end - column_first, false);
+    }
   }
   if (!stencil_overwritten && dest->stencil_nonzero) {
     const Rect clear_rect =
@@ -1483,6 +1498,15 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
     command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &vk_rect);
   }
   Count("depth_overwrite_claim");
+}
+
+bool Fh1NativeExecutor::StencilScrambled(const SurfaceKey& key, uint32_t owner) {
+  if (!scrambled_stencil_claims_) return false;
+  Surface* source = owner == kNoOwner ? nullptr : FindSurface(owner);
+  // Stencil read through another pitch or sample count, or a color owner's
+  // bits, lands on unrelated samples, so no draw can depend on keeping it.
+  return !source || !source->key.is_depth || source->key.pitch_tiles != key.pitch_tiles ||
+         source->key.msaa != key.msaa;
 }
 
 bool Fh1NativeExecutor::DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const {
@@ -2296,7 +2320,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       if (unscaled_complete) QueueResolveReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
-    config_.textures->MarkRangeAsResolved(extent_start, extent_length);
+    config_.textures->MarkRangeAsResolved(extent_start, extent_length,
+                                          (plan.dest_info >> 16) & 3);
     if (written_address) *written_address = extent_start;
     if (written_length) *written_length = extent_length;
     if (complete) {

@@ -76,6 +76,9 @@ class Fh1NativeExecutor {
   bool NativeResolve(uint32_t& written_address, uint32_t& written_length);
   // Copies one-off resolve read-backs into guest memory, waiting for the GPU.
   void FlushResolveReadbacks();
+  // Whether fh1_scaled_msaa_single_sample changed since setup in a way that
+  // matters at this scale; it applies when the executor is created again.
+  bool IsSingleSampleMsaaOutdated() const;
   void OnSwap(uint64_t frame);
   void LogStats(uint64_t frame);
   // Counts what ended a draw rendering (a stat name).
@@ -205,6 +208,9 @@ class Fh1NativeExecutor {
                                 bool stencil_written);
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
+  // Whether the stencil `owner` left in a tile is meaningless to `key`, so a
+  // depth overwrite may drop it (fh1_scrambled_stencil_claims).
+  bool StencilScrambled(const SurfaceKey& key, uint32_t owner);
   // Whether a draw replaces its color targets (all channels, no blending), as
   // the title's clears do.
   bool DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const;
@@ -352,6 +358,7 @@ class Fh1NativeExecutor {
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
   bool color_overwrite_claims_ = true;
+  bool scrambled_stencil_claims_ = true;
   // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x
   // stored as 4x, 3 every guest sample in one host sample.
   static uint32_t HostSampleMode(const Surface& surface);
