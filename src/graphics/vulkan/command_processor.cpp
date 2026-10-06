@@ -1967,6 +1967,7 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
   }
   // A new texture cache has no samplers yet.
   sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
+  sampler_anisotropic_override_ = REXCVAR_GET(anisotropic_override);
 
   if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
@@ -2059,14 +2060,18 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
   const uint32_t previous_scale_x = texture_cache_->draw_resolution_scale_x();
   const uint32_t previous_scale_y = texture_cache_->draw_resolution_scale_y();
-  if (scale_x == previous_scale_x && scale_y == previous_scale_y) {
+  // The executor's MSAA setting also applies through a rebuild, at the same
+  // scale.
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y &&
+      !(fh1_native_executor_ && fh1_native_executor_->IsSingleSampleMsaaOutdated())) {
     declined_draw_resolution_scale_ = 0;
     return;
   }
   // Square, as on D3D12; unequal axes are also seen between the two cvar
   // writes of one change. A frame left open (a swap without a source) is
   // closed by the next swap first.
-  if (scale_x != scale_y || scale_x == declined_draw_resolution_scale_ || frame_open_) {
+  if (scale_x != scale_y || scale_x == declined_draw_resolution_scale_ || frame_open_ ||
+      texture_cache_->has_pending_inherited_resolves()) {
     return;
   }
   if (scale_x > 4) {
@@ -2125,8 +2130,15 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
     return CreateScaledComponents(x, y) && render_target_cache_->GetPath() == path &&
            (fh1_native_executor_ != nullptr) == native_executor;
   };
+  // The old texture cache outlives the switch long enough to hand its scaled
+  // resolve data to the new one.
+  std::unique_ptr<VulkanTextureCache> previous_texture_cache = std::move(texture_cache_);
   destroy();
-  if (!create(scale_x, scale_y)) {
+  if (create(scale_x, scale_y)) {
+    texture_cache_->InheritScaledResolves(*previous_texture_cache);
+    previous_texture_cache.reset();
+  } else {
+    previous_texture_cache.reset();
     REXGPU_ERROR("Could not switch to draw resolution scale {}x; staying at {}x", scale_x,
                  previous_scale_x);
     declined_draw_resolution_scale_ = scale_x;
@@ -2168,12 +2180,15 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
                   .count());
 }
 
-void VulkanCommandProcessor::RecreateSamplersIfMipLodBiasChanged() {
+void VulkanCommandProcessor::RecreateSamplersIfSettingsChanged() {
   const double mip_lod_bias = REXCVAR_GET(texture_mip_lod_bias);
-  if (mip_lod_bias == sampler_mip_lod_bias_ || device_lost_ || frame_open_) {
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  if ((mip_lod_bias == sampler_mip_lod_bias_ &&
+       anisotropic_override == sampler_anisotropic_override_) ||
+      device_lost_ || frame_open_) {
     return;
   }
-  // The bias is baked into the samplers the texture cache keeps by their
+  // Both are baked into the samplers the texture cache keeps by their
   // parameters; they go once the frames in flight are done with them.
   const auto start = std::chrono::steady_clock::now();
   if (!AwaitAllQueueOperationsCompletion()) {
@@ -2182,12 +2197,14 @@ void VulkanCommandProcessor::RecreateSamplersIfMipLodBiasChanged() {
   AwaitSubmissionWorker();
   texture_cache_->ClearSamplers();
   ResetSamplerBindings();
-  REXGPU_INFO("Applied the texture LOD bias {} (was {}) in {} ms", mip_lod_bias,
-              sampler_mip_lod_bias_,
+  REXGPU_INFO("Applied the texture LOD bias {} (was {}) and anisotropic override {} (was {}) in {} ms",
+              mip_lod_bias, sampler_mip_lod_bias_, anisotropic_override,
+              sampler_anisotropic_override_,
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count());
   sampler_mip_lod_bias_ = mip_lod_bias;
+  sampler_anisotropic_override_ = anisotropic_override;
 }
 
 void VulkanCommandProcessor::ResetSamplerBindings() {
@@ -2644,7 +2661,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Settings that rebuild host objects apply between frames.
   SwitchDrawResolutionScaleIfRequested();
-  RecreateSamplersIfMipLodBiasChanged();
+  RecreateSamplersIfSettingsChanged();
 }
 
 void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,

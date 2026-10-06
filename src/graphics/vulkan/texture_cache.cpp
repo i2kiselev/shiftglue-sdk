@@ -40,6 +40,7 @@ namespace rex::graphics::vulkan {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+#include "../shaders/vulkan_spirv/fh1_scaled_resolve_rescale_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_128bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_16bpb_cs.h"
@@ -441,6 +442,10 @@ VulkanTextureCache::~VulkanTextureCache() {
   ClearSamplers();
 
   ShutdownScaledResolveBuffer();
+  ReleaseInheritedBuffer();
+  if (rescale_pipeline_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipeline(device, rescale_pipeline_, nullptr);
+  }
 
   if (null_image_view_3d_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, null_image_view_3d_, nullptr);
@@ -523,6 +528,134 @@ void VulkanTextureCache::BeginFrame() {
   TextureCache::BeginFrame();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
+
+  if (inherited_buffer_ != VK_NULL_HANDLE && inherited_runs_.empty() &&
+      command_processor_.GetCompletedSubmission() >= inherited_buffer_submission_) {
+    ReleaseInheritedBuffer();
+  }
+  if (!inherited_runs_.empty()) {
+    ResampleInheritedResolves();
+  }
+}
+
+void VulkanTextureCache::InheritScaledResolves(VulkanTextureCache& previous) {
+  std::vector<ScaledResolveRun> runs = previous.GetScaledResolveRuns();
+  if (runs.empty() || previous.scaled_resolve_buffer_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ReleaseInheritedBuffer();
+  inherited_buffer_ = std::exchange(previous.scaled_resolve_buffer_, VK_NULL_HANDLE);
+  inherited_buffer_memory_ = std::move(previous.scaled_resolve_buffer_memory_);
+  previous.scaled_resolve_buffer_memory_.clear();
+  inherited_scale_ = previous.draw_resolution_scale_x();
+  inherited_runs_ = std::move(runs);
+  inherited_buffer_submission_ = UINT64_MAX;
+}
+
+void VulkanTextureCache::ReleaseInheritedBuffer() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, inherited_buffer_);
+  for (VkDeviceMemory memory : inherited_buffer_memory_) {
+    dfn.vkFreeMemory(device, memory, nullptr);
+  }
+  inherited_buffer_memory_.clear();
+  inherited_runs_.clear();
+  inherited_buffer_submission_ = UINT64_MAX;
+}
+
+void VulkanTextureCache::ResampleInheritedResolves() {
+  const std::vector<ScaledResolveRun> runs = std::move(inherited_runs_);
+  inherited_runs_.clear();
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (rescale_pipeline_ == VK_NULL_HANDLE) {
+    rescale_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        vulkan_device, load_pipeline_layout_, shaders::fh1_scaled_resolve_rescale_cs,
+        sizeof(shaders::fh1_scaled_resolve_rescale_cs));
+    if (rescale_pipeline_ == VK_NULL_HANDLE) {
+      REXGPU_ERROR("VulkanTextureCache: Failed to create the scaled resolve rescale pipeline");
+      inherited_buffer_submission_ = command_processor_.GetCurrentSubmission();
+      return;
+    }
+  }
+  VulkanSharedMemory& vulkan_shared_memory = static_cast<VulkanSharedMemory&>(shared_memory());
+  const uint32_t scale = draw_resolution_scale_x();
+  const uint64_t source_area = uint64_t(inherited_scale_) * inherited_scale_;
+  const uint64_t dest_area = uint64_t(scale) * scale;
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  // Written by earlier submissions; the GPU was idle at the switch.
+  command_processor_.PushBufferMemoryBarrier(
+      inherited_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  // One dispatch per megabyte of guest memory keeps the group count and the
+  // bindings small at any scale.
+  constexpr uint32_t kChunk = UINT32_C(1) << 20;
+  uint64_t guest_bytes = 0;
+  for (const ScaledResolveRun& run : runs) {
+    for (uint32_t offset = 0; offset < run.length; offset += kChunk) {
+      const uint32_t start = run.start + offset;
+      const uint32_t length = std::min(kChunk, run.length - offset);
+      VkBuffer dest_buffer;
+      uint64_t dest_start, dest_length;
+      if (scale > 1) {
+        if (!GetScaledResolveRange(start, length, 0, dest_start, dest_length) ||
+            !CommitScaledResolveRange(start, length)) {
+          continue;
+        }
+        UseScaledResolveBufferForWrite(dest_start, dest_length);
+        dest_buffer = scaled_resolve_buffer_;
+      } else {
+        if (!vulkan_shared_memory.RequestRange(start, length)) {
+          continue;
+        }
+        vulkan_shared_memory.Use(VulkanSharedMemory::Usage::kComputeWrite,
+                                 std::make_pair(start, length));
+        dest_buffer = vulkan_shared_memory.buffer();
+        dest_start = start;
+        dest_length = length;
+      }
+      VkDescriptorSet descriptor_sets[kLoadDescriptorSetCount];
+      for (VkDescriptorSet& descriptor_set : descriptor_sets) {
+        descriptor_set = command_processor_.AllocateSingleTransientDescriptor(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferCompute);
+      }
+      if (!descriptor_sets[0] || !descriptor_sets[1]) {
+        continue;
+      }
+      VkDescriptorBufferInfo buffer_infos[kLoadDescriptorSetCount];
+      buffer_infos[kLoadDescriptorSetIndexDestination] = {dest_buffer, dest_start, dest_length};
+      buffer_infos[kLoadDescriptorSetIndexSource] = {inherited_buffer_, start * source_area,
+                                                     length * source_area};
+      VkWriteDescriptorSet writes[kLoadDescriptorSetCount] = {};
+      for (uint32_t i = 0; i < kLoadDescriptorSetCount; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = descriptor_sets[i];
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &buffer_infos[i];
+      }
+      dfn.vkUpdateDescriptorSets(device, kLoadDescriptorSetCount, writes, 0, nullptr);
+      command_processor_.BindExternalComputePipeline(rescale_pipeline_);
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                             load_pipeline_layout_, 0, kLoadDescriptorSetCount,
+                                             descriptor_sets, 0, nullptr);
+      const uint32_t constants[] = {length, inherited_scale_, scale, run.bpb_log2};
+      command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                        sizeof(constants), constants);
+      command_processor_.SubmitBarriers(true, "end_texture_load");
+      const uint64_t dest_words = length * dest_area / 4;
+      command_buffer.CmdVkDispatch(uint32_t((dest_words + 255) / 256), 1, 1);
+      guest_bytes += length;
+    }
+    MarkRangeAsResolved(run.start, run.length, run.bpb_log2);
+  }
+  inherited_buffer_submission_ = command_processor_.GetCurrentSubmission();
+  REXGPU_INFO("Resampled {} KB of resolved data from {}x to {}x in {} runs", guest_bytes >> 10,
+              inherited_scale_, scale, runs.size());
 }
 
 void VulkanTextureCache::EndFrame() {
@@ -1238,10 +1371,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   const bool loaded = LoadTextureDataFromResidentMemoryUntimed(texture, load_base, load_mips);
   if (command_processor_.debug_log_draws_frame()) {
     const TextureKey key = texture.key();
+    uint32_t rows_first, rows_end;
+    loading_base_rows(rows_first, rows_end);
     REXGPU_INFO("FH1 debug texture load {:08X} {}x{} format={} scaled={} resolve_sourced={} "
-                "base={} mips={}",
+                "base={} mips={} rows={}-{}",
                 key.base_page << 12, key.GetWidth(), key.GetHeight(), uint32_t(key.format),
-                bool(key.scaled_resolve), loading_resolve_sourced(), load_base, load_mips);
+                bool(key.scaled_resolve), loading_resolve_sourced(), load_base, load_mips,
+                rows_first, std::min(rows_end, key.GetHeight()));
   }
   if (gpu_profile_executor) {
     gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
@@ -1337,6 +1473,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_key.scaled_resolve ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_key.scaled_resolve ? draw_resolution_scale_y() : 1;
+
+  // After a resolve into part of an up-to-date base level (one screen tile of
+  // the frame) only the rows it wrote are loaded. They are contiguous in guest
+  // memory (TextureCache::Texture::GetBaseRowsOfRange), so from here on they
+  // are a level of their own height at an offset.
+  uint32_t base_rows_first = 0, base_rows_end = UINT32_MAX;
+  loading_base_rows(base_rows_first, base_rows_end);
+  if (base_rows_end <= height && level_last == 0 && level_packed != 0 && !is_3d_tiling &&
+      array_size == 1 && !host_format.block_compressed &&
+      load_shader_float_convert == kLoadShaderIndexUnknown) {
+    height = base_rows_end - base_rows_first;
+  } else {
+    base_rows_first = 0;
+  }
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
@@ -1589,11 +1739,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     }
 
     // TODO(Triang3l): guest_offset relative to the storage buffer origin.
-    load_constants.guest_offset = 0;
-    if (!is_base) {
-      load_constants.guest_offset += guest_layout.mip_offsets_bytes[level] *
-                                     (texture_resolution_scale_x * texture_resolution_scale_y);
-    }
+    load_constants.guest_offset =
+        (is_base ? base_rows_first * guest_layout.base.row_pitch_bytes
+                 : guest_layout.mip_offsets_bytes[level]) *
+        (texture_resolution_scale_x * texture_resolution_scale_y);
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
     uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
@@ -1825,7 +1974,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     copy_region.imageSubresource.baseArrayLayer = 0;
     copy_region.imageSubresource.layerCount = array_size;
     copy_region.imageOffset.x = 0;
-    copy_region.imageOffset.y = 0;
+    copy_region.imageOffset.y = int32_t(base_rows_first * texture_resolution_scale_y);
     copy_region.imageOffset.z = 0;
     copy_region.imageExtent.width =
         std::max((width * texture_resolution_scale_x) >> level, UINT32_C(1));

@@ -314,9 +314,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // resolution scale cvars name another square scale from 1x to 4x, so the
   // scale changes without a restart (NP-4.7).
   void SwitchDrawResolutionScaleIfRequested();
-  // Between frames, destroys the samplers when texture_mip_lod_bias differs
-  // from the bias they were created with, so they are created again with it.
-  void RecreateSamplersIfMipLodBiasChanged();
+  // Between frames, destroys the samplers when texture_mip_lod_bias or
+  // anisotropic_override differs from what they were created with, so they
+  // are created again with it.
+  void RecreateSamplersIfSettingsChanged();
   // Forgets the samplers and texture descriptors draws reuse. The GPU must be
   // done with every submission and none may be open.
   void ResetSamplerBindings();
@@ -832,6 +833,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t declined_draw_resolution_scale_ = 0;
   // texture_mip_lod_bias when the texture cache's samplers were last dropped.
   double sampler_mip_lod_bias_ = 0.0;
+  int32_t sampler_anisotropic_override_ = 0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;

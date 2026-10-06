@@ -78,4 +78,10 @@ done
 # Their DXBC headers were built with other fxc flags and are kept as they are.
 compile_spirv cs_5_1 fh1_scaled_32bpp_2x.cs.hlsl fh1_scaled_32bpp_2x_cs
 compile_spirv cs_5_1 fh1_reflection_cube_import.cs.hlsl fh1_reflection_cube_import_cs
+# Texture cache: resolves resampled across a scale switch. Its bindings are the
+# load pipeline layout's explicit sets, so no register shifts.
+if [[ -n $GLSLANG ]]; then
+  "$GLSLANG" -D -V -S comp -e main -DFH1_SPIRV=1 --vn fh1_scaled_resolve_rescale_cs \
+    -o vulkan_spirv/fh1_scaled_resolve_rescale_cs.h fh1_scaled_resolve_rescale.cs.hlsl > /dev/null
+fi
 echo compiled

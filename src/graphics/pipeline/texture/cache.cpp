@@ -239,6 +239,10 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
     std::memset(scaled_resolve_pages_.get(), 0, kScaledResolvePageDwordCount * sizeof(uint32_t));
     std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
+    scaled_resolve_page_bpb_log2_ =
+        std::unique_ptr<uint8_t[]>(new uint8_t[SharedMemory::kBufferSize / 4096]);
+    std::memset(scaled_resolve_page_bpb_log2_.get(), kScaledResolveBpbUnknown,
+                SharedMemory::kBufferSize / 4096);
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
@@ -246,6 +250,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     reload_probe_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ReloadProbeGlobalWatchCallback, this);
   }
+  outdated_rows_global_watch_handle_ =
+      shared_memory.RegisterGlobalWatch(OutdatedRowsGlobalWatchCallback, this);
 }
 
 TextureCache::~TextureCache() {
@@ -257,6 +263,7 @@ TextureCache::~TextureCache() {
   if (reload_probe_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(reload_probe_global_watch_handle_);
   }
+  shared_memory().UnregisterGlobalWatch(outdated_rows_global_watch_handle_);
 }
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
@@ -344,7 +351,36 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+std::vector<TextureCache::ScaledResolveRun> TextureCache::GetScaledResolveRuns() {
+  std::vector<ScaledResolveRun> runs;
+  if (!IsDrawResolutionScaled()) {
+    return runs;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  constexpr uint32_t kPageCount = SharedMemory::kBufferSize / 4096;
+  for (uint32_t page = 0; page < kPageCount; ++page) {
+    if (!(scaled_resolve_pages_[page >> 5] & (UINT32_C(1) << (page & 31)))) {
+      if (!(page & 31) && !scaled_resolve_pages_[page >> 5]) {
+        page += 31;
+      }
+      continue;
+    }
+    const uint32_t bpb_log2 = scaled_resolve_page_bpb_log2_[page];
+    if (bpb_log2 > 3) {
+      continue;
+    }
+    if (!runs.empty() && runs.back().bpb_log2 == bpb_log2 &&
+        runs.back().start + runs.back().length == page << 12) {
+      runs.back().length += 4096;
+    } else {
+      runs.push_back({page << 12, 4096, bpb_log2});
+    }
+  }
+  return runs;
+}
+
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                                       uint32_t bpb_log2) {
   if (length_unscaled == 0) {
     return;
   }
@@ -368,11 +404,35 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       scaled_resolve_pages_[i] |= add_bits;
       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
     }
+    std::memset(scaled_resolve_page_bpb_log2_.get() + page_first, int(bpb_log2),
+                page_last - page_first + 1);
+  }
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t i = textures_outdated_in_rows_.size(); i-- > 0;) {
+      Texture& texture = *textures_outdated_in_rows_[i];
+      if (start_unscaled >= (texture.key().base_page << 12) + texture.GetGuestBaseSize() ||
+          start_unscaled + length_unscaled <= texture.key().base_page << 12) {
+        continue;
+      }
+      uint32_t outdated_first, outdated_end, written_first = 0, written_end = UINT32_MAX;
+      texture.base_outdated_rows(global_lock, outdated_first, outdated_end);
+      if (texture.GetBaseRowsOfRange(start_unscaled, length_unscaled, written_first,
+                                     written_end)) {
+        written_first = std::min(written_first, outdated_first);
+        written_end = std::max(written_end, outdated_end);
+      }
+      texture.SetBaseOutdatedRows(global_lock, written_first, written_end);
+    }
   }
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
+  resolving_start_ = start_unscaled;
+  resolving_length_ = length_unscaled;
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  resolving_length_ = 0;
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -407,6 +467,8 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
     auto global_lock = global_critical_region_.Acquire();
     if (outdated_mask & Texture::kOutdatedBitBase) {
       base_outdated = texture.base_outdated(global_lock);
+      texture.base_outdated_rows(global_lock, pending_load_out.base_rows_first,
+                                 pending_load_out.base_rows_end);
     }
     if (outdated_mask & Texture::kOutdatedBitMips) {
       mips_outdated = texture.mips_outdated(global_lock);
@@ -493,9 +555,13 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
 
   loading_resolve_sourced_ = pending_load.resolve_sourced;
+  loading_base_rows_first_ = pending_load.base_rows_first;
+  loading_base_rows_end_ = pending_load.base_rows_end;
   const auto load_start = std::chrono::steady_clock::now();
   const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                                             pending_load.load_mips);
+  loading_base_rows_first_ = 0;
+  loading_base_rows_end_ = UINT32_MAX;
   if (pending_load.resolve_sourced) {
     PERF_counter_add(kTextureResolveReloadCpuTimeNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -821,6 +887,7 @@ TextureCache::Texture::~Texture() {
   if (base_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
   }
+  SetBaseOutdatedRows(texture_cache_.global_critical_region_.Acquire(), 0, UINT32_MAX);
 
   if (in_usage_list_) {
     if (used_previous_) {
@@ -858,6 +925,7 @@ void TextureCache::Texture::CompleteLoad(
   bool loaded = false;
   if (load_base && base_watch_handle_) {
     base_outdated_ = false;
+    SetBaseOutdatedRows(global_lock, 0, UINT32_MAX);
     gpu_outdated_mask_ &= ~kOutdatedBitBase;
     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
     loaded = true;
@@ -908,8 +976,49 @@ void TextureCache::Texture::MarkAsUsed() {
   texture_cache_.texture_used_last_ = this;
 }
 
+bool TextureCache::Texture::GetBaseRowsOfRange(uint32_t start, uint32_t length,
+                                               uint32_t& first_out, uint32_t& end_out) const {
+  const FormatInfo* format_info = FormatInfo::Get(key_.format);
+  // The tiled address of a texel is that of its 32-row band plus an offset
+  // within the band only from 4 bytes per block; linear rows always are.
+  if (key_.dimension != xenos::DataDimension::k2DOrStacked || key_.depth_or_array_size_minus_1 ||
+      !guest_layout_.packed_level || format_info->block_width != 1 ||
+      format_info->block_height != 1 || format_info->bytes_per_block() < 4) {
+    return false;
+  }
+  const uint32_t band_bytes = guest_layout_.base.row_pitch_bytes * xenos::kTextureTileWidthHeight;
+  const uint64_t base_start = uint64_t(key_.base_page) << 12;
+  const uint64_t end = uint64_t(start) + length;
+  if (!band_bytes || end <= base_start) {
+    return false;
+  }
+  const uint64_t band_first = start > base_start ? (start - base_start) / band_bytes : 0;
+  const uint64_t band_end = (end - base_start + band_bytes - 1) / band_bytes;
+  first_out = uint32_t(band_first * xenos::kTextureTileWidthHeight);
+  end_out = uint32_t(
+      std::min<uint64_t>(band_end * xenos::kTextureTileWidthHeight, key_.GetHeight()));
+  return first_out < end_out;
+}
+
+void TextureCache::Texture::SetBaseOutdatedRows(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t first,
+    uint32_t end) {
+  auto& list = texture_cache_.textures_outdated_in_rows_;
+  const bool was_listed = base_outdated_rows_end_ != UINT32_MAX;
+  if (was_listed != (end != UINT32_MAX)) {
+    if (was_listed) {
+      *std::find(list.begin(), list.end(), this) = list.back();
+      list.pop_back();
+    } else {
+      list.push_back(this);
+    }
+  }
+  base_outdated_rows_first_ = first;
+  base_outdated_rows_end_ = end;
+}
+
 void TextureCache::Texture::WatchCallback(
-    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
+    const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
     bool invalidated_by_gpu) {
   const uint32_t bit = is_mip ? kOutdatedBitMips : kOutdatedBitBase;
   if (is_mip) {
@@ -918,6 +1027,14 @@ void TextureCache::Texture::WatchCallback(
     mips_watch_handle_ = nullptr;
   } else {
     assert_not_zero(GetGuestBaseSize());
+    uint32_t rows_first = 0, rows_end = UINT32_MAX;
+    if (base_outdated_ || !invalidated_by_gpu || !texture_cache_.resolving_length_ ||
+        !GetBaseRowsOfRange(texture_cache_.resolving_start_, texture_cache_.resolving_length_,
+                            rows_first, rows_end)) {
+      rows_first = 0;
+      rows_end = UINT32_MAX;
+    }
+    SetBaseOutdatedRows(global_lock, rows_first, rows_end);
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
   }
@@ -1175,7 +1292,11 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   key_out.pitch = fetch.pitch;
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
-  key_out.packed_mips = fetch.packed_mips;
+  // Without a level in the packed tail the flag changes nothing in the layout;
+  // dropped, one texture read with and without it is one texture.
+  key_out.packed_mips =
+      fetch.packed_mips &&
+      texture_util::GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1) <= mip_max_level;
   key_out.format = format;
   key_out.endianness = fetch.endianness;
 
@@ -1287,6 +1408,24 @@ void TextureCache::ReloadProbeGlobalWatchCallback(
       "FH1 texture invalidation range {{\"first\":\"{:08X}\",\"last\":\"{:08X}\","
       "\"gpu\":{}}}",
       address_first, address_last, invalidated_by_gpu);
+}
+
+void TextureCache::OutdatedRowsGlobalWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
+  // MarkRangeAsResolved has added a resolve's rows itself.
+  if (invalidated_by_gpu && texture_cache->resolving_length_) {
+    return;
+  }
+  auto& list = texture_cache->textures_outdated_in_rows_;
+  for (size_t i = list.size(); i-- > 0;) {
+    Texture& texture = *list[i];
+    const uint32_t base_start = texture.key().base_page << 12;
+    if (address_first < base_start + texture.GetGuestBaseSize() && address_last >= base_start) {
+      texture.SetBaseOutdatedRows(global_lock, 0, UINT32_MAX);
+    }
+  }
 }
 
 void TextureCache::ScaledResolveGlobalWatchCallback(

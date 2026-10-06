@@ -136,6 +136,14 @@ class VulkanTextureCache final : public TextureCache {
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
 
+  // After a draw resolution scale switch, with the GPU idle: takes the
+  // previous cache's scaled resolve buffer and resamples what it holds into
+  // this cache's scale at the start of the next frame, so render targets the
+  // title draws once per scene (a showroom's reflections) survive the switch.
+  void InheritScaledResolves(VulkanTextureCache& previous);
+  // Inherited data waits for a frame; a further switch must not drop it.
+  bool has_pending_inherited_resolves() const { return !inherited_runs_.empty(); }
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -402,6 +410,18 @@ class VulkanTextureCache final : public TextureCache {
   std::vector<uint64_t> scaled_resolve_sparse_allocated_;
   bool scaled_resolve_last_usage_write_ = false;
   std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
+
+  // The previous scale's resolve buffer and what to resample from it
+  // (InheritScaledResolves); the buffer goes once the copying submission is
+  // done.
+  void ResampleInheritedResolves();
+  void ReleaseInheritedBuffer();
+  VkBuffer inherited_buffer_ = VK_NULL_HANDLE;
+  std::vector<VkDeviceMemory> inherited_buffer_memory_;
+  uint32_t inherited_scale_ = 1;
+  std::vector<ScaledResolveRun> inherited_runs_;
+  uint64_t inherited_buffer_submission_ = UINT64_MAX;
+  VkPipeline rescale_pipeline_ = VK_NULL_HANDLE;
 };
 
 }  // namespace rex::graphics::vulkan

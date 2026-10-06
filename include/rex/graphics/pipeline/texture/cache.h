@@ -80,7 +80,18 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // The scaled resolve layout depends on the resolved texel size; a range
+  // marked without one is not carried across a scale switch.
+  static constexpr uint32_t kScaledResolveBpbUnknown = 0xFF;
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           uint32_t bpb_log2 = kScaledResolveBpbUnknown);
+  // Scaled resolve data of one texel size in whole 4 KB pages.
+  struct ScaledResolveRun {
+    uint32_t start;
+    uint32_t length;
+    uint32_t bpb_log2;
+  };
+  std::vector<ScaledResolveRun> GetScaledResolveRuns();
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -249,6 +260,22 @@ class TextureCache {
       return gpu_outdated_mask_;
     }
 
+    // The rows of an outdated base level a load has to bring up to date,
+    // [first, end) in steps of 32: only those a resolve wrote when the level
+    // was up to date before it (a frame resolved one screen tile at a time).
+    // The whole level when the end is UINT32_MAX.
+    void base_outdated_rows(const std::unique_lock<std::recursive_mutex>& global_lock,
+                            uint32_t& first_out, uint32_t& end_out) const {
+      first_out = base_outdated_rows_first_;
+      end_out = base_outdated_rows_end_;
+    }
+    // Whether [start, start + length) of guest memory overlaps the base level
+    // and the rows it covers are known (32 rows of the level are contiguous).
+    bool GetBaseRowsOfRange(uint32_t start, uint32_t length, uint32_t& first_out,
+                            uint32_t& end_out) const;
+    void SetBaseOutdatedRows(const std::unique_lock<std::recursive_mutex>& global_lock,
+                             uint32_t first, uint32_t end);
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
@@ -292,6 +319,8 @@ class TextureCache {
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
     uint32_t gpu_outdated_mask_ = 0;
+    uint32_t base_outdated_rows_first_ = 0;
+    uint32_t base_outdated_rows_end_ = UINT32_MAX;
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -569,6 +598,12 @@ class TextureCache {
   // Whether the load in LoadTextureDataFromResidentMemoryImpl reloads data a
   // GPU write (a resolve) invalidated, for profiling.
   bool loading_resolve_sourced() const { return loading_resolve_sourced_; }
+  // The rows of the base level the load in LoadTextureDataFromResidentMemoryImpl
+  // has to bring up to date (Texture::base_outdated_rows); loading more is fine.
+  void loading_base_rows(uint32_t& first_out, uint32_t& end_out) const {
+    first_out = loading_base_rows_first_;
+    end_out = loading_base_rows_end_;
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -599,6 +634,8 @@ class TextureCache {
     bool load_base = false;
     bool load_mips = false;
     bool resolve_sourced = false;
+    uint32_t base_rows_first = 0;
+    uint32_t base_rows_end = UINT32_MAX;
   };
   struct PendingSharedMemoryRange {
     uint32_t start = 0;
@@ -626,6 +663,11 @@ class TextureCache {
   void ScaledResolveGlobalWatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                         uint32_t address_first, uint32_t address_last,
                                         bool invalidated_by_gpu);
+  // Global shared memory invalidation callback for writes other than resolves
+  // to textures outdated in some rows only.
+  static void OutdatedRowsGlobalWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
@@ -643,10 +685,20 @@ class TextureCache {
   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
   // level 2 bits.
   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
+  // The texel size (log2 bytes) of each page's latest resolve.
+  std::unique_ptr<uint8_t[]> scaled_resolve_page_bpb_log2_;
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
   SharedMemory::GlobalWatchHandle reload_probe_global_watch_handle_ = nullptr;
+  SharedMemory::GlobalWatchHandle outdated_rows_global_watch_handle_ = nullptr;
+  // Textures whose base level is outdated in some rows only, within the global
+  // critical region. An outdated texture has no watch, so later writes to it
+  // reach its rows through this list.
+  std::vector<Texture*> textures_outdated_in_rows_;
+  // The range MarkRangeAsResolved is invalidating (GPU command thread only).
+  uint32_t resolving_start_ = 0;
+  uint32_t resolving_length_ = 0;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
@@ -669,6 +721,8 @@ class TextureCache {
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
   bool loading_resolve_sourced_ = false;
+  uint32_t loading_base_rows_first_ = 0;
+  uint32_t loading_base_rows_end_ = UINT32_MAX;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Recent derivations per fetch constant: while no binding has been reset
