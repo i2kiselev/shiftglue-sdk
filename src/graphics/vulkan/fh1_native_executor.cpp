@@ -2129,13 +2129,14 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
 }
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
-  // As the D3D12 executor: the first frames of each run of resolves to a new,
-  // large range are read back (car thumbnails the game saves). 64 KB takes in
-  // the 32x512 blurred asphalt strips FM4 renders at race load and compresses
-  // on the CPU for its road detail texture.
+  // As the D3D12 executor: the first frames of each run of resolves to a new
+  // range are read back: car thumbnails the game saves, the 32x512 blurred
+  // asphalt strips FM4 compresses on the CPU at race load, and the 8x8 cube
+  // faces no draw samples, which the CPU reads for the cars' ambient light. Any
+  // size: with a 64 KB floor those faces kept whatever the memory held before,
+  // tinting cars purple once a few races had left garbage there.
   constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
                      kNewFrames = 120;
-  constexpr uint32_t kMinLength = 64 * 1024;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
   if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
     if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
@@ -2144,7 +2145,7 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
     readback.run_start_frame = frame_;
   }
   readback.last_used_frame = frame_;
-  return length >= kMinLength && frame_ < readback.run_start_frame + kRunReadbackFrames &&
+  return frame_ < readback.run_start_frame + kRunReadbackFrames &&
          frame_ < readback.new_since_frame + kNewFrames;
 }
 
