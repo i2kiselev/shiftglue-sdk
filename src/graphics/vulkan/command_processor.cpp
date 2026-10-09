@@ -13,6 +13,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -85,6 +86,8 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
                     "Submit command buffer when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
@@ -6266,6 +6269,46 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+    }
+    // Diagnostics for corrupted textures: "flush_textures" in the dump
+    // directory reloads every texture from the GPU's copy of guest memory,
+    // "flush_memory" also re-reads what the CPU wrote, so a stale texture, a
+    // stale copy and bad guest data can be told apart in a running game. The
+    // next frame is dumped, so its log lists every reload.
+    if (shared_memory_ && !(frame_current_ & 31) && !REXCVAR_GET(fh1_resolve_dump_dir).empty()) {
+      const std::filesystem::path dump_dir(REXCVAR_GET(fh1_resolve_dump_dir));
+      std::error_code error;
+      const bool flush_memory = std::filesystem::remove(dump_dir / "flush_memory", error);
+      const bool flush_textures =
+          std::filesystem::remove(dump_dir / "flush_textures", error) || flush_memory;
+      if (flush_textures && AwaitAllQueueOperationsCompletion()) {
+        if (flush_memory) {
+          shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+        }
+        texture_cache_->ClearCache();
+        std::ofstream(dump_dir / "trigger");
+        REXGPU_INFO("FH1 debug flush: textures{} at frame {}", flush_memory ? " and CPU memory" : "",
+                    frame_current_);
+      }
+      // "dump_memory" lists "<address> <length>" in hex per line; each range of
+      // guest memory is written as it is now, to decode it against the picture.
+      std::ifstream dump_list(dump_dir / "dump_memory");
+      if (dump_list) {
+        uint32_t address, length;
+        dump_list >> std::hex;
+        while (dump_list >> address >> length) {
+          address &= 0x1FFFFFFF;
+          length = std::min(length, SharedMemory::kBufferSize - address);
+          std::ofstream(dump_dir / fmt::format("guest_{:08X}_{:X}.bin", address, length),
+                        std::ios::binary)
+              .write(memory_->TranslatePhysical<const char*>(address), std::streamsize(length));
+          const auto [valid, gpu_written] = shared_memory_->CountValidPages(address, length);
+          REXGPU_INFO("FH1 debug memory {:08X}+{:X}: pages valid {} gpu-written {} of {}", address,
+                      length, valid, gpu_written, (length + 4095) >> 12);
+        }
+        dump_list.close();
+        std::filesystem::remove(dump_dir / "dump_memory", error);
+      }
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
