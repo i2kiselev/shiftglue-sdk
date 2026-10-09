@@ -83,6 +83,9 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
   allocator_create_info.physicalDevice = vulkan_device->physical_device();
   allocator_create_info.device = vulkan_device->device();
   allocator_create_info.pVulkanFunctions = &vma_vulkan_functions;
+  // The texture cache evicts textures one by one; in VMA's default 256 MB blocks the survivors
+  // keep a block alive, and a 2x race held 480 MB of blocks for 305 MB of textures.
+  allocator_create_info.preferredLargeHeapBlockSize = VkDeviceSize(32) << 20;
   allocator_create_info.instance = vulkan_instance->instance();
   allocator_create_info.vulkanApiVersion = vulkan_device->properties().apiVersion;
   VmaAllocator allocator;

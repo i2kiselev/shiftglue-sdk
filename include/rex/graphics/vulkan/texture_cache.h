@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <bit>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -132,6 +133,12 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+  uint64_t scaled_resolve_committed_bytes() const {
+    if (!scaled_resolve_buffer_sparse_) return scaled_resolve_buffer_size_;
+    uint64_t allocations = 0;
+    for (uint64_t bits : scaled_resolve_sparse_allocated_) allocations += std::popcount(bits);
+    return allocations << scaled_resolve_sparse_granularity_log2_;
+  }
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);

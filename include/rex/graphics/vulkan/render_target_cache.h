@@ -101,6 +101,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   Path GetPath() const override { return path_; }
 
   VkBuffer edram_buffer() const { return edram_buffer_; }
+  // For a cache that will never draw or resolve; the buffer is EDRAM size times the scale squared.
+  void ReleaseEdramBuffer();
 
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a

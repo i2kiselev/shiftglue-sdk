@@ -1986,6 +1986,9 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     if (!fh1_native_executor_->Initialize(native_config)) {
       REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
       fh1_native_executor_.reset();
+    } else {
+      // The executor draws and resolves; the cache only answers format queries.
+      render_target_cache_->ReleaseEdramBuffer();
     }
   }
 
@@ -2679,6 +2682,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   }
   if (fh1_native_executor_) {
     fh1_native_executor_->OnSwap(frame_current_);
+  }
+  if (frame_current_ % 600 == 0) {
+    REXGPU_INFO("GPU memory MB: textures {} scaled_resolve {} shared_memory {}",
+                texture_cache_->total_host_memory_usage() >> 20,
+                texture_cache_->scaled_resolve_committed_bytes() >> 20,
+                shared_memory_->host_gpu_memory_sparse_used_bytes() >> 20);
   }
 
   if (!graphics_system_)

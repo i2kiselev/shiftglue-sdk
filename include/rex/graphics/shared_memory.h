@@ -26,6 +26,7 @@ namespace rex::graphics {
 // system page size granularity.
 class SharedMemory {
  public:
+  uint32_t host_gpu_memory_sparse_used_bytes() const { return host_gpu_memory_sparse_used_bytes_; }
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
 
