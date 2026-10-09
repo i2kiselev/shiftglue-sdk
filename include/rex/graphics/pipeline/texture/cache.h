@@ -92,6 +92,11 @@ class TextureCache {
     uint32_t bpb_log2;
   };
   std::vector<ScaledResolveRun> GetScaledResolveRuns();
+  // Guest ranges (start, length) whose scaled resolve data may still be read:
+  // runs of pages marked as scaled-resolved, whatever their texel size, and the
+  // base and mips of every live scaled texture.
+  std::vector<std::pair<uint32_t, uint32_t>> GetScaledResolvedPageRuns();
+  std::vector<std::pair<uint32_t, uint32_t>> GetLiveScaledTextureRanges() const;
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,

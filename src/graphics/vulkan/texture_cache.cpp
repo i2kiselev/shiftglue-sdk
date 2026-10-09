@@ -17,6 +17,7 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/cvar.h>
@@ -2350,6 +2351,11 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer() {
       uint32_t allocation_count_log2 =
           std::max(uint32_t(6), size_log2 - scaled_resolve_sparse_granularity_log2_);
       scaled_resolve_sparse_allocated_.resize(size_t(1) << (allocation_count_log2 - uint32_t(6)));
+      const size_t granule_count = size_t(1) << allocation_count_log2;
+      scaled_resolve_buffer_memory_.assign(granule_count, VK_NULL_HANDLE);
+      scaled_resolve_granule_touch_ms_.assign(granule_count, 0);
+      scaled_resolve_granule_touch_submission_.assign(granule_count, 0);
+      scaled_resolve_granule_release_submission_.assign(granule_count, 0);
       scaled_resolve_buffer_sparse_ = true;
     } else {
       dfn.vkDestroyBuffer(device, scaled_resolve_buffer_, nullptr);
@@ -2389,7 +2395,14 @@ void VulkanTextureCache::ShutdownScaledResolveBuffer() {
     dfn.vkFreeMemory(device, memory, nullptr);
   }
   scaled_resolve_buffer_memory_.clear();
+  for (const auto& [submission, memory] : scaled_resolve_memory_to_free_) {
+    dfn.vkFreeMemory(device, memory, nullptr);
+  }
+  scaled_resolve_memory_to_free_.clear();
   scaled_resolve_sparse_allocated_.clear();
+  scaled_resolve_granule_touch_ms_.clear();
+  scaled_resolve_granule_touch_submission_.clear();
+  scaled_resolve_granule_release_submission_.clear();
   scaled_resolve_buffer_size_ = 0;
   scaled_resolve_buffer_sparse_ = false;
   scaled_resolve_buffer_memory_type_ = UINT32_MAX;
@@ -2439,23 +2452,33 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
   uint32_t allocation_first = uint32_t(start_scaled >> scaled_resolve_sparse_granularity_log2_);
   uint32_t allocation_last =
       uint32_t((start_scaled + (length_scaled - 1)) >> scaled_resolve_sparse_granularity_log2_);
-  while (true) {
-    std::pair<size_t, size_t> allocation_range =
-        rex::bit::GetNextRangeUnset(scaled_resolve_sparse_allocated_.data(), allocation_first,
-                                    allocation_last - allocation_first + 1);
-    if (!allocation_range.second) {
-      break;
-    }
+  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+  const uint64_t submission_current = command_processor_.GetCurrentSubmission();
+  for (uint32_t i = allocation_first; i <= allocation_last; ++i) {
+    scaled_resolve_granule_touch_ms_[i] = now_ms;
+    scaled_resolve_granule_touch_submission_[i] = submission_current;
+  }
 
-    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const VkDeviceSize granule_size = VkDeviceSize(1) << scaled_resolve_sparse_granularity_log2_;
+  std::vector<VkSparseMemoryBind> binds;
+  bool allocated = true;
+  for (uint32_t i = allocation_first; i <= allocation_last; ++i) {
+    if (scaled_resolve_sparse_allocated_[i >> 6] & (UINT64_C(1) << (i & 63))) {
+      continue;
+    }
+    if (scaled_resolve_granule_release_submission_[i] >
+        command_processor_.GetCompletedSubmission()) {
+      command_processor_.AwaitSubmission(scaled_resolve_granule_release_submission_[i]);
+    }
+    scaled_resolve_granule_release_submission_[i] = 0;
 
     VkMemoryAllocateInfo memory_allocate_info;
     memory_allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     memory_allocate_info.pNext = nullptr;
-    memory_allocate_info.allocationSize = VkDeviceSize(allocation_range.second)
-                                          << scaled_resolve_sparse_granularity_log2_;
+    memory_allocate_info.allocationSize = granule_size;
     memory_allocate_info.memoryTypeIndex = scaled_resolve_buffer_memory_type_;
     VkDeviceMemory allocation_memory;
     if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &allocation_memory) !=
@@ -2463,26 +2486,107 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
       REXGPU_ERROR(
           "VulkanTextureCache: Failed to allocate sparse memory for the "
           "scaled resolve buffer");
-      return false;
+      allocated = false;
+      break;
     }
-    scaled_resolve_buffer_memory_.push_back(allocation_memory);
+    scaled_resolve_buffer_memory_[i] = allocation_memory;
 
-    VkSparseMemoryBind bind;
-    bind.resourceOffset = VkDeviceSize(allocation_range.first)
-                          << scaled_resolve_sparse_granularity_log2_;
-    bind.size = memory_allocate_info.allocationSize;
+    VkSparseMemoryBind& bind = binds.emplace_back();
+    bind.resourceOffset = VkDeviceSize(i) << scaled_resolve_sparse_granularity_log2_;
+    bind.size = granule_size;
     bind.memory = allocation_memory;
     bind.memoryOffset = 0;
     bind.flags = 0;
-    command_processor_.SparseBindBuffer(
-        scaled_resolve_buffer_, 1, &bind,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-    rex::bit::SetRange(scaled_resolve_sparse_allocated_.data(), allocation_range.first,
-                       allocation_range.second);
-    allocation_first = uint32_t(allocation_range.first + allocation_range.second);
+    scaled_resolve_sparse_allocated_[i >> 6] |= UINT64_C(1) << (i & 63);
   }
-  return true;
+  command_processor_.SparseBindBuffer(
+      scaled_resolve_buffer_, uint32_t(binds.size()), binds.data(),
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+  return allocated;
+}
+
+void VulkanTextureCache::ReleaseStaleScaledResolveMemory() {
+  if (!scaled_resolve_buffer_sparse_) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const uint64_t submission_completed = command_processor_.GetCompletedSubmission();
+  std::erase_if(scaled_resolve_memory_to_free_, [&](const auto& entry) {
+    if (entry.first > submission_completed) {
+      return false;
+    }
+    dfn.vkFreeMemory(device, entry.second, nullptr);
+    return true;
+  });
+
+  constexpr uint64_t kCheckIntervalMs = 1000;
+  constexpr uint64_t kIdleMs = 10000;
+  const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+  if (now_ms < scaled_resolve_release_check_ms_ + kCheckIntervalMs) {
+    return;
+  }
+  scaled_resolve_release_check_ms_ = now_ms;
+
+  const uint32_t granularity_log2 = scaled_resolve_sparse_granularity_log2_;
+  const size_t granule_count = scaled_resolve_granule_touch_ms_.size();
+  std::vector<uint8_t> candidates(granule_count, 0);
+  bool any_candidate = false;
+  for (size_t i = 0; i < granule_count; ++i) {
+    if ((scaled_resolve_sparse_allocated_[i >> 6] & (UINT64_C(1) << (i & 63))) &&
+        scaled_resolve_granule_touch_ms_[i] + kIdleMs < now_ms &&
+        scaled_resolve_granule_touch_submission_[i] <= submission_completed) {
+      candidates[i] = 1;
+      any_candidate = true;
+    }
+  }
+  if (!any_candidate) {
+    return;
+  }
+  const uint64_t scale_area =
+      uint64_t(draw_resolution_scale_x()) * uint64_t(draw_resolution_scale_y());
+  auto keep = [&](uint32_t start, uint32_t length) {
+    uint64_t first = (uint64_t(start) * scale_area) >> granularity_log2;
+    uint64_t last = ((uint64_t(start) + length) * scale_area - 1) >> granularity_log2;
+    for (uint64_t i = first; i <= last && i < granule_count; ++i) {
+      candidates[size_t(i)] = 0;
+    }
+  };
+  for (const auto& [start, length] : GetScaledResolvedPageRuns()) {
+    keep(start, length);
+  }
+  for (const auto& [start, length] : GetLiveScaledTextureRanges()) {
+    keep(start, length);
+  }
+
+  const uint64_t submission_current = command_processor_.GetCurrentSubmission();
+  std::vector<VkSparseMemoryBind> unbinds;
+  for (size_t i = 0; i < granule_count; ++i) {
+    if (!candidates[i]) {
+      continue;
+    }
+    VkSparseMemoryBind& unbind = unbinds.emplace_back();
+    unbind.resourceOffset = VkDeviceSize(i) << granularity_log2;
+    unbind.size = VkDeviceSize(1) << granularity_log2;
+    unbind.memory = VK_NULL_HANDLE;
+    unbind.memoryOffset = 0;
+    unbind.flags = 0;
+    scaled_resolve_memory_to_free_.emplace_back(submission_current,
+                                                scaled_resolve_buffer_memory_[i]);
+    scaled_resolve_buffer_memory_[i] = VK_NULL_HANDLE;
+    scaled_resolve_sparse_allocated_[i >> 6] &= ~(UINT64_C(1) << (i & 63));
+    scaled_resolve_granule_release_submission_[i] = submission_current;
+  }
+  if (unbinds.empty()) {
+    return;
+  }
+  command_processor_.SparseBindBuffer(
+      scaled_resolve_buffer_, uint32_t(unbinds.size()), unbinds.data(),
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+  REXGPU_INFO("Scaled resolve buffer: released {} MB, {} MB committed",
+              (uint64_t(unbinds.size()) << granularity_log2) >> 20,
+              scaled_resolve_committed_bytes() >> 20);
 }
 
 void VulkanTextureCache::GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_mask_out,

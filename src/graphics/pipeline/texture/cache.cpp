@@ -379,6 +379,45 @@ std::vector<TextureCache::ScaledResolveRun> TextureCache::GetScaledResolveRuns()
   return runs;
 }
 
+std::vector<std::pair<uint32_t, uint32_t>> TextureCache::GetScaledResolvedPageRuns() {
+  std::vector<std::pair<uint32_t, uint32_t>> runs;
+  if (!IsDrawResolutionScaled()) {
+    return runs;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  constexpr uint32_t kPageCount = SharedMemory::kBufferSize / 4096;
+  for (uint32_t page = 0; page < kPageCount; ++page) {
+    if (!(scaled_resolve_pages_[page >> 5] & (UINT32_C(1) << (page & 31)))) {
+      if (!(page & 31) && !scaled_resolve_pages_[page >> 5]) {
+        page += 31;
+      }
+      continue;
+    }
+    if (!runs.empty() && runs.back().first + runs.back().second == page << 12) {
+      runs.back().second += 4096;
+    } else {
+      runs.emplace_back(page << 12, 4096);
+    }
+  }
+  return runs;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> TextureCache::GetLiveScaledTextureRanges() const {
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  for (const auto& [key, texture] : textures_) {
+    if (!key.scaled_resolve) {
+      continue;
+    }
+    if (texture->GetGuestBaseSize()) {
+      ranges.emplace_back(uint32_t(key.base_page) << 12, texture->GetGuestBaseSize());
+    }
+    if (texture->GetGuestMipsSize()) {
+      ranges.emplace_back(uint32_t(key.mip_page) << 12, texture->GetGuestMipsSize());
+    }
+  }
+  return ranges;
+}
+
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
                                        uint32_t bpb_log2) {
   if (length_unscaled == 0) {

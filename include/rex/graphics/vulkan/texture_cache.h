@@ -132,6 +132,12 @@ class VulkanTextureCache final : public TextureCache {
     return EnsureScaledResolveMemoryCommitted(start_unscaled, length_unscaled,
                                               length_scaled_alignment_log2);
   }
+  // Unbinds and frees the scaled resolve buffer's sparse allocations that no
+  // resolve or texture load has reached for a while and that hold no page still
+  // marked as resolved nor any live scaled texture. Called as a frame's last
+  // submission ends, after all of its commits: a range must not be bound twice
+  // in one batch.
+  void ReleaseStaleScaledResolveMemory();
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
   uint64_t scaled_resolve_committed_bytes() const {
     if (!scaled_resolve_buffer_sparse_) return scaled_resolve_buffer_size_;
@@ -412,9 +418,19 @@ class VulkanTextureCache final : public TextureCache {
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;
   uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;
+  // Sparse: one allocation per granule, indexed by granule, null where unbound.
   std::vector<VkDeviceMemory> scaled_resolve_buffer_memory_;
   uint32_t scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> scaled_resolve_sparse_allocated_;
+  // Per granule: host uptime in ms and submission of the last resolve or
+  // texture load reaching it, and the submission that unbound it when released,
+  // which must complete before it is bound again.
+  std::vector<uint64_t> scaled_resolve_granule_touch_ms_;
+  std::vector<uint64_t> scaled_resolve_granule_touch_submission_;
+  std::vector<uint64_t> scaled_resolve_granule_release_submission_;
+  // Released memory and the submission whose sparse batch unbinds it.
+  std::vector<std::pair<uint64_t, VkDeviceMemory>> scaled_resolve_memory_to_free_;
+  uint64_t scaled_resolve_release_check_ms_ = 0;
   bool scaled_resolve_last_usage_write_ = false;
   std::pair<uint64_t, uint64_t> scaled_resolve_last_written_range_{0, 0};
 

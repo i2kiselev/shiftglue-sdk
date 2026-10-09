@@ -6071,6 +6071,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  // Ahead of the semaphore for the sparse binds below.
+  if (is_swap && frame_open_ && submission_open_) {
+    texture_cache_->ReleaseStaleScaledResolveMemory();
+  }
+
   // Make sure everything needed for submitting exist.
   if (submission_open_) {
     if (fences_free_.empty()) {

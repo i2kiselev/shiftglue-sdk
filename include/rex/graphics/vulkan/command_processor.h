@@ -170,6 +170,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  void AwaitSubmission(uint64_t submission) { CheckSubmissionFenceAndDeviceLoss(submission); }
 
   // Sparse binds are:
   // - In a single submission, all submitted in one vkQueueBindSparse.
