@@ -1,10 +1,12 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/fh1_depth_overwrite.h>
@@ -77,7 +79,8 @@ class Fh1NativeExecutor {
   void NativeDrawIssued(const Fh1DrawInfo& draw);
   // In place of the render target cache's resolve.
   bool NativeResolve(uint32_t& written_address, uint32_t& written_length);
-  // Copies one-off resolve read-backs into guest memory, waiting for the GPU.
+  // Copies one-off resolve read-backs into guest memory, waiting for the GPU,
+  // or with fh1_async_readbacks only those whose submission has completed.
   void FlushResolveReadbacks();
   // Whether fh1_scaled_msaa_single_sample changed since setup in a way that
   // matters at this scale; it applies when the executor is created again.
@@ -163,7 +166,14 @@ class Fh1NativeExecutor {
     uint32_t length;
     VkBuffer buffer;
     VkDeviceMemory memory;
+    uint64_t submission;
+    // The first run of a range that is new: the guest may process it at
+    // once (race load, thumbnails), so it is waited for even when async.
+    bool wait;
   };
+  // Copies the pending read-backs into guest memory, in order, up to the
+  // first whose submission is after `completed_submission`.
+  void CompleteResolveReadbacks(uint64_t completed_submission);
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
@@ -387,6 +397,7 @@ class Fh1NativeExecutor {
   bool color_overwrite_claims_ = true;
   bool scrambled_stencil_claims_ = true;
   bool surfaceless_clears_ = true;
+  bool async_readbacks_ = false;
   // The words of the clear records, by owner index.
   std::vector<uint32_t> clear_words_;
   // The prepared draw left some of its targets as clear words.
@@ -407,10 +418,13 @@ class Fh1NativeExecutor {
     kGpuFrame,
     kGpuPhases
   };
-  static constexpr uint32_t kGpuProfileSlots = 4;
+  // A GPU-bound frame queue is several frames deep; a pending slot leaves its
+  // frame untimed.
+  static constexpr uint32_t kGpuProfileSlots = 8;
   static constexpr uint32_t kGpuProfileQueries = 2048;
   struct GpuProfileSlot {
     uint32_t used = 0;
+    uint64_t frame = 0;
     uint64_t submission = 0;
     bool pending = false;
     // Phase, first query, last query.
@@ -438,6 +452,32 @@ class Fh1NativeExecutor {
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;
+
+  // fh1_slow_frame_log: frames well above the median of the recent ones.
+  class RecentMedian {
+   public:
+    // Zero until enough samples to compare against.
+    float Median() const;
+    void Add(float value);
+
+   private:
+    std::array<float, 240> values_{};
+    size_t count_ = 0;
+    size_t next_ = 0;
+  };
+  static bool IsSlow(float value, float median) {
+    return median > 0.0f && value > median * 1.5f && value > median + 4.0f;
+  }
+  void LogSlowFrame();
+  bool slow_frame_log_ = false;
+  std::chrono::steady_clock::time_point slow_frame_last_swap_{};
+  RecentMedian slow_frame_intervals_;
+  RecentMedian slow_gpu_frames_;
+  uint64_t slow_frame_draws_ = 0;
+  uint64_t slow_frame_resolves_ = 0;
+  std::unordered_map<const char*, uint64_t> slow_frame_stats_;
+  std::string slow_frame_previous_;
+
   // Tile passes per source -> destination surface pair while profiling.
   std::map<std::string, uint64_t> transfer_volume_;
   // Resolve kinds already reported as skipped, so each is logged once.

@@ -36,6 +36,20 @@ REXCVAR_DEFINE_BOOL(fh1_scrambled_stencil_claims, true, "GPU",
                     "claim tiles whose stencil came from another sample layout, zeroing it "
                     "instead of transferring it (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_slow_frame_log, false, "GPU",
+                    "Log the frames that take well above the recent median (Vulkan), with the "
+                    "frame before: the GPU thread's fence waits and full queue drains, memexport "
+                    "readbacks, draws, resolves and the executor's counts; with "
+                    "fh1_native_gpu_profile also the slow GPU frames by phase")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_async_readbacks, false, "GPU",
+                    "Steadier frame times when the GPU is fully loaded, at the risk of texture "
+                    "and lighting corruption (Vulkan). Copies the resolves the CPU reads into "
+                    "guest memory once their submission has completed instead of waiting for "
+                    "the whole GPU queue at the guest's sync point, so the guest can see its "
+                    "fence before the data, which arrives a few frames later. The first run of "
+                    "a range that is new still waits")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(fh1_surfaceless_clears, true, "GPU",
                     "Keep the whole tiles a clear sets to one value as that value instead of in a "
                     "surface of the clear's layout (D3D's fast clears through a 4x MSAA view); "
@@ -364,6 +378,8 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   color_overwrite_claims_ = REXCVAR_GET(fh1_color_overwrite_claims);
   scrambled_stencil_claims_ = REXCVAR_GET(fh1_scrambled_stencil_claims);
   surfaceless_clears_ = REXCVAR_GET(fh1_surfaceless_clears);
+  slow_frame_log_ = REXCVAR_GET(fh1_slow_frame_log);
+  async_readbacks_ = REXCVAR_GET(fh1_async_readbacks);
   if (single_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
   }
@@ -2392,7 +2408,10 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
 }
 
 void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
-  PendingReadback readback = {address, length, VK_NULL_HANDLE, VK_NULL_HANDLE};
+  const ResolveReadback& range = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  PendingReadback readback = {address, length, VK_NULL_HANDLE, VK_NULL_HANDLE,
+                              command_processor_.GetCurrentSubmission(),
+                              range.run_start_frame == range.new_since_frame};
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
           command_processor_.GetVulkanDevice(), length, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
           ui::vulkan::util::MemoryPurpose::kReadback, readback.buffer, readback.memory)) {
@@ -2409,12 +2428,26 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
 
 void Fh1NativeExecutor::FlushResolveReadbacks() {
   if (pending_readbacks_.empty()) return;
+  if (async_readbacks_ &&
+      std::none_of(pending_readbacks_.begin(), pending_readbacks_.end(),
+                   [](const PendingReadback& pending) { return pending.wait; })) {
+    CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());
+    return;
+  }
   command_processor_.Fh1AwaitAllQueueOperations();
+  CompleteResolveReadbacks(UINT64_MAX);
+  Count("resolve_readback_flush");
+}
+
+void Fh1NativeExecutor::CompleteResolveReadbacks(uint64_t completed_submission) {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   // In order: a later resolve over the same bytes wins, as on the GPU.
-  for (PendingReadback& pending : pending_readbacks_) {
+  size_t completed = 0;
+  for (; completed < pending_readbacks_.size(); ++completed) {
+    PendingReadback& pending = pending_readbacks_[completed];
+    if (pending.submission > completed_submission) break;
     uint8_t* destination = memory_.TranslatePhysical(pending.address);
     void* mapped = nullptr;
     if (destination &&
@@ -2430,8 +2463,7 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
     dfn.vkDestroyBuffer(device, pending.buffer, nullptr);
     dfn.vkFreeMemory(device, pending.memory, nullptr);
   }
-  pending_readbacks_.clear();
-  Count("resolve_readback_flush");
+  pending_readbacks_.erase(pending_readbacks_.begin(), pending_readbacks_.begin() + completed);
 }
 
 bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_length) {
@@ -2637,10 +2669,59 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   GpuEndFrame();
   GpuDrain();
   DestroyRetired(command_processor_.GetCompletedSubmission());
+  if (async_readbacks_) CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());
   if (frame_ == dump_trigger_frame_) command_processor_.SetDebugLogDrawsFrame(false);
   frame_ = frame;
+  if (slow_frame_log_) LogSlowFrame();
   if (frame % 64 == 0) ReleaseIdleSurfaces();
   if (frame % 600 == 0) LogStats(frame);
+}
+
+float Fh1NativeExecutor::RecentMedian::Median() const {
+  if (count_ < 60) return 0.0f;
+  std::array<float, 240> sorted = values_;
+  auto middle = sorted.begin() + count_ / 2;
+  std::nth_element(sorted.begin(), middle, sorted.begin() + count_);
+  return *middle;
+}
+
+void Fh1NativeExecutor::RecentMedian::Add(float value) {
+  values_[next_] = value;
+  next_ = (next_ + 1) % values_.size();
+  count_ = std::min(count_ + 1, values_.size());
+}
+
+void Fh1NativeExecutor::LogSlowFrame() {
+  const auto now = std::chrono::steady_clock::now();
+  const float ms = slow_frame_last_swap_.time_since_epoch().count()
+                       ? std::chrono::duration<float, std::milli>(now - slow_frame_last_swap_).count()
+                       : 0.0f;
+  slow_frame_last_swap_ = now;
+  const VulkanCommandProcessor::Fh1FrameWaits waits = command_processor_.TakeFh1FrameWaits();
+  std::string stats;
+  for (const auto& [name, count] : counters_.stats()) {
+    uint64_t& seen = slow_frame_stats_[name];
+    if (count != seen) {
+      stats += fmt::format(" {}={}", name, count - seen);
+      seen = count;
+    }
+  }
+  const std::string summary = fmt::format(
+      "draws {} resolves {} fence_wait {:.1f} ms drains {} ({:.1f} ms) memexport {} (full {}){}",
+      draws_ - slow_frame_draws_, resolves_ - slow_frame_resolves_, waits.fence_wait_ns / 1e6,
+      waits.drains, waits.drain_wait_ns / 1e6, waits.memexport_readbacks,
+      waits.memexport_full_readbacks, stats);
+  slow_frame_draws_ = draws_;
+  slow_frame_resolves_ = resolves_;
+  if (ms > 0.0f) {
+    const float median = slow_frame_intervals_.Median();
+    if (IsSlow(ms, median)) {
+      REXGPU_INFO("FH1 slow frame {}: {:.1f} ms (median {:.1f}): {} | before: {}", frame_, ms,
+                  median, summary, slow_frame_previous_);
+    }
+    slow_frame_intervals_.Add(ms);
+  }
+  slow_frame_previous_ = summary;
 }
 
 void Fh1NativeExecutor::LogStats(uint64_t frame) {
@@ -2733,6 +2814,7 @@ void Fh1NativeExecutor::GpuEndFrame() {
       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_query_pool_,
       gpu_slot_ * kGpuProfileQueries + query);
   slot.spans.push_back({uint32_t(kGpuFrame), 0, query});
+  slot.frame = frame_;
   slot.submission = command_processor_.GetCurrentSubmission();
   slot.pending = true;
   gpu_slot_ = (gpu_slot_ + 1) % kGpuProfileSlots;
@@ -2751,10 +2833,27 @@ void Fh1NativeExecutor::GpuDrain() {
             vulkan_device->device(), gpu_query_pool_, index * kGpuProfileQueries, slot.used,
             ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
             VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      std::array<uint64_t, kGpuPhases> frame_ticks{};
       for (const auto& [phase, begin, end] : slot.spans) {
-        if (ticks[end] > ticks[begin]) gpu_ticks_[phase] += ticks[end] - ticks[begin];
+        if (ticks[end] > ticks[begin]) frame_ticks[phase] += ticks[end] - ticks[begin];
       }
+      for (uint32_t phase = 0; phase < kGpuPhases; ++phase) gpu_ticks_[phase] += frame_ticks[phase];
       ++gpu_frames_;
+      if (slow_frame_log_) {
+        const double tick_ms = vulkan_device->properties().timestampPeriod / 1e6;
+        const float ms = float(frame_ticks[kGpuFrame] * tick_ms);
+        const float median = slow_gpu_frames_.Median();
+        if (IsSlow(ms, median)) {
+          // The frame here is the one before its swap, as frame_ in OnSwap.
+          REXGPU_INFO(
+              "FH1 slow GPU frame after {}: {:.1f} ms (median {:.1f}): transfers {:.2f} "
+              "resolves {:.2f} clears {:.2f} texture_reloads {:.2f} texture_loads {:.2f}",
+              slot.frame, ms, median, frame_ticks[kGpuTransfers] * tick_ms,
+              frame_ticks[kGpuResolves] * tick_ms, frame_ticks[kGpuClears] * tick_ms,
+              frame_ticks[kGpuTextureReloads] * tick_ms, frame_ticks[kGpuTextureLoads] * tick_ms);
+        }
+        slow_gpu_frames_.Add(ms);
+      }
     }
     slot = GpuProfileSlot();
   }

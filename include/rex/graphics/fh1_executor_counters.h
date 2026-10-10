@@ -19,6 +19,7 @@ class Fh1ExecutorCounters {
 
   std::string FormatSkips() const { return Format(skips_); }
   std::string FormatStats() const { return Format(stats_); }
+  const std::unordered_map<const char*, uint64_t>& stats() const { return stats_; }
 
  private:
   static std::string Format(const std::unordered_map<const char*, uint64_t>& counts) {

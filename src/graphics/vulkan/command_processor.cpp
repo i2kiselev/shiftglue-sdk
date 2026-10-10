@@ -4978,6 +4978,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
+      ++fh1_frame_waits_.memexport_readbacks;
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
@@ -4993,6 +4994,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+  ++fh1_frame_waits_.memexport_full_readbacks;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5805,10 +5807,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
-    PERF_counter_add(kGpuThreadFenceWaitNs,
-                     std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - wait_start)
-                         .count());
+    const int64_t wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_start)
+                                .count();
+    PERF_counter_add(kGpuThreadFenceWaitNs, wait_ns);
+    fh1_frame_waits_.fence_wait_ns += uint64_t(wait_ns);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {

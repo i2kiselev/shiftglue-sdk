@@ -223,6 +223,19 @@ class VulkanCommandProcessor : public CommandProcessor {
   Fh1NativeExecutor* GetFh1NativeExecutor() const { return fh1_native_executor_.get(); }
   uint64_t TakeBarrierBatchCount() { return std::exchange(barrier_batch_count_, 0); }
   uint64_t TakeRenderingBeginCount() { return std::exchange(rendering_begin_count_, 0); }
+  // fh1_slow_frame_log: the GPU thread's blocking waits since the last call.
+  struct Fh1FrameWaits {
+    // Every blocking fence wait, the throttle on frames in flight included.
+    uint64_t fence_wait_ns = 0;
+    // Waits for the whole queue that had to wait (readbacks, memexport).
+    uint64_t drains = 0;
+    uint64_t drain_wait_ns = 0;
+    uint64_t memexport_readbacks = 0;
+    // Memexport readbacks that waited for the queue instead of reading the
+    // previous copy.
+    uint64_t memexport_full_readbacks = 0;
+  };
+  Fh1FrameWaits TakeFh1FrameWaits() { return std::exchange(fh1_frame_waits_, {}); }
   // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
   // reports the last draws, copies, texture loads and executor passes the GPU
   // reached. Each marker is a serial number; a ring keeps what each recent
@@ -574,7 +587,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
   bool AwaitAllQueueOperationsCompletion() {
+    const uint64_t fence_wait_before = fh1_frame_waits_.fence_wait_ns;
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+    if (fh1_frame_waits_.fence_wait_ns != fence_wait_before) {
+      ++fh1_frame_waits_.drains;
+      fh1_frame_waits_.drain_wait_ns += fh1_frame_waits_.fence_wait_ns - fence_wait_before;
+    }
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
   // Guest frame GPU timing for the performance CSV (guest_frame_gpu_time_ns):
@@ -979,6 +997,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   FrameTimingSlot frame_timing_slots_[kMaxFramesInFlight] = {};
   uint64_t barrier_batch_count_ = 0;
   uint64_t rendering_begin_count_ = 0;
+  Fh1FrameWaits fh1_frame_waits_;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
