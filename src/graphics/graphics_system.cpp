@@ -51,6 +51,10 @@ REXCVAR_DEFINE_UINT32(
     pinyon_shift_fh1_render_fps_limit, 0, "Pinyon Shift",
     "FH1 source-render FPS limit (0 follows the host display)")
     .range(0, 1000);
+REXCVAR_DEFINE_DOUBLE(fh1_guest_vblank_hz, 0.0, "GPU",
+                      "Guest vblank rate in Hz, read live (0 = twice "
+                      "pinyon_shift_fh1_render_fps_limit)")
+    .range(0.0, 2000.0);
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -245,15 +249,20 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         // steps a second, and where a step is expensive (race central's
         // paused screens) each frame spanned ever more vblanks.
         uint32_t render_fps_limit = UINT32_MAX;
+        double vblank_hz = -1.0;
         uint64_t interval_ticks = 1;
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           const uint32_t current_render_fps_limit =
               REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
-          if (current_render_fps_limit != render_fps_limit) {
+          const double current_vblank_hz = REXCVAR_GET(fh1_guest_vblank_hz);
+          if (current_render_fps_limit != render_fps_limit || current_vblank_hz != vblank_hz) {
             render_fps_limit = current_render_fps_limit;
-            const double refresh_rate_hz = Fh1GuestVblankHzForRenderLimit(
-                render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
+            vblank_hz = current_vblank_hz;
+            const double refresh_rate_hz =
+                vblank_hz > 0.0 ? vblank_hz
+                                : Fh1GuestVblankHzForRenderLimit(
+                                      render_fps_limit, REXCVAR_GET(video_mode_refresh_rate));
             interval_ticks =
                 std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
           }
