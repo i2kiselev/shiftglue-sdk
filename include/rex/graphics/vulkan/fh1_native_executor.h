@@ -69,6 +69,9 @@ class Fh1NativeExecutor {
   // The render pass key the draw's pipeline is created for (formats and
   // samples of the surfaces PrepareTargets derived). False skips the draw.
   bool BindTargets(VulkanRenderTargetCache::RenderPassKey& key_out);
+  // Whether PrepareTargets took everything the draw writes as tiles holding
+  // a clear value (fh1_surfaceless_clears), so it is not to be drawn.
+  bool DrawAbsorbed() const { return draw_absorbed_ && !pending_used_bits_; }
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
   void NativeDrawIssued(const Fh1DrawInfo& draw);
@@ -126,6 +129,8 @@ class Fh1NativeExecutor {
     Surface* surface = nullptr;
     Rect rect = {};
     bool unowned = false;
+    // Held by a clear record (MaterializeClears).
+    bool cleared = false;
   };
   struct CopyPlan : Fh1ResolvePlan {
     std::vector<SourceRect> sources;
@@ -218,6 +223,26 @@ class Fh1NativeExecutor {
   // its rectangles are worth deriving and its claims are not reused.
   bool MayOverwrite(const Fh1DrawInfo& draw, uint32_t used_bits) const;
   bool ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t length);
+  // Tiles a clear sets to one EDRAM word are owned by a record of that word
+  // instead of a surface; the next claim clears the claimant to it.
+  static constexpr uint32_t kClearOwner = UINT32_C(1) << 31;
+  static constexpr uint32_t kClearWordsMax = 64;
+  static bool IsClearOwner(uint32_t owner) {
+    return owner != kNoOwner && (owner & kClearOwner);
+  }
+  // The owner standing for tiles holding `word`, or kNoOwner when every
+  // record is held.
+  uint32_t ClearOwner(uint32_t word);
+  // Per draw target bit, the EDRAM word an overwriting draw (after a
+  // successful depth_overwrite_.Derive) leaves in every sample, when known.
+  uint32_t DeriveClearWords(const Fh1DrawInfo& draw, uint32_t used_bits, bool stencil_overwritten,
+                            uint32_t* words_out);
+  // Hands the whole tiles the derived rectangles cover to the record of
+  // `word`; false when they do not cover whole tiles within `length`, or the
+  // stencil the draw keeps is not known to be zero (`stencil_kept`).
+  bool AbsorbClear(const SurfaceKey& key, uint32_t length, uint32_t word, bool stencil_kept);
+  // Before a resolve reads tiles a record owns: claims them for `key`.
+  void MaterializeClears(const SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
                      uint32_t column_end, uint32_t row_end);
   void TransferTiles(Surface& dest, const TileRun& run);
@@ -243,7 +268,9 @@ class Fh1NativeExecutor {
                        uint32_t sample_select, uint32_t dest_info, uint32_t dest_base,
                        uint32_t dest_pitch, VkBuffer buffer, VkDeviceSize memory_offset,
                        VkDeviceSize memory_range, bool unscaled_dest = false);
-  void ClearSurfaceRect(Surface& surface, const Rect& guest_rect, uint32_t clear_value,
+  // Sets a rectangle in host pixels to an EDRAM word (two for 64bpp) decoded
+  // in the surface's format.
+  void ClearSurfaceRect(Surface& surface, const Rect& host_rect, uint32_t clear_value,
                         uint32_t clear_value_lo);
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
@@ -359,6 +386,11 @@ class Fh1NativeExecutor {
   bool single_sample_msaa_ = false;
   bool color_overwrite_claims_ = true;
   bool scrambled_stencil_claims_ = true;
+  bool surfaceless_clears_ = true;
+  // The words of the clear records, by owner index.
+  std::vector<uint32_t> clear_words_;
+  // The prepared draw left some of its targets as clear words.
+  bool draw_absorbed_ = false;
   // The layout constant's host sample mode: 0 native, 1 native 2x, 2 2x
   // stored as 4x, 3 every guest sample in one host sample.
   static uint32_t HostSampleMode(const Surface& surface);

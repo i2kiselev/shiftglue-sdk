@@ -1,6 +1,7 @@
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -34,6 +35,11 @@ REXCVAR_DEFINE_BOOL(fh1_scrambled_stencil_claims, true, "GPU",
                     "Let a depth overwrite that keeps stencil (the title's shadow map clear) "
                     "claim tiles whose stencil came from another sample layout, zeroing it "
                     "instead of transferring it (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_surfaceless_clears, true, "GPU",
+                    "Keep the whole tiles a clear sets to one value as that value instead of in a "
+                    "surface of the clear's layout (D3D's fast clears through a 4x MSAA view); "
+                    "the surface claiming them next clears them (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 #if REX_HAS_D3D12
@@ -268,6 +274,59 @@ float HalfToFloat(uint16_t half) {
   return value;
 }
 
+// Xenos 7e3 from a float as the render backend packs it
+// (spirv_translator_rb.cpp): clamped to [0, 31.875], rounded to nearest even.
+uint32_t Float32To7e3(float value) {
+  if (!(value > 0.0f)) value = 0.0f;
+  value = std::min(value, 31.875f);
+  uint32_t f32;
+  std::memcpy(&f32, &value, sizeof(f32));
+  const uint32_t biased = f32 < 0x3E800000
+                              ? ((f32 & 0x7FFFFF) | 0x800000) >> std::min(125 - (f32 >> 23), 24u)
+                              : f32 - (UINT32_C(124) << 23);
+  return ((biased + 0x7FFF + ((biased >> 16) & 1)) >> 16) & 0x3FF;
+}
+
+// The EDRAM word a 32bpp color format holds for a color, packed as the render
+// backend packs it. False for formats not packed here.
+bool PackColorWord(xenos::ColorRenderTargetFormat format, const std::array<float, 4>& color,
+                   uint32_t& word_out) {
+  auto unorm = [](float value, float max) {
+    return uint32_t((value > 0.0f ? std::min(value, 1.0f) : 0.0f) * max + 0.5f);
+  };
+  switch (format) {
+    case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      word_out = 0;
+      for (uint32_t i = 0; i < 4; ++i) word_out |= unorm(color[i], 255.0f) << (8 * i);
+      return true;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
+      word_out = unorm(color[3], 3.0f) << 30;
+      for (uint32_t i = 0; i < 3; ++i) word_out |= unorm(color[i], 1023.0f) << (10 * i);
+      return true;
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+    case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
+      word_out = unorm(color[3], 3.0f) << 30;
+      for (uint32_t i = 0; i < 3; ++i) word_out |= Float32To7e3(color[i]) << (10 * i);
+      return true;
+    case xenos::ColorRenderTargetFormat::k_16_16:
+      word_out = 0;
+      for (uint32_t i = 0; i < 2; ++i) {
+        const float scaled =
+            (std::isnan(color[i]) ? 0.0f : std::clamp(color[i], -32.0f, 32.0f)) *
+            (32767.0f / 32.0f);
+        word_out |= (uint32_t(int32_t(scaled + (scaled < 0.0f ? -0.5f : 0.5f))) & 0xFFFF)
+                    << (16 * i);
+      }
+      return true;
+    case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+      std::memcpy(&word_out, &color[0], sizeof(word_out));
+      return true;
+    default:
+      return false;
+  }
+}
+
 constexpr VkPipelineStageFlags kColorAttachmentStage =
     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 constexpr VkAccessFlags kColorAttachmentAccess =
@@ -300,6 +359,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   single_sample_msaa_ = scale_ >= 2 && REXCVAR_GET(fh1_scaled_msaa_single_sample);
   color_overwrite_claims_ = REXCVAR_GET(fh1_color_overwrite_claims);
   scrambled_stencil_claims_ = REXCVAR_GET(fh1_scrambled_stencil_claims);
+  surfaceless_clears_ = REXCVAR_GET(fh1_surfaceless_clears);
   if (single_sample_msaa_) {
     REXGPU_INFO("FH1 native executor (Vulkan): MSAA surfaces single-sampled at {}x", scale_);
   }
@@ -372,6 +432,7 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
     return false;
   }
   tiles_.Reset();
+  clear_words_.clear();
   initialized_ = true;
   REXGPU_INFO("FH1 native executor enabled: native (Vulkan)");
   return true;
@@ -1049,6 +1110,16 @@ void Fh1NativeExecutor::ClaimTileRect(const SurfaceKey& key, uint32_t column_fir
 void Fh1NativeExecutor::TransferRects(Surface& dest, uint32_t previous_owner, const Rect* rects,
                                       uint32_t rect_count, uint32_t tile_count,
                                       bool tiles_stencil) {
+  if (IsClearOwner(previous_owner)) {
+    const uint32_t word = clear_words_[previous_owner & ~kClearOwner];
+    for (uint32_t i = 0; i < rect_count; ++i) ClearSurfaceRect(dest, rects[i], word, word);
+    counters_.Count("clear_claimed_tiles", tile_count);
+    if (command_processor_.debug_log_draws_frame()) {
+      REXGPU_INFO("FH1 debug transfer clear{:08X}->{} tiles={} passes=0", word,
+                  dest.key.Describe(), tile_count);
+    }
+    return;
+  }
   GpuTimer gpu_timer(*this, kGpuTransfers);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTransfer);
   Surface* source = FindSurface(previous_owner);
@@ -1370,7 +1441,8 @@ void Fh1NativeExecutor::GetResolveSources(const SurfaceKey& resolve_key, int32_t
     SourceRect source;
     source.rect = {rect.left, rect.top, rect.right, rect.bottom};
     source.unowned = rect.owner == kNoOwner;
-    source.surface = source.unowned ? nullptr : FindSurface(rect.owner);
+    source.cleared = IsClearOwner(rect.owner);
+    source.surface = source.unowned || source.cleared ? nullptr : FindSurface(rect.owner);
     sources_out.push_back(source);
   }
 }
@@ -1501,7 +1573,7 @@ void Fh1NativeExecutor::ClaimOverwrittenDepthTiles(const SurfaceKey& key,
 }
 
 bool Fh1NativeExecutor::StencilScrambled(const SurfaceKey& key, uint32_t owner) {
-  if (!scrambled_stencil_claims_) return false;
+  if (!scrambled_stencil_claims_ || IsClearOwner(owner)) return false;
   Surface* source = owner == kNoOwner ? nullptr : FindSurface(owner);
   // Stencil read through another pitch or sample count, or a color owner's
   // bits, lands on unrelated samples, so no draw can depend on keeping it.
@@ -1587,7 +1659,141 @@ bool Fh1NativeExecutor::ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t
   return true;
 }
 
+uint32_t Fh1NativeExecutor::ClearOwner(uint32_t word) {
+  auto it = std::find(clear_words_.begin(), clear_words_.end(), word);
+  if (it != clear_words_.end()) return kClearOwner | uint32_t(it - clear_words_.begin());
+  if (clear_words_.size() < kClearWordsMax) {
+    REXGPU_INFO("FH1 native executor (Vulkan): clear record {} holds {:08X}", clear_words_.size(),
+                word);
+    clear_words_.push_back(word);
+    return kClearOwner | uint32_t(clear_words_.size() - 1);
+  }
+  std::array<bool, kClearWordsMax> held = {};
+  for (uint32_t tile = 0; tile < xenos::kEdramTileCount; ++tile) {
+    const uint32_t owner = tiles_.Owner(tile);
+    if (IsClearOwner(owner)) held[owner & ~kClearOwner] = true;
+  }
+  for (uint32_t i = 0; i < kClearWordsMax; ++i) {
+    if (held[i]) continue;
+    clear_words_[i] = word;
+    return kClearOwner | i;
+  }
+  return kNoOwner;
+}
+
+uint32_t Fh1NativeExecutor::DeriveClearWords(const Fh1DrawInfo& draw, uint32_t used_bits,
+                                             bool stencil_overwritten, uint32_t* words_out) {
+  if (!surfaceless_clears_ || draw.occlusion_query_active) return 0;
+  const RegisterFile& regs = register_file_;
+  uint32_t known_bits = 0;
+  float depth;
+  if ((used_bits & 1) && depth_overwrite_.ConstantDepth(depth)) {
+    depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
+    const uint32_t depth_bits =
+        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8
+            ? xenos::Float32To20e4(depth, true)
+            : uint32_t(std::nearbyint(depth * float(0xFFFFFF)));
+    // Stencil the draw keeps is zero, or AbsorbClear finds it is not.
+    const uint32_t stencil =
+        stencil_overwritten
+            ? regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK).stencilref
+            : 0;
+    words_out[0] = (depth_bits << 8) | stencil;
+    known_bits |= 1;
+  }
+  std::array<std::array<float, 4>, 4> colors;
+  uint32_t colors_written = 0;
+  if ((used_bits & ~1u) && draw.pixel_shader &&
+      depth_overwrite_.DeriveColors(*draw.pixel_shader, colors, colors_written)) {
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!(used_bits & (1u << (1 + i))) || !(colors_written & (1u << i))) continue;
+      const auto format =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format;
+      if (PackColorWord(format, colors[i], words_out[1 + i])) known_bits |= 1u << (1 + i);
+    }
+  }
+  return known_bits;
+}
+
+bool Fh1NativeExecutor::AbsorbClear(const SurfaceKey& key, uint32_t length, uint32_t word,
+                                    bool stencil_kept) {
+  if (key.Is64bpp()) return false;
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const int32_t tile_width = int32_t(xenos::kEdramTileWidthSamples >> msaa_x_log2);
+  const int32_t tile_height = int32_t(xenos::kEdramTileHeightSamples >> msaa_y_log2);
+  for (const auto& rect : depth_overwrite_.rects()) {
+    if (rect.inner != rect.outer || rect.outer[0] % tile_width || rect.outer[2] % tile_width ||
+        rect.outer[1] % tile_height || rect.outer[3] % tile_height) {
+      return false;
+    }
+    const uint32_t column_end = uint32_t(rect.outer[2] / tile_width);
+    const uint32_t row_end = uint32_t(rect.outer[3] / tile_height);
+    if (column_end > key.pitch_tiles || (row_end - 1) * key.pitch_tiles + column_end > length) {
+      return false;
+    }
+    if (!stencil_kept) continue;
+    for (uint32_t row = uint32_t(rect.outer[1] / tile_height); row < row_end; ++row) {
+      for (uint32_t column = uint32_t(rect.outer[0] / tile_width); column < column_end; ++column) {
+        const uint32_t tile = key.base_tiles + row * key.pitch_tiles + column;
+        if (tiles_.StencilNonzero(tile) && !StencilScrambled(key, tiles_.Owner(tile))) {
+          return false;
+        }
+      }
+    }
+  }
+  const uint32_t owner = ClearOwner(word);
+  if (owner == kNoOwner) return false;
+  for (const auto& rect : depth_overwrite_.rects()) {
+    const uint32_t column_first = uint32_t(rect.outer[0] / tile_width);
+    const uint32_t column_end = uint32_t(rect.outer[2] / tile_width);
+    for (uint32_t row = uint32_t(rect.outer[1] / tile_height);
+         row < uint32_t(rect.outer[3] / tile_height); ++row) {
+      const uint32_t row_base = key.base_tiles + row * key.pitch_tiles + column_first;
+      tiles_.Claim(row_base, column_end - column_first, owner, false);
+      MarkTileStencil(row_base, column_end - column_first, (word & 0xFF) != 0);
+    }
+  }
+  Count(key.is_depth ? "clear_absorbed_depth" : "clear_absorbed_color");
+  return true;
+}
+
+void Fh1NativeExecutor::MaterializeClears(const SurfaceKey& key, int32_t x0, int32_t y0,
+                                          int32_t x1, int32_t y1) {
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t is_64bpp = key.Is64bpp() ? 1 : 0;
+  const uint32_t tile_width = (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> is_64bpp;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  const uint32_t pitch = key.pitch_tiles << is_64bpp;
+  if (!GetOrCreateSurface(key, uint32_t(y1))) return Skip("clear_materialize_surface");
+  const uint32_t column_first = uint32_t(x0) / tile_width;
+  const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
+  for (uint32_t row = uint32_t(y0) / tile_height;
+       row < (uint32_t(y1) + tile_height - 1) / tile_height; ++row) {
+    for (uint32_t column = column_first; column < column_end;) {
+      const uint32_t first = key.base_tiles + row * pitch + column;
+      uint32_t count = 0;
+      while (column < column_end && IsClearOwner(tiles_.Owner(first + count))) {
+        ++count;
+        ++column;
+      }
+      if (count) {
+        ClaimTiles(first, count, key.Pack());
+      } else {
+        ++column;
+      }
+    }
+  }
+  FlushTransfers();
+  Count("clear_materialized");
+  if (command_processor_.debug_log_draws_frame()) {
+    REXGPU_INFO("FH1 debug clear materialized for {}", key.Describe());
+  }
+}
+
 void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
+  draw_absorbed_ = false;
   if (!initialized_) return;
   // The extent estimate reads vertices when clipping is off.
   const bool memo_allowed = draw.state_epoch && !draw.memexport &&
@@ -1605,7 +1811,7 @@ void Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw) {
     return;
   }
   PrepareTargetsImpl(draw);
-  if (memo_allowed && !MayOverwrite(draw, pending_used_bits_)) {
+  if (memo_allowed && !draw_absorbed_ && !MayOverwrite(draw, pending_used_bits_)) {
     memo.state_epoch = draw.state_epoch;
     memo.vertex_shader = draw.vertex_shader;
     memo.depth_control = draw.normalized_depth_control.value;
@@ -1693,24 +1899,31 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
   signature.length_tiles = length_tiles_32bpp;
   if (same_targets && length_tiles_32bpp <= same_targets->length_tiles) return;
 
-  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-    // A draw whose rectangles get derived below needs their rows only.
-    if ((used_bits & (1u << i)) && !GetOrCreateSurface(keys[i], may_overwrite ? 0 : height_used)) {
-      used_bits &= ~(1u << i);
-    }
-  }
-  pending_used_bits_ = used_bits;
-  if (depth_stencil_written && (used_bits & 1)) {
-    FindSurface(keys[0].Pack())->stencil_nonzero = true;
-  }
   bool stencil_overwritten = false;
   const bool overwritten =
       may_overwrite && (used_bits == 1 || DrawOverwritesColor(draw, used_bits)) &&
       depth_overwrite_.Derive(draw, REXCVAR_GET(half_pixel_offset), stencil_overwritten,
                               !(used_bits & 1));
+  // Targets a clear may leave as words in the tiles get a surface only if the
+  // tiles cannot take them.
+  uint32_t clear_words[1 + xenos::kMaxColorRenderTargets];
+  uint32_t clear_bits =
+      overwritten ? DeriveClearWords(draw, used_bits, stencil_overwritten, clear_words) : 0;
+  if (!stencil_overwritten && depth_stencil_written) clear_bits &= ~1u;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    // A draw whose rectangles get derived below needs their rows only.
+    if ((used_bits & ~clear_bits & (1u << i)) &&
+        !GetOrCreateSurface(keys[i], may_overwrite ? 0 : height_used)) {
+      used_bits &= ~(1u << i);
+    }
+  }
+  pending_used_bits_ = used_bits;
+  if (depth_stencil_written && (used_bits & ~clear_bits & 1)) {
+    FindSurface(keys[0].Pack())->stencil_nonzero = true;
+  }
+  // Every target holds the rows the draw can reach, whatever its claim.
+  uint32_t draw_height = height_used;
   if (may_overwrite) {
-    // Every target holds the rows the draw can reach, whatever its claim.
-    uint32_t draw_height = height_used;
     if (overwritten) {
       draw_height = 0;
       for (const auto& rect : depth_overwrite_.rects()) {
@@ -1719,7 +1932,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
       draw_height = std::min(draw_height, height_used);
     }
     for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-      if (!(used_bits & (1u << i))) continue;
+      if (!(used_bits & ~clear_bits & (1u << i))) continue;
       if (!EnsureSurfaceHeight(*FindSurface(keys[i].Pack()), draw_height)) used_bits &= ~(1u << i);
     }
     pending_used_bits_ = used_bits;
@@ -1736,6 +1949,21 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
                                    : xenos::kEdramTileCount + bases[0].first;
     const uint32_t length =
         std::min(length_tiles_32bpp << uint32_t(key.Is64bpp()), next_base - key.base_tiles);
+    const uint32_t bit = 1u << bases[i].second;
+    if (clear_bits & bit) {
+      if (AbsorbClear(key, length, clear_words[bases[i].second],
+                      key.is_depth && !stencil_overwritten)) {
+        used_bits &= ~bit;
+        draw_absorbed_ = true;
+        continue;
+      }
+      Surface* surface = GetOrCreateSurface(key, draw_height);
+      if (!surface) {
+        used_bits &= ~bit;
+        continue;
+      }
+      if (key.is_depth && depth_stencil_written) surface->stencil_nonzero = true;
+    }
     if (overwritten &&
         (key.is_depth
              ? ClaimDepthOverwriteTiles(key, length, stencil_overwritten, depth_stencil_written)
@@ -1746,6 +1974,7 @@ void Fh1NativeExecutor::PrepareTargetsImpl(const Fh1DrawInfo& draw) {
     if (!key.is_depth || depth_stencil_written) MarkTileStencil(key.base_tiles, length, true);
   }
   FlushTransfers();
+  pending_used_bits_ = used_bits;
   if (used_bits == signature.used_bits && !may_overwrite) {
     // Entries of an older generation never match, so no invalidation is
     // needed; the same targets take their old entry's place.
@@ -1903,11 +2132,10 @@ void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
   ++draws_;
 }
 
-void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& guest_rect,
+void Fh1NativeExecutor::ClearSurfaceRect(Surface& surface, const Rect& rect,
                                          uint32_t clear_value, uint32_t clear_value_lo) {
   GpuTimer gpu_timer(*this, kGpuClears);
   command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kClear);
-  const Rect rect = HostRect(guest_rect);
   VkClearAttachment clear = {};
   if (surface.key.is_depth) {
     const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
@@ -2056,6 +2284,15 @@ bool Fh1NativeExecutor::PlanCopy(CopyPlan& plan) {
   if (!Fh1PlanResolve(register_file_, memory_, flags, plan)) return false;
   if (plan.copy) {
     GetResolveSources(plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1, plan.sources);
+    if (std::any_of(plan.sources.begin(), plan.sources.end(),
+                    [](const SourceRect& source) { return source.cleared; })) {
+      MaterializeClears(plan.copying_depth
+                            ? plan.resolve_key
+                            : MakeColorKey(plan.color_info.color_base, plan.pitch_tiles, plan.msaa,
+                                           plan.color_info.color_format),
+                        plan.x0, plan.y0, plan.x1, plan.y1);
+      GetResolveSources(plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1, plan.sources);
+    }
   }
   return true;
 }
@@ -2376,7 +2613,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       }
     }
     FlushTransfers();
-    ClearSurfaceRect(*surface, rect, value, value_lo);
+    ClearSurfaceRect(*surface, HostRect(rect), value, value_lo);
     Count(key.is_depth ? "clear_depth" : "clear_color");
   };
   if (resolve_info.IsClearingColor()) {

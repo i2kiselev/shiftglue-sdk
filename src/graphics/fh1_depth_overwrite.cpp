@@ -18,6 +18,12 @@ void Fh1DepthOverwrite::PositionSink::Export(ucode::ExportRegister export_regist
       if (value_mask & (1u << i)) position[i] = value[i];
     }
     position_mask |= value_mask;
+  } else if (uint32_t(export_register) < kInterpolators) {
+    auto& interpolator = interpolators[uint32_t(export_register)];
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (1u << i)) interpolator[i] = value[i];
+    }
+    interpolator_masks[uint32_t(export_register)] |= value_mask;
   } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex &&
              (value_mask & 0b0100) &&
              (rex::memory::Reinterpret<uint32_t>(value[2]) & ~(UINT32_C(1) << 31))) {
@@ -107,6 +113,9 @@ bool Fh1DepthOverwrite::Derive(const Fh1DrawInfo& draw, bool half_pixel_offset,
                                  ? 0.5f
                                  : 0.0f;
   rects_.clear();
+  depth_constant_ = true;
+  interpolators_constant_ = true;
+  bool first_vertex = true;
   interpreter_.SetShader(*draw.vertex_shader);
   PositionSink sink;
   interpreter_.SetExportSink(&sink);
@@ -140,6 +149,19 @@ bool Fh1DepthOverwrite::Derive(const Fh1DrawInfo& draw, bool half_pixel_offset,
         ok = false;
         break;
       }
+      const float depth = position[2] * scale[2] + offset[2];
+      if (first_vertex) {
+        depth_ = depth;
+        interpolators_ = sink.interpolators;
+      }
+      depth_constant_ &= depth == depth_;
+      for (uint32_t j = 0; j < kInterpolators; ++j) {
+        const uint32_t mask = sink.interpolator_masks[j];
+        if (mask && (mask != 0b1111 || sink.interpolators[j] != interpolators_[j])) {
+          interpolators_constant_ = false;
+        }
+      }
+      first_vertex = false;
       for (uint32_t j = 0; j < 2; ++j) {
         corners[i][j] = position[j] * scale[j] + offset[j];
         if (!std::isfinite(corners[i][j])) ok = false;
@@ -187,6 +209,47 @@ bool Fh1DepthOverwrite::Derive(const Fh1DrawInfo& draw, bool half_pixel_offset,
   }
   interpreter_.SetExportSink(nullptr);
   return ok;
+}
+
+bool Fh1DepthOverwrite::DeriveColors(const Shader& pixel_shader,
+                                     std::array<std::array<float, 4>, 4>& colors_out,
+                                     uint32_t& colors_written) {
+  colors_written = 0;
+  // With constant inputs every pixel computes the same, unless the shader
+  // reads its position.
+  if (!interpolators_constant_ || !ShaderInterpreter::CanInterpretShader(pixel_shader) ||
+      register_file_.Get<reg::SQ_PROGRAM_CNTL>().param_gen) {
+    return false;
+  }
+  class ColorSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override {
+      const uint32_t index = uint32_t(export_register) - uint32_t(ucode::ExportRegister::kPSColor0);
+      if (index >= 4) return;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (value_mask & (1u << i)) colors[index][i] = value[i];
+      }
+      masks[index] |= value_mask;
+    }
+    std::array<std::array<float, 4>, 4> colors{};
+    std::array<uint32_t, 4> masks{};
+  } sink;
+  float* temps = interpreter_.temp_registers();
+  std::fill_n(temps, size_t(4) * xenos::kMaxShaderTempRegisters, 0.0f);
+  for (uint32_t i = 0; i < kInterpolators; ++i) {
+    std::copy(interpolators_[i].begin(), interpolators_[i].end(), temps + 4 * i);
+  }
+  interpreter_.SetShader(pixel_shader);
+  interpreter_.SetExportSink(&sink);
+  interpreter_.Execute();
+  interpreter_.SetExportSink(nullptr);
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (sink.masks[i] != 0b1111) continue;
+    colors_out[i] = sink.colors[i];
+    colors_written |= 1u << i;
+  }
+  return true;
 }
 
 }  // namespace rex::graphics

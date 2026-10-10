@@ -58,7 +58,20 @@ class Fh1DepthOverwrite {
               bool color_only = false);
   const std::vector<Rect>& rects() const { return rects_; }
 
+  // After a successful Derive, the window-space depth every vertex has, when
+  // all have the same.
+  bool ConstantDepth(float& depth_out) const {
+    depth_out = depth_;
+    return depth_constant_;
+  }
+  // After a successful Derive, when every vertex exported the same
+  // interpolators: the colors the pixel shader writes from them (bit i of
+  // `colors_written`: all four channels of oC<i>).
+  bool DeriveColors(const Shader& pixel_shader, std::array<std::array<float, 4>, 4>& colors_out,
+                    uint32_t& colors_written);
+
  private:
+  static constexpr uint32_t kInterpolators = 16;
   class PositionSink : public ShaderInterpreter::ExportSink {
    public:
     void Export(ucode::ExportRegister export_register, const float* value,
@@ -66,11 +79,17 @@ class Fh1DepthOverwrite {
     std::array<float, 4> position{};
     uint32_t position_mask = 0;
     bool killed = false;
+    std::array<std::array<float, 4>, kInterpolators> interpolators{};
+    std::array<uint32_t, kInterpolators> interpolator_masks{};
   };
 
   const RegisterFile& register_file_;
   ShaderInterpreter interpreter_;
   std::vector<Rect> rects_;
+  bool depth_constant_ = false;
+  float depth_ = 0.0f;
+  bool interpolators_constant_ = false;
+  std::array<std::array<float, 4>, kInterpolators> interpolators_{};
 };
 
 }  // namespace rex::graphics

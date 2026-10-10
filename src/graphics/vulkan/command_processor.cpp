@@ -4556,9 +4556,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_draw.vertex_shader = vertex_shader;
     fh1_draw.pixel_shader = pixel_shader;
     fh1_draw.state_epoch = state_epoch_;
+    fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");
+    }
+    if (fh1_native_executor_->DrawAbsorbed()) {
+      fh1_native_executor_->NativeDrawIssued(fh1_draw);
+      return true;
     }
   } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                            normalized_color_mask, *vertex_shader)) {
