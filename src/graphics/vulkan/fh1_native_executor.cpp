@@ -287,14 +287,18 @@ uint32_t Float32To7e3(float value) {
   return ((biased + 0x7FFF + ((biased >> 16) & 1)) >> 16) & 0x3FF;
 }
 
-// The EDRAM word a 32bpp color format holds for a color, packed as the render
-// backend packs it. False for formats not packed here.
-bool PackColorWord(xenos::ColorRenderTargetFormat format, const std::array<float, 4>& color,
-                   uint32_t& word_out) {
+// The EDRAM word a 32bpp color target holds for a shader output, as the host
+// render targets store it: scaled by the target's exponent bias, 16_16 as
+// snorm over -1...1 (or -32...32 unless `fixed16_truncated`). False for
+// formats not packed here.
+bool PackColorWord(reg::RB_COLOR_INFO color_info, bool fixed16_truncated,
+                   std::array<float, 4> color, uint32_t& word_out) {
+  const float bias_scale = std::ldexp(1.0f, int32_t(color_info.color_exp_bias));
+  for (float& channel : color) channel *= bias_scale;
   auto unorm = [](float value, float max) {
     return uint32_t((value > 0.0f ? std::min(value, 1.0f) : 0.0f) * max + 0.5f);
   };
-  switch (format) {
+  switch (color_info.color_format) {
     case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       word_out = 0;
       for (uint32_t i = 0; i < 4; ++i) word_out |= unorm(color[i], 255.0f) << (8 * i);
@@ -312,9 +316,9 @@ bool PackColorWord(xenos::ColorRenderTargetFormat format, const std::array<float
     case xenos::ColorRenderTargetFormat::k_16_16:
       word_out = 0;
       for (uint32_t i = 0; i < 2; ++i) {
-        const float scaled =
-            (std::isnan(color[i]) ? 0.0f : std::clamp(color[i], -32.0f, 32.0f)) *
-            (32767.0f / 32.0f);
+        const float value = std::isnan(color[i]) ? 0.0f
+                                                 : color[i] * (fixed16_truncated ? 1.0f : 1.0f / 32.0f);
+        const float scaled = std::clamp(value, -1.0f, 1.0f) * 32767.0f;
         word_out |= (uint32_t(int32_t(scaled + (scaled < 0.0f ? -0.5f : 0.5f))) & 0xFFFF)
                     << (16 * i);
       }
@@ -1707,9 +1711,10 @@ uint32_t Fh1NativeExecutor::DeriveClearWords(const Fh1DrawInfo& draw, uint32_t u
       depth_overwrite_.DeriveColors(*draw.pixel_shader, colors, colors_written)) {
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       if (!(used_bits & (1u << (1 + i))) || !(colors_written & (1u << i))) continue;
-      const auto format =
-          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format;
-      if (PackColorWord(format, colors[i], words_out[1 + i])) known_bits |= 1u << (1 + i);
+      if (PackColorWord(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]),
+                        config_.fixed16_truncated, colors[i], words_out[1 + i])) {
+        known_bits |= 1u << (1 + i);
+      }
     }
   }
   return known_bits;
