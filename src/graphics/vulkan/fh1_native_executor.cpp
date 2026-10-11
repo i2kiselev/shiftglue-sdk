@@ -50,6 +50,10 @@ REXCVAR_DEFINE_BOOL(fh1_async_readbacks, false, "GPU",
                     "fence before the data, which arrives a few frames later. The first run of "
                     "a range that is new still waits")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_async_readbacks_hold, false, "GPU",
+                    "Read live: while set, readbacks wait as without fh1_async_readbacks. A game "
+                    "sets it where it caches what it computes from a capture read too early "
+                    "(FM4: the menu car's lighting)");
 REXCVAR_DEFINE_BOOL(fh1_surfaceless_clears, true, "GPU",
                     "Keep the whole tiles a clear sets to one value as that value instead of in a "
                     "surface of the clear's layout (D3D's fast clears through a 4x MSAA view); "
@@ -2428,7 +2432,7 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
 
 void Fh1NativeExecutor::FlushResolveReadbacks() {
   if (pending_readbacks_.empty()) return;
-  if (async_readbacks_ &&
+  if (async_readbacks_ && !REXCVAR_GET(fh1_async_readbacks_hold) &&
       std::none_of(pending_readbacks_.begin(), pending_readbacks_.end(),
                    [](const PendingReadback& pending) { return pending.wait; })) {
     CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());
