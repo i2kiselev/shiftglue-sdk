@@ -98,6 +98,8 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+REXCVAR_DEFINE_BOOL(fh1_log_scaled_textures, false, "GPU",
+                    "Diagnostics: log every texture created from scaled resolve data");
 
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
@@ -445,6 +447,13 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     }
     std::memset(scaled_resolve_page_bpb_log2_.get() + page_first, int(bpb_log2),
                 page_last - page_first + 1);
+    if (REXCVAR_GET(fh1_log_scaled_textures)) {
+      page_resolves_.resize(SharedMemory::kBufferSize >> 12);
+      const PageResolve resolve = {start_unscaled, length_unscaled,
+                                   rex::chrono::Clock::QueryHostUptimeMillis()};
+      std::fill(page_resolves_.begin() + page_first, page_resolves_.begin() + page_last + 1,
+                resolve);
+    }
   }
 
   {
@@ -1111,16 +1120,21 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+  bool kept_unscaled = false;
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
     texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    const uint32_t base_extent = scaled_resolve_guest_layout.base.level_data_extent_bytes;
+    const uint32_t mips_extent = scaled_resolve_guest_layout.mips_total_extent_bytes;
+    // The base decides when there is one: a texture the CPU loaded over an old render target
+    // can leave a resolved page at the end of its mip extent that its data never reaches,
+    // and sampling the whole texture from the scaled buffer then shows that target's bytes.
+    const bool mips_scaled =
+        mips_extent && IsRangeScaledResolved(key.mip_page << 12, mips_extent);
+    if (base_extent ? IsRangeScaledResolved(key.base_page << 12, base_extent) : mips_scaled) {
       key.scaled_resolve = 1;
+    } else {
+      kept_unscaled = mips_scaled;
     }
   }
 
@@ -1226,6 +1240,38 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
+  if (kept_unscaled && REXCVAR_GET(fh1_log_scaled_textures)) {
+    REXGPU_INFO("FH1 texture kept unscaled, resolved pages only in its mips: {}x{} {} base "
+                "{:08X} mips {:08X}",
+                key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name,
+                key.base_page << 12, key.mip_page << 12);
+  }
+  if (key.scaled_resolve && REXCVAR_GET(fh1_log_scaled_textures)) {
+    REXGPU_INFO(
+        "FH1 scaled texture {}x{}x{} {} {} levels {} base {:08X} size {:X} mips {:08X} size {:X}",
+        key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(), key.GetLogDimensionName(),
+        FormatInfo::Get(key.format)->name, key.mip_max_level + 1, key.base_page << 12,
+        texture->GetGuestBaseSize(), key.mip_page << 12, texture->GetGuestMipsSize());
+    if (FormatInfo::Get(key.format)->block_width > 1) {
+      const uint64_t now_ms = rex::chrono::Clock::QueryHostUptimeMillis();
+      auto report = [&](const char* level, uint32_t start, uint32_t length) {
+        if (!length) return;
+        const auto [valid, gpu_written] = shared_memory().CountValidPages(start, length);
+        auto global_lock = global_critical_region_.Acquire();
+        REXGPU_INFO("  {} {:08X}+{:X}: pages valid {} gpu-written {}", level, start, length,
+                    valid, gpu_written);
+        for (uint32_t page = start >> 12; page <= (start + length - 1) >> 12; ++page) {
+          if (!((scaled_resolve_pages_[page >> 5] >> (page & 31)) & 1)) continue;
+          const PageResolve resolve =
+              page < page_resolves_.size() ? page_resolves_[page] : PageResolve{};
+          REXGPU_INFO("    scaled page {:08X}: resolve {:08X}+{:X} {} ms ago", page << 12,
+                      resolve.start, resolve.length, resolve.ms ? now_ms - resolve.ms : 0);
+        }
+      };
+      report("base", key.base_page << 12, texture->GetGuestBaseSize());
+      report("mips", key.mip_page << 12, texture->GetGuestMipsSize());
+    }
+  }
   return texture;
 }
 

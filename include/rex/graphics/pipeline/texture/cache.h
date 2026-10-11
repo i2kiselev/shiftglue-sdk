@@ -692,6 +692,12 @@ class TextureCache {
   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
   // The texel size (log2 bytes) of each page's latest resolve.
   std::unique_ptr<uint8_t[]> scaled_resolve_page_bpb_log2_;
+  // Diagnostics (fh1_log_scaled_textures): each page's latest resolve.
+  struct PageResolve {
+    uint32_t start, length;
+    uint64_t ms;
+  };
+  std::vector<PageResolve> page_resolves_;
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
