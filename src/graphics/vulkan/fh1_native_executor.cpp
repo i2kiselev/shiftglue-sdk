@@ -2350,6 +2350,7 @@ bool Fh1NativeExecutor::NativeResolve(uint32_t& written_address, uint32_t& writt
         dump_trigger_frame_ = frame_;
         command_processor_.SetDebugLogDrawsFrame(true);
       }
+      DumpScaledResolveRanges();
     }
     if (!dump_frame || frame_ == uint64_t(dump_frame) ||
         (dump_frame < 0 && frame_ == dump_trigger_frame_)) {
@@ -2363,6 +2364,49 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
   // As the D3D12 command processor's fh1_resolve_dump_dir: every resolve's
   // output bytes, waiting for the GPU after each.
   static uint32_t sequence = 0;
+  config_.memory->Use(VulkanSharedMemory::Usage::kRead);
+  char name[64];
+  std::snprintf(name, sizeof(name), "%05u_%08X_%u.bin", sequence++, address, length);
+  DumpBufferRange(config_.memory->buffer(), address, length, name);
+}
+
+void Fh1NativeExecutor::DumpScaledResolveRanges() {
+  // "dump_scaled" in fh1_resolve_dump_dir lists "<address> <length>" in hex per
+  // line, as the command processor's "dump_memory": each range's part of the
+  // scaled resolve buffer, which scaled textures there sample and a texture
+  // flush reloads unchanged, goes to scaled_<address>_<length>.bin.
+  const std::filesystem::path dump_dir(REXCVAR_GET(fh1_resolve_dump_dir));
+  std::ifstream list(dump_dir / "dump_scaled");
+  if (!list) return;
+  std::vector<std::pair<uint32_t, uint32_t>> ranges;
+  uint32_t address, length;
+  list >> std::hex;
+  while (list >> address >> length) ranges.emplace_back(address & 0x1FFFFFFF, length);
+  list.close();
+  std::error_code error;
+  std::filesystem::remove(dump_dir / "dump_scaled", error);
+  if (scale_ <= 1) return;
+  for (const auto& [range_address, range_length] : ranges) {
+    uint64_t start, size;
+    // Committing first: a copy from unbound sparse memory is undefined.
+    if (!config_.textures->GetScaledResolveRange(range_address, range_length, 0, start, size) ||
+        !config_.textures->CommitScaledResolveRange(range_address, range_length)) {
+      continue;
+    }
+    command_processor_.PushBufferMemoryBarrier(
+        config_.textures->scaled_resolve_buffer(), start, size,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
+    DumpBufferRange(config_.textures->scaled_resolve_buffer(), start, size,
+                    fmt::format("scaled_{:08X}_{:X}.bin", range_address, range_length));
+    REXGPU_INFO("FH1 debug scaled {:08X}+{:X}: scale {} bytes {:X} at {:X}", range_address,
+                range_length, scale_, size, start);
+  }
+}
+
+void Fh1NativeExecutor::DumpBufferRange(VkBuffer source, VkDeviceSize offset, VkDeviceSize length,
+                                        const std::string& name) {
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2373,11 +2417,9 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
           ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
     return;
   }
-  config_.memory->Use(VulkanSharedMemory::Usage::kRead);
   command_processor_.SubmitBarriers(true, "end_executor");
-  const VkBufferCopy region = {address, 0, length};
-  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(config_.memory->buffer(), buffer,
-                                                               1, &region);
+  const VkBufferCopy region = {offset, 0, length};
+  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(source, buffer, 1, &region);
   command_processor_.Fh1AwaitAllQueueOperations();
   void* mapped = nullptr;
   if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
@@ -2386,8 +2428,6 @@ void Fh1NativeExecutor::DumpResolveOutput(uint32_t address, uint32_t length) {
     range.memory = memory;
     range.size = VK_WHOLE_SIZE;
     dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
-    char name[64];
-    std::snprintf(name, sizeof(name), "%05u_%08X_%u.bin", sequence++, address, length);
     std::ofstream(std::filesystem::path(REXCVAR_GET(fh1_resolve_dump_dir)) / name,
                   std::ios::binary)
         .write(static_cast<const char*>(mapped), std::streamsize(length));

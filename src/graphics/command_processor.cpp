@@ -1935,8 +1935,9 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
       if (REXCVAR_GET(fh1_debug_log_draws) || debug_log_draws_frame_) {
         const RegisterFile& regs = *register_file_;
         std::string textures;
-        // Each shader's textures (vertex shader's as vt) and its float
-        // constants 0-3 and 252-255 (vc, pc).
+        // Each shader's textures (vertex shader's as vt) and the float
+        // constants it reads (vc, pc); 0-3 and 252-255 for a shader that
+        // indexes them dynamically.
         for (const Shader* shader : {active_pixel_shader_, active_vertex_shader_}) {
           if (!shader || !shader->is_ucode_analyzed()) continue;
           const bool is_vertex = shader->type() == xenos::ShaderType::kVertex;
@@ -1952,11 +1953,22 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
                 words[3], words[4], words[5]);
           }
           textures += is_vertex ? " vc=[" : " pc=[";
-          for (uint32_t constant : {0u, 1u, 2u, 3u, 252u, 253u, 254u, 255u}) {
+          const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+          std::vector<uint32_t> constants;
+          if (map.float_dynamic_addressing) {
+            constants = {0, 1, 2, 3, 252, 253, 254, 255};
+          } else {
+            for (uint32_t constant = 0; constant < 256; ++constant) {
+              if (map.float_bitmap[constant >> 6] & (uint64_t(1) << (constant & 63))) {
+                constants.push_back(constant);
+              }
+            }
+          }
+          for (uint32_t constant : constants) {
             const float* value = reinterpret_cast<const float*>(
                 &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * ((is_vertex ? 0 : 256) + constant)]);
-            textures += fmt::format("{}c{}:{:g},{:g},{:g},{:g}", constant ? " " : "", constant,
-                                    value[0], value[1], value[2], value[3]);
+            textures += fmt::format("{}c{}:{:g},{:g},{:g},{:g}", textures.back() == '[' ? "" : " ",
+                                    constant, value[0], value[1], value[2], value[3]);
           }
           textures += "]";
         }

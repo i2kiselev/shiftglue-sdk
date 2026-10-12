@@ -287,6 +287,10 @@ class Fh1NativeExecutor {
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
   void DumpResolveOutput(uint32_t address, uint32_t length);
+  void DumpScaledResolveRanges();
+  // Copies a buffer range to fh1_resolve_dump_dir/name, waiting for the GPU.
+  void DumpBufferRange(VkBuffer source, VkDeviceSize offset, VkDeviceSize length,
+                       const std::string& name);
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);
