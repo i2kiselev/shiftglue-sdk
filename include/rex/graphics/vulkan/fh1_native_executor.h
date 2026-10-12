@@ -178,6 +178,8 @@ class Fh1NativeExecutor {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
     uint64_t new_since_frame = 0;
+    // Order of the range's latest readback among all readbacks, 0 if none.
+    uint64_t readback_sequence = 0;
   };
 
   SurfaceKey MakeColorKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
@@ -351,6 +353,7 @@ class Fh1NativeExecutor {
   std::vector<PendingTransfer> pending_transfers_;
   std::vector<PendingReadback> pending_readbacks_;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
+  uint64_t readback_sequence_ = 0;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
   bool pending_targets_valid_ = false;
