@@ -647,13 +647,112 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         if (msaa_samples == spv::NoResult) {
           msaa_samples = LoadMsaaSamplesFromFlags();
         }
+        // Above 1x a guest pixel is block_size^2 host pixels, so an ordered dither over them
+        // gives that many more coverage levels per guest pixel. Without it a single-sampled
+        // guest pixel has one threshold per host pixel in a 2x2 host pattern, which thins
+        // cut-outs (foliage, crowds) into a fixed checkerboard that sparkles in motion; with
+        // MSAA it is optional (alpha to mask bit 9).
+        const uint32_t block_size = draw_resolution_scale_x_;
+        const bool block_dither = !edram_fragment_shader_interlock_ &&
+                                  block_size == draw_resolution_scale_y_ && block_size >= 2 &&
+                                  block_size <= 4;
+        const uint32_t block_pixels = block_size * block_size;
+        spv::Id dither_rank_plus_1_minus_offset = spv::NoResult;
+        spv::Id dither_msaa = spv::NoResult;
+        if (block_dither) {
+          static constexpr uint8_t kDitherRanks[3][16] = {
+              {0, 2, 3, 1},
+              {0, 7, 3, 6, 5, 2, 4, 1, 8},
+              {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5},
+          };
+          uint32_t ranks_low = 0, ranks_high = 0;
+          for (uint32_t i = 0; i < block_pixels; ++i) {
+            (i < 8 ? ranks_low : ranks_high) |= uint32_t(kDitherRanks[block_size - 2][i])
+                                                << ((i & 7) * 4);
+          }
+          spv::Id const_block_size = builder_->makeUintConstant(block_size);
+          spv::Id sub_x = builder_->createBinOp(spv::OpUMod, type_uint_,
+                                                alpha_to_coverage_position_x, const_block_size);
+          spv::Id sub_y = builder_->createBinOp(spv::OpUMod, type_uint_,
+                                                alpha_to_coverage_position_y, const_block_size);
+          spv::Id guest_x = builder_->createBinOp(spv::OpUDiv, type_uint_,
+                                                  alpha_to_coverage_position_x, const_block_size);
+          spv::Id guest_y = builder_->createBinOp(spv::OpUDiv, type_uint_,
+                                                  alpha_to_coverage_position_y, const_block_size);
+          // The guest's dither offset, by the guest pixel's place in its 2x2 quad.
+          spv::Id guest_offset = builder_->createTriOp(
+              spv::OpBitFieldUExtract, type_uint_, alpha_to_mask,
+              builder_->createBinOp(
+                  spv::OpShiftLeftLogical, type_uint_,
+                  builder_->createBinOp(
+                      spv::OpBitwiseOr, type_uint_,
+                      builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, guest_x, const_uint_1),
+                      builder_->createBinOp(
+                          spv::OpShiftLeftLogical, type_uint_,
+                          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, guest_y,
+                                                const_uint_1),
+                          const_uint_1)),
+                  const_uint_1),
+              const_uint_2);
+          spv::Id index = builder_->createBinOp(
+              spv::OpIAdd, type_uint_,
+              builder_->createBinOp(spv::OpIMul, type_uint_, sub_y, const_block_size), sub_x);
+          spv::Id ranks = builder_->createTriOp(
+              spv::OpSelect, type_uint_,
+              builder_->createBinOp(spv::OpULessThan, type_bool_, index,
+                                    builder_->makeUintConstant(8)),
+              builder_->makeUintConstant(ranks_low), builder_->makeUintConstant(ranks_high));
+          spv::Id rank = builder_->createTriOp(
+              spv::OpBitFieldUExtract, type_uint_, ranks,
+              builder_->createBinOp(
+                  spv::OpShiftLeftLogical, type_uint_,
+                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, index,
+                                        builder_->makeUintConstant(7)),
+                  const_uint_2),
+              builder_->makeUintConstant(4));
+          dither_rank_plus_1_minus_offset = builder_->createBinOp(
+              spv::OpFSub, type_float_,
+              builder_->createBinOp(spv::OpFAdd, type_float_,
+                                    builder_->createUnaryOp(spv::OpConvertUToF, type_float_, rank),
+                                    const_float_1_),
+              builder_->createBinOp(
+                  spv::OpFMul, type_float_,
+                  builder_->createUnaryOp(spv::OpConvertUToF, type_float_, guest_offset),
+                  builder_->makeFloatConstant(0.25f)));
+          dither_msaa = builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, alpha_to_mask,
+                                    builder_->makeUintConstant(UINT32_C(1) << 9)),
+              const_uint_0_);
+        }
+        // With the block dither, the sample of dither level L of a guest pixel with N samples is
+        // covered from alpha (L * block_size^2 + rank + 1 - offset / 4) / (N * block_size^2):
+        // alpha 1 covers every sample, alpha 0 none, and at alpha k / N every host pixel has
+        // exactly k samples, so the pattern only shows between those levels. dither_on is
+        // spv::NoResult for always.
         auto alpha_to_coverage_apply_sample = [&](spv::Id sample_mask, uint32_t guest_sample_index,
                                                   uint32_t host_sample_index, float threshold_base,
-                                                  float threshold_offset_scale) -> spv::Id {
-          spv::Id sample_threshold = builder_->createBinOp(
-              spv::OpFSub, type_float_, builder_->makeFloatConstant(threshold_base),
-              builder_->createBinOp(spv::OpFMul, type_float_, alpha_to_coverage_offset_float,
-                                    builder_->makeFloatConstant(threshold_offset_scale)));
+                                                  float threshold_offset_scale, spv::Id dither_on,
+                                                  uint32_t dither_level,
+                                                  uint32_t dither_levels) -> spv::Id {
+          spv::Id sample_threshold = spv::NoResult;
+          if (!block_dither || dither_on != spv::NoResult) {
+            sample_threshold = builder_->createBinOp(
+                spv::OpFSub, type_float_, builder_->makeFloatConstant(threshold_base),
+                builder_->createBinOp(spv::OpFMul, type_float_, alpha_to_coverage_offset_float,
+                                      builder_->makeFloatConstant(threshold_offset_scale)));
+          }
+          if (block_dither) {
+            spv::Id dither_threshold = builder_->createBinOp(
+                spv::OpFMul, type_float_,
+                builder_->createBinOp(spv::OpFAdd, type_float_, dither_rank_plus_1_minus_offset,
+                                      builder_->makeFloatConstant(float(dither_level * block_pixels))),
+                builder_->makeFloatConstant(1.0f / float(dither_levels * block_pixels)));
+            sample_threshold = dither_on == spv::NoResult
+                                   ? dither_threshold
+                                   : builder_->createTriOp(spv::OpSelect, type_float_, dither_on,
+                                                           dither_threshold, sample_threshold);
+          }
           spv::Id sample_covered = builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_,
                                                          alpha_to_coverage_alpha, sample_threshold);
           if (edram_fragment_shader_interlock_) {
@@ -696,8 +795,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
         block_alpha_to_coverage_msaa_4x.addPredecessor(&block_alpha_to_coverage_msaa_head);
         // 1x.
         builder_->setBuildPoint(&block_alpha_to_coverage_msaa_1x);
-        spv::Id alpha_to_coverage_mask_1x =
-            alpha_to_coverage_apply_sample(alpha_to_coverage_mask, 0, 0, 1.0f, 1.0f / 4.0f);
+        spv::Id alpha_to_coverage_mask_1x = alpha_to_coverage_apply_sample(
+            alpha_to_coverage_mask, 0, 0, 1.0f, 1.0f / 4.0f, spv::NoResult, 0, 1);
         builder_->createBranch(&block_alpha_to_coverage_msaa_merge);
         // 2x.
         builder_->setBuildPoint(&block_alpha_to_coverage_msaa_2x);
@@ -714,10 +813,13 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             alpha_to_coverage_host_sample_1 = 3;
           }
         }
-        spv::Id alpha_to_coverage_mask_2x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask, 0, alpha_to_coverage_host_sample_0, 0.5f, 1.0f / 8.0f);
-        alpha_to_coverage_mask_2x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask_2x, 1, alpha_to_coverage_host_sample_1, 1.0f, 1.0f / 8.0f);
+        spv::Id alpha_to_coverage_mask_2x =
+            alpha_to_coverage_apply_sample(alpha_to_coverage_mask, 0, alpha_to_coverage_host_sample_0,
+                                           0.5f, 1.0f / 8.0f, dither_msaa, 0, 2);
+        alpha_to_coverage_mask_2x =
+            alpha_to_coverage_apply_sample(alpha_to_coverage_mask_2x, 1,
+                                           alpha_to_coverage_host_sample_1, 1.0f, 1.0f / 8.0f,
+                                           dither_msaa, 1, 2);
         builder_->createBranch(&block_alpha_to_coverage_msaa_merge);
         // 4x.
         builder_->setBuildPoint(&block_alpha_to_coverage_msaa_4x);
@@ -732,14 +834,19 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
           alpha_to_coverage_host_sample_4x_2 = 1;
           alpha_to_coverage_host_sample_4x_3 = 3;
         }
+        // Dither levels in the order of the guest's thresholds.
         spv::Id alpha_to_coverage_mask_4x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask, 0, alpha_to_coverage_host_sample_4x_0, 0.75f, 1.0f / 16.0f);
+            alpha_to_coverage_mask, 0, alpha_to_coverage_host_sample_4x_0, 0.75f, 1.0f / 16.0f,
+            dither_msaa, 2, 4);
         alpha_to_coverage_mask_4x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask_4x, 1, alpha_to_coverage_host_sample_4x_1, 0.25f, 1.0f / 16.0f);
+            alpha_to_coverage_mask_4x, 1, alpha_to_coverage_host_sample_4x_1, 0.25f, 1.0f / 16.0f,
+            dither_msaa, 0, 4);
         alpha_to_coverage_mask_4x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask_4x, 2, alpha_to_coverage_host_sample_4x_2, 0.5f, 1.0f / 16.0f);
+            alpha_to_coverage_mask_4x, 2, alpha_to_coverage_host_sample_4x_2, 0.5f, 1.0f / 16.0f,
+            dither_msaa, 1, 4);
         alpha_to_coverage_mask_4x = alpha_to_coverage_apply_sample(
-            alpha_to_coverage_mask_4x, 3, alpha_to_coverage_host_sample_4x_3, 1.0f, 1.0f / 16.0f);
+            alpha_to_coverage_mask_4x, 3, alpha_to_coverage_host_sample_4x_3, 1.0f, 1.0f / 16.0f,
+            dither_msaa, 3, 4);
         builder_->createBranch(&block_alpha_to_coverage_msaa_merge);
         // Select depending on the MSAA sample count.
         builder_->setBuildPoint(&block_alpha_to_coverage_msaa_merge);

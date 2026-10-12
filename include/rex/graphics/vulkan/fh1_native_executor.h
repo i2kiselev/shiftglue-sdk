@@ -85,6 +85,7 @@ class Fh1NativeExecutor {
   // Whether fh1_scaled_msaa_single_sample changed since setup in a way that
   // matters at this scale; it applies when the executor is created again.
   bool IsSingleSampleMsaaOutdated() const;
+  bool single_sample_msaa() const { return single_sample_msaa_; }
   void OnSwap(uint64_t frame);
   void LogStats(uint64_t frame);
   // Counts what ended a draw rendering (a stat name).
