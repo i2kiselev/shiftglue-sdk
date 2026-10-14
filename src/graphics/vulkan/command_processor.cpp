@@ -59,10 +59,6 @@ REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_alpha_dither, false, "GPU",
-                    "Above 1x resolution scale, spread the alpha to coverage of MSAA surfaces "
-                    "over the host pixels of each guest pixel too: more coverage levels for "
-                    "foliage, crowds and fences (single-sampled surfaces always have it)");
 REXCVAR_DEFINE_BOOL(gpu_state_hash_memos, true, "GPU/Vulkan",
                     "Key the per-draw shader, pipeline and viewport memos by the register "
                     "state's content hash, so a draw reuses the derivations of any earlier "
@@ -7426,10 +7422,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
   system_constants_.alpha_test_reference = rb_alpha_ref;
   uint32_t alpha_to_mask =
-      rb_colorcontrol.alpha_to_mask_enable
-          ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8) |
-                (uint32_t(REXCVAR_GET(fh1_scaled_msaa_alpha_dither)) << 9)
-          : 0;
+      rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8)
+                                           : 0;
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 
