@@ -104,6 +104,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before Runtime::Setup(). Override to modify backend config.
   virtual void OnPreSetup(RuntimeConfig& config) {}
 
+  /// Asked after OnPreSetup. False skips the window and graphics presentation,
+  /// for a run that only needs the runtime (a content install, a tool).
+  virtual bool WantsPresentation() const { return true; }
+
   /// Called before Runtime::LoadXexImage(). Override to modify xex image.
   virtual void OnLoadXexImage(std::string& xex_image) {}
 

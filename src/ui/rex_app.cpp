@@ -330,6 +330,10 @@ bool ReXApp::SetupPresentation() {
     }
   }
 
+  if (!WantsPresentation()) {
+    return true;
+  }
+
   if (config_.graphics) {
     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
     if (XFAILED(status)) {
