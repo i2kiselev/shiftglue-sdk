@@ -107,6 +107,11 @@ class VulkanDevice {
     // Vulkan 1.1 subgroups: quad operations in fragment shaders.
 
     bool subgroupQuadFragment = false;
+
+    // Vulkan 1.1 device identification, for matching the DXGI adapter.
+
+    uint8_t deviceLUID[VK_LUID_SIZE] = {};
+    bool deviceLUIDValid = false;
     bool depthClamp = false;
     bool fillModeNonSolid = false;
     bool samplerAnisotropy = false;
@@ -129,6 +134,10 @@ class VulkanDevice {
     // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
 
     bool scalarBlockLayout = false;
+
+    // VK_KHR_timeline_semaphore (#208, promoted to 1.2)
+
+    bool timelineSemaphore = false;
 
     // VK_KHR_portability_subset (#164)
 
@@ -209,6 +218,9 @@ class VulkanDevice {
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
     // Only with vulkan_diagnostic_checkpoints.
     bool ext_NV_device_diagnostic_checkpoints = false;  // #207
+    // Windows only, for presenting through DXGI.
+    bool ext_KHR_external_memory_win32 = false;     // #74
+    bool ext_KHR_external_semaphore_win32 = false;  // #79
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -234,6 +246,12 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_nv_device_diagnostic_checkpoints.inc>
     // VK_KHR_push_descriptor (#81)
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+#if REX_PLATFORM_WIN32
+    // VK_KHR_external_memory_win32 (#74)
+#include <rex/ui/vulkan/functions/device_khr_external_memory_win32.inc>
+    // VK_KHR_external_semaphore_win32 (#79)
+#include <rex/ui/vulkan/functions/device_khr_external_semaphore_win32.inc>
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

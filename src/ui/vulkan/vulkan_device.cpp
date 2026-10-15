@@ -206,6 +206,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (with_swapchain) {
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+#if REX_PLATFORM_WIN32
+    if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      // #74.
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_memory_win32)
+      // #79.
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_external_semaphore_win32)
+    }
+#endif
   }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
@@ -328,6 +336,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
   VkPhysicalDeviceSubgroupProperties properties_1_1_subgroup = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+  VkPhysicalDeviceIDProperties properties_1_1_id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
@@ -374,6 +383,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
       properties_1_1_subgroup.pNext = properties_2.pNext;
       properties_2.pNext = &properties_1_1_subgroup;
+      properties_1_1_id.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_1_1_id;
     }
     if (ext_1_2_KHR_shader_float_controls) {
       properties_1_2_KHR_shader_float_controls.pNext = properties_2.pNext;
@@ -539,6 +550,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   device->properties_.deviceID = properties.deviceID;
   rex::string::copy_truncating(device->properties_.deviceName, properties.deviceName,
                                sizeof(device->properties_.deviceName));
+  if (properties_1_1_id.deviceLUIDValid) {
+    std::memcpy(device->properties_.deviceLUID, properties_1_1_id.deviceLUID, VK_LUID_SIZE);
+    device->properties_.deviceLUIDValid = true;
+  }
 
   REXLOG_INFO(
       "Vulkan device '{}': API {}.{}.{}, vendor 0x{:04X}, device 0x{:04X}, "
@@ -669,6 +684,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+    }
+    if (device->extensions_.ext_KHR_external_semaphore_win32) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
@@ -832,6 +850,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_push_descriptor) {
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
   }
+#if REX_PLATFORM_WIN32
+  if (device->extensions_.ext_KHR_external_memory_win32) {
+#include <rex/ui/vulkan/functions/device_khr_external_memory_win32.inc>
+  }
+  if (device->extensions_.ext_KHR_external_semaphore_win32) {
+#include <rex/ui/vulkan/functions/device_khr_external_semaphore_win32.inc>
+  }
+#endif
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
 #undef XE_UI_VULKAN_FUNCTION

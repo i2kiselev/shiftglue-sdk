@@ -408,7 +408,21 @@ class VulkanPresenter final : public Presenter {
     // May be reused between connections if the format stays the same.
     VkRenderPass swapchain_render_pass = VK_NULL_HANDLE;
     VkFormat swapchain_render_pass_format = VK_FORMAT_UNDEFINED;
+    VkImageLayout swapchain_render_pass_final_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     bool swapchain_render_pass_clear_load_op = false;
+
+#if REX_PLATFORM_WIN32
+    // Present through a DXGI flip-model swapchain in place of `swapchain`, so
+    // that frame generation and capture tools hooking DXGI see the frames.
+    class DxgiSwapchain;
+    struct DxgiSwapchainDeleter {
+      void operator()(DxgiSwapchain* dxgi_swapchain) const;
+    };
+    std::unique_ptr<DxgiSwapchain, DxgiSwapchainDeleter> dxgi_swapchain;
+    // Stays on the Vulkan swapchain for the rest of the session once DXGI
+    // presentation has failed.
+    bool dxgi_swapchain_failed = false;
+#endif
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
     uint32_t present_queue_family = UINT32_MAX;

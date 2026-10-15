@@ -40,6 +40,10 @@
 #include <rex/ui/surface_gnulinux.h>
 #endif
 #if REX_PLATFORM_WIN32
+#include <d3d11_4.h>
+#include <dxgi1_5.h>
+#include <wrl/client.h>
+
 #include <rex/ui/surface_win.h>
 #endif
 #if REX_PLATFORM_MAC
@@ -57,6 +61,16 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
+
+#if REX_PLATFORM_WIN32
+REXCVAR_DEFINE_BOOL(vulkan_present_via_dxgi, false, "UI/Vulkan",
+                    "Present through a DXGI flip-model swapchain instead of the Vulkan one, so "
+                    "that frame generation and capture tools (Lossless Scaling, NVIDIA Smooth "
+                    "Motion, AMD Fluid Motion Frames, overlays) see the frames; falls back to the "
+                    "Vulkan swapchain if unavailable. The allowed present modes map to DXGI: "
+                    "immediate to tearing, mailbox to no vsync without tearing, else vsync")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 namespace rex {
 namespace ui {
@@ -417,6 +431,421 @@ bool VulkanPresenter::DispatchTemporalUpscaler(VkCommandBuffer command_buffer, V
 }
 #endif
 
+#if REX_PLATFORM_WIN32
+// Vulkan draws each frame into one of a ring of textures shared with a
+// Direct3D 11 device on the same adapter, and Direct3D 11 copies it to the
+// back buffer of a DXGI flip-model swapchain and presents. Two shared fences
+// order the APIs: `rendered` (Vulkan signals frame N drawn, Direct3D waits for
+// it) and `copied` (Direct3D signals frame N copied, Vulkan waits for it before
+// drawing into the same texture again, kImageCount frames later).
+class VulkanPresenter::PaintContext::DxgiSwapchain {
+ public:
+  static constexpr uint32_t kImageCount = kSubmissionCount;
+  static constexpr VkFormat kFormat = VK_FORMAT_B8G8R8A8_UNORM;
+
+  static std::unique_ptr<DxgiSwapchain, DxgiSwapchainDeleter> Create(
+      const VulkanDevice* vulkan_device, HWND hwnd, uint32_t width, uint32_t height) {
+    const VulkanDevice::Extensions& extensions = vulkan_device->extensions();
+    const VulkanDevice::Properties& properties = vulkan_device->properties();
+    if (!extensions.ext_KHR_external_memory_win32 ||
+        !extensions.ext_KHR_external_semaphore_win32 || !properties.timelineSemaphore ||
+        !properties.deviceLUIDValid) {
+      REXLOG_WARN(
+          "VulkanPresenter: The Vulkan device doesn't support Win32 external memory, Win32 "
+          "external semaphores, timeline semaphores or the device LUID, needed for DXGI "
+          "presentation");
+      return nullptr;
+    }
+    std::unique_ptr<DxgiSwapchain, DxgiSwapchainDeleter> dxgi_swapchain(
+        new DxgiSwapchain(vulkan_device, hwnd));
+    if (!dxgi_swapchain->Initialize(width, height)) {
+      return nullptr;
+    }
+    return dxgi_swapchain;
+  }
+
+  DxgiSwapchain(const DxgiSwapchain&) = delete;
+  DxgiSwapchain& operator=(const DxgiSwapchain&) = delete;
+
+  ~DxgiSwapchain() {
+    // The Vulkan side must have been awaited by the owner.
+    AwaitDirect3DCompletion();
+    DestroyImages();
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDevice device = vulkan_device_->device();
+    util::DestroyAndNullHandle(dfn.vkDestroySemaphore, device, rendered_semaphore_);
+    util::DestroyAndNullHandle(dfn.vkDestroySemaphore, device, copied_semaphore_);
+    swapchain_.Reset();
+    copied_fence_.Reset();
+    rendered_fence_.Reset();
+    context_.Reset();
+    device_.Reset();
+    if (fence_event_) {
+      CloseHandle(fence_event_);
+    }
+    if (d3d11_module_) {
+      FreeLibrary(d3d11_module_);
+    }
+  }
+
+  HWND hwnd() const { return hwnd_; }
+  const VkExtent2D& extent() const { return extent_; }
+  bool is_vsync() const { return sync_interval_ != 0; }
+  const std::array<VkImage, kImageCount>& images() const { return images_; }
+
+  // For the Vulkan submission drawing the next frame: the image to draw into,
+  // the `copied` value to wait for before drawing into it, and the `rendered`
+  // value to signal.
+  uint64_t next_frame() const { return frame_ + 1; }
+  uint32_t next_image_index() const { return uint32_t(next_frame() % kImageCount); }
+  uint64_t next_image_copied_frame() const {
+    return next_frame() > kImageCount ? next_frame() - kImageCount : 0;
+  }
+  VkSemaphore copied_semaphore() const { return copied_semaphore_; }
+  VkSemaphore rendered_semaphore() const { return rendered_semaphore_; }
+
+  // Neither API may be using the images (the owner awaits Vulkan).
+  bool Resize(uint32_t width, uint32_t height) {
+    AwaitDirect3DCompletion();
+    DestroyImages();
+    HRESULT result =
+        swapchain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swapchain_flags_);
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to resize the DXGI swapchain buffers (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    return CreateImages(width, height);
+  }
+
+  // To be called after the Vulkan submission that signals `rendered` for
+  // next_frame() has succeeded.
+  bool Present() {
+    ++frame_;
+    context_->Wait(rendered_fence_.Get(), frame_);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> back_buffer;
+    HRESULT result = swapchain_->GetBuffer(0, IID_PPV_ARGS(&back_buffer));
+    if (SUCCEEDED(result)) {
+      context_->CopyResource(back_buffer.Get(), textures_[frame_ % kImageCount].Get());
+    }
+    // Signaled even without the copy, as Vulkan will wait for this value.
+    context_->Signal(copied_fence_.Get(), frame_);
+    if (FAILED(result)) {
+      context_->Flush();
+      REXLOG_ERROR("VulkanPresenter: Failed to get the DXGI swapchain back buffer (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    result = swapchain_->Present(sync_interval_, present_flags_);
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to present the DXGI swapchain (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  DxgiSwapchain(const VulkanDevice* vulkan_device, HWND hwnd)
+      : vulkan_device_(vulkan_device), hwnd_(hwnd) {}
+
+  bool Initialize(uint32_t width, uint32_t height) {
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    HRESULT result = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a DXGI factory (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    LUID luid;
+    static_assert(sizeof(luid) == VK_LUID_SIZE);
+    std::memcpy(&luid, vulkan_device_->properties().deviceLUID, sizeof(luid));
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    result = factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter));
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: No DXGI adapter matches the Vulkan device (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+
+    // Loaded at runtime to keep Direct3D 11 out of the link.
+    d3d11_module_ = LoadLibraryW(L"d3d11.dll");
+    if (!d3d11_module_) {
+      REXLOG_ERROR("VulkanPresenter: Failed to load d3d11.dll");
+      return false;
+    }
+    auto d3d11_create_device = reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(
+        reinterpret_cast<void*>(GetProcAddress(d3d11_module_, "D3D11CreateDevice")));
+    if (!d3d11_create_device) {
+      REXLOG_ERROR("VulkanPresenter: d3d11.dll has no D3D11CreateDevice");
+      return false;
+    }
+    static const D3D_FEATURE_LEVEL kFeatureLevels[] = {D3D_FEATURE_LEVEL_11_1,
+                                                       D3D_FEATURE_LEVEL_11_0};
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    result = d3d11_create_device(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0,
+                                 kFeatureLevels, UINT(rex::countof(kFeatureLevels)),
+                                 D3D11_SDK_VERSION, &device, nullptr, &context);
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a Direct3D 11 device (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    if (FAILED(device.As(&device_)) || FAILED(context.As(&context_))) {
+      REXLOG_ERROR(
+          "VulkanPresenter: Direct3D 11.4 shared fences are unavailable (Windows 10 1703 or "
+          "newer is needed)");
+      return false;
+    }
+
+    BOOL tearing_supported = FALSE;
+    Microsoft::WRL::ComPtr<IDXGIFactory5> factory_5;
+    if (SUCCEEDED(factory.As(&factory_5)) &&
+        FAILED(factory_5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                              &tearing_supported, sizeof(tearing_supported)))) {
+      tearing_supported = FALSE;
+    }
+    if (tearing_supported) {
+      swapchain_flags_ |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+    }
+    if (REXCVAR_GET(vulkan_allow_present_mode_immediate) && tearing_supported) {
+      present_flags_ = DXGI_PRESENT_ALLOW_TEARING;
+    } else if (!REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+               !REXCVAR_GET(vulkan_allow_present_mode_mailbox)) {
+      sync_interval_ = 1;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 swapchain_desc = {};
+    swapchain_desc.Width = width;
+    swapchain_desc.Height = height;
+    swapchain_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    swapchain_desc.SampleDesc.Count = 1;
+    swapchain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    swapchain_desc.BufferCount = kImageCount;
+    swapchain_desc.Scaling = DXGI_SCALING_STRETCH;
+    swapchain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    swapchain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    swapchain_desc.Flags = swapchain_flags_;
+    result = factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &swapchain_desc, nullptr,
+                                             nullptr, &swapchain_);
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a DXGI swapchain (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    // Fullscreen is the window's business (borderless), not DXGI's.
+    factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+
+    fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!fence_event_) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create the DXGI presentation fence event");
+      return false;
+    }
+    if (!CreateSharedFence(rendered_fence_, rendered_semaphore_) ||
+        !CreateSharedFence(copied_fence_, copied_semaphore_)) {
+      return false;
+    }
+
+    if (!CreateImages(width, height)) {
+      return false;
+    }
+    REXLOG_INFO("VulkanPresenter: Presenting through a {}x{} DXGI swapchain ({})", width, height,
+                present_flags_ ? "tearing" : (sync_interval_ ? "vsync" : "no vsync"));
+    return true;
+  }
+
+  bool CreateSharedFence(Microsoft::WRL::ComPtr<ID3D11Fence>& fence_out,
+                         VkSemaphore& semaphore_out) {
+    HRESULT result = device_->CreateFence(0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_out));
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a shared Direct3D 11 fence (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    HANDLE handle;
+    result = fence_out->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle);
+    if (FAILED(result)) {
+      REXLOG_ERROR("VulkanPresenter: Failed to share a Direct3D 11 fence (0x{:08X})",
+                   uint32_t(result));
+      return false;
+    }
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDevice device = vulkan_device_->device();
+    VkSemaphoreTypeCreateInfo semaphore_type_create_info = {
+        VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    semaphore_type_create_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo semaphore_create_info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    semaphore_create_info.pNext = &semaphore_type_create_info;
+    bool imported = false;
+    if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &semaphore_out) ==
+        VK_SUCCESS) {
+      VkImportSemaphoreWin32HandleInfoKHR import_info = {
+          VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR};
+      import_info.semaphore = semaphore_out;
+      import_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+      import_info.handle = handle;
+      imported = dfn.vkImportSemaphoreWin32HandleKHR(device, &import_info) == VK_SUCCESS;
+    }
+    // Importing doesn't take the ownership of an NT handle.
+    CloseHandle(handle);
+    if (!imported) {
+      REXLOG_ERROR("VulkanPresenter: Failed to import a Direct3D 11 fence into Vulkan");
+      return false;
+    }
+    return true;
+  }
+
+  bool CreateImages(uint32_t width, uint32_t height) {
+    D3D11_TEXTURE2D_DESC texture_desc = {};
+    texture_desc.Width = width;
+    texture_desc.Height = height;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    texture_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    for (uint32_t i = 0; i < kImageCount; ++i) {
+      HRESULT result = device_->CreateTexture2D(&texture_desc, nullptr, &textures_[i]);
+      Microsoft::WRL::ComPtr<IDXGIResource1> resource;
+      HANDLE handle = nullptr;
+      if (SUCCEEDED(result)) {
+        result = textures_[i].As(&resource);
+      }
+      if (SUCCEEDED(result)) {
+        result = resource->CreateSharedHandle(
+            nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &handle);
+      }
+      if (FAILED(result)) {
+        REXLOG_ERROR(
+            "VulkanPresenter: Failed to create a shared Direct3D 11 texture (0x{:08X})",
+            uint32_t(result));
+        return false;
+      }
+      bool imported = ImportImage(handle, width, height, images_[i], memories_[i]);
+      CloseHandle(handle);
+      if (!imported) {
+        return false;
+      }
+    }
+    extent_.width = width;
+    extent_.height = height;
+    return true;
+  }
+
+  bool ImportImage(HANDLE handle, uint32_t width, uint32_t height, VkImage& image_out,
+                   VkDeviceMemory& memory_out) {
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDevice device = vulkan_device_->device();
+    VkExternalMemoryImageCreateInfo external_create_info = {
+        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+    external_create_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    VkImageCreateInfo image_create_info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    image_create_info.pNext = &external_create_info;
+    image_create_info.imageType = VK_IMAGE_TYPE_2D;
+    image_create_info.format = kFormat;
+    image_create_info.extent.width = width;
+    image_create_info.extent.height = height;
+    image_create_info.extent.depth = 1;
+    image_create_info.mipLevels = 1;
+    image_create_info.arrayLayers = 1;
+    image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_create_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dfn.vkCreateImage(device, &image_create_info, nullptr, &image_out) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a Vulkan image for a shared texture");
+      return false;
+    }
+    VkMemoryRequirements memory_requirements;
+    dfn.vkGetImageMemoryRequirements(device, image_out, &memory_requirements);
+    VkMemoryWin32HandlePropertiesKHR handle_properties = {
+        VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR};
+    uint32_t memory_type;
+    if (dfn.vkGetMemoryWin32HandlePropertiesKHR(device,
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
+                                                handle, &handle_properties) != VK_SUCCESS ||
+        !rex::bit_scan_forward(
+            memory_requirements.memoryTypeBits & handle_properties.memoryTypeBits,
+            &memory_type)) {
+      REXLOG_ERROR("VulkanPresenter: No Vulkan memory type can import a shared texture");
+      return false;
+    }
+    VkMemoryDedicatedAllocateInfo dedicated_allocate_info = {
+        VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated_allocate_info.image = image_out;
+    VkImportMemoryWin32HandleInfoKHR import_info = {
+        VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR};
+    import_info.pNext = &dedicated_allocate_info;
+    import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+    import_info.handle = handle;
+    VkMemoryAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocate_info.pNext = &import_info;
+    allocate_info.allocationSize = memory_requirements.size;
+    allocate_info.memoryTypeIndex = memory_type;
+    if (dfn.vkAllocateMemory(device, &allocate_info, nullptr, &memory_out) != VK_SUCCESS ||
+        dfn.vkBindImageMemory(device, image_out, memory_out, 0) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to import a shared texture into Vulkan");
+      return false;
+    }
+    return true;
+  }
+
+  void DestroyImages() {
+    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+    const VkDevice device = vulkan_device_->device();
+    for (uint32_t i = 0; i < kImageCount; ++i) {
+      util::DestroyAndNullHandle(dfn.vkDestroyImage, device, images_[i]);
+      util::DestroyAndNullHandle(dfn.vkFreeMemory, device, memories_[i]);
+      textures_[i].Reset();
+    }
+    extent_ = {};
+  }
+
+  void AwaitDirect3DCompletion() {
+    if (!frame_ || !copied_fence_ || copied_fence_->GetCompletedValue() >= frame_) {
+      return;
+    }
+    context_->Flush();
+    if (SUCCEEDED(copied_fence_->SetEventOnCompletion(frame_, fence_event_))) {
+      WaitForSingleObject(fence_event_, INFINITE);
+    }
+  }
+
+  const VulkanDevice* vulkan_device_;
+  HWND hwnd_;
+
+  HMODULE d3d11_module_ = nullptr;
+  Microsoft::WRL::ComPtr<ID3D11Device5> device_;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context_;
+  Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain_;
+  UINT swapchain_flags_ = 0;
+  UINT sync_interval_ = 0;
+  UINT present_flags_ = 0;
+
+  Microsoft::WRL::ComPtr<ID3D11Fence> rendered_fence_;
+  Microsoft::WRL::ComPtr<ID3D11Fence> copied_fence_;
+  VkSemaphore rendered_semaphore_ = VK_NULL_HANDLE;
+  VkSemaphore copied_semaphore_ = VK_NULL_HANDLE;
+  HANDLE fence_event_ = nullptr;
+  // The last frame given to Direct3D, also the last value of both fences.
+  uint64_t frame_ = 0;
+
+  VkExtent2D extent_ = {};
+  std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, kImageCount> textures_;
+  std::array<VkImage, kImageCount> images_ = {};
+  std::array<VkDeviceMemory, kImageCount> memories_ = {};
+};
+
+void VulkanPresenter::PaintContext::DxgiSwapchainDeleter::operator()(
+    DxgiSwapchain* dxgi_swapchain) const {
+  delete dxgi_swapchain;
+}
+#endif  // REX_PLATFORM_WIN32
+
 Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
     const VulkanInstance::Extensions& instance_extensions) {
   if (!instance_extensions.ext_KHR_surface) {
@@ -755,6 +1184,39 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 
   VkFormat new_swapchain_format;
 
+  bool presenting_via_dxgi = false;
+#if REX_PLATFORM_WIN32
+  if (REXCVAR_GET(vulkan_present_via_dxgi) && !paint_context_.dxgi_swapchain_failed &&
+      new_surface.GetType() == Surface::kTypeIndex_Win32Hwnd) {
+    const HWND hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+    if (paint_context_.dxgi_swapchain && paint_context_.dxgi_swapchain->hwnd() == hwnd) {
+      // Awaits the Vulkan usage of the images and releases their framebuffers.
+      paint_context_.PrepareForSwapchainRetirement();
+      presenting_via_dxgi =
+          paint_context_.dxgi_swapchain->Resize(new_surface_width, new_surface_height);
+    } else {
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      paint_context_.dxgi_swapchain = PaintContext::DxgiSwapchain::Create(
+          vulkan_device_, hwnd, new_surface_width, new_surface_height);
+      presenting_via_dxgi = paint_context_.dxgi_swapchain != nullptr;
+    }
+    if (presenting_via_dxgi) {
+      const PaintContext::DxgiSwapchain& dxgi_swapchain = *paint_context_.dxgi_swapchain;
+      new_swapchain_format = PaintContext::DxgiSwapchain::kFormat;
+      paint_context_.swapchain_extent = dxgi_swapchain.extent();
+      paint_context_.swapchain_is_fifo = dxgi_swapchain.is_vsync();
+      paint_context_.swapchain_images.assign(dxgi_swapchain.images().cbegin(),
+                                             dxgi_swapchain.images().cend());
+    } else {
+      REXLOG_WARN(
+          "VulkanPresenter: Presenting through DXGI failed, using the Vulkan swapchain for the "
+          "rest of the session");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      paint_context_.dxgi_swapchain_failed = true;
+    }
+  }
+#endif
+
   // ConnectOrReconnectToSurfaceFromUIThread may be called only for the
   // ui::Surface of the current swapchain or when the old swapchain and
   // VkSurface have, if the ui::Surface is the same, try using the existing
@@ -763,7 +1225,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // The retirement or destruction of the swapchain here will also cause
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
-  if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
+  if (!presenting_via_dxgi && paint_context_.vulkan_surface != VK_NULL_HANDLE) {
     VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
     bool surface_unusable;
     paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
@@ -782,7 +1244,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 
   // If failed to create the swapchain for the previous surface, recreate the
   // surface and create the new swapchain.
-  if (paint_context_.swapchain == VK_NULL_HANDLE) {
+  if (!presenting_via_dxgi && paint_context_.swapchain == VK_NULL_HANDLE) {
     // DestroySwapchainAndVulkanSurface should have been called previously.
     assert_true(paint_context_.vulkan_surface == VK_NULL_HANDLE);
     Surface::TypeIndex surface_type = new_surface.GetType();
@@ -889,8 +1351,13 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
-  // Update the render pass to the new format.
-  if (paint_context_.swapchain_render_pass_format != new_swapchain_format) {
+  // Update the render pass to the new format. Direct3D copies the images
+  // presented through DXGI, so they end in a layout other than PRESENT_SRC
+  // (layouts don't affect render pass compatibility, the pipelines are kept).
+  const VkImageLayout new_swapchain_final_layout =
+      presenting_via_dxgi ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  if (paint_context_.swapchain_render_pass_format != new_swapchain_format ||
+      paint_context_.swapchain_render_pass_final_layout != new_swapchain_final_layout) {
     util::DestroyAndNullHandle(dfn.vkDestroyRenderPass, device,
                                paint_context_.swapchain_render_pass);
     paint_context_.swapchain_render_pass_format = new_swapchain_format;
@@ -907,7 +1374,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     render_pass_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     render_pass_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     render_pass_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    render_pass_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    render_pass_attachment.finalLayout = new_swapchain_final_layout;
     VkAttachmentReference render_pass_color_attachment;
     render_pass_color_attachment.attachment = 0;
     render_pass_color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -957,35 +1424,39 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     paint_context_.swapchain_render_pass = new_render_pass;
     paint_context_.swapchain_render_pass_format = new_swapchain_format;
+    paint_context_.swapchain_render_pass_final_layout = new_swapchain_final_layout;
     paint_context_.swapchain_render_pass_clear_load_op =
         render_pass_attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
   }
 
-  // Get the swapchain images.
-  paint_context_.swapchain_images.clear();
-  VkResult swapchain_images_get_result;
-  for (;;) {
-    uint32_t swapchain_image_count = uint32_t(paint_context_.swapchain_images.size());
-    bool swapchain_images_were_empty = !swapchain_image_count;
-    swapchain_images_get_result = dfn.vkGetSwapchainImagesKHR(
-        device, paint_context_.swapchain, &swapchain_image_count,
-        swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
-    // If the original swapchain image count was 0 (first call), SUCCESS is
-    // returned, not INCOMPLETE.
-    if (swapchain_images_get_result == VK_SUCCESS || swapchain_images_get_result == VK_INCOMPLETE) {
-      paint_context_.swapchain_images.resize(swapchain_image_count);
-      if (swapchain_images_get_result == VK_SUCCESS &&
-          (!swapchain_images_were_empty || !swapchain_image_count)) {
+  // Get the swapchain images (the DXGI ones are taken above).
+  if (!presenting_via_dxgi) {
+    paint_context_.swapchain_images.clear();
+    VkResult swapchain_images_get_result;
+    for (;;) {
+      uint32_t swapchain_image_count = uint32_t(paint_context_.swapchain_images.size());
+      bool swapchain_images_were_empty = !swapchain_image_count;
+      swapchain_images_get_result = dfn.vkGetSwapchainImagesKHR(
+          device, paint_context_.swapchain, &swapchain_image_count,
+          swapchain_images_were_empty ? nullptr : paint_context_.swapchain_images.data());
+      // If the original swapchain image count was 0 (first call), SUCCESS is
+      // returned, not INCOMPLETE.
+      if (swapchain_images_get_result == VK_SUCCESS ||
+          swapchain_images_get_result == VK_INCOMPLETE) {
+        paint_context_.swapchain_images.resize(swapchain_image_count);
+        if (swapchain_images_get_result == VK_SUCCESS &&
+            (!swapchain_images_were_empty || !swapchain_image_count)) {
+          break;
+        }
+      } else {
         break;
       }
-    } else {
-      break;
     }
-  }
-  if (swapchain_images_get_result != VK_SUCCESS) {
-    REXLOG_ERROR("VulkanPresenter: Failed to get swapchain images");
-    paint_context_.DestroySwapchainAndVulkanSurface();
-    return SurfacePaintConnectResult::kFailure;
+    if (swapchain_images_get_result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to get swapchain images");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
   }
 
   // Create the image views and the framebuffers.
@@ -1434,7 +1905,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
-  if (swapchain != VK_NULL_HANDLE) {
+  // Framebuffers without a swapchain are the DXGI swapchain's.
+  if (swapchain != VK_NULL_HANDLE || !swapchain_framebuffers.empty()) {
     submission_tracker.AwaitAllSubmissionsCompletion();
   }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1459,6 +1931,9 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
     vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
                                                      nullptr);
   }
+#if REX_PLATFORM_WIN32
+  dxgi_swapchain.reset();
+#endif
   present_queue_family = UINT32_MAX;
   if (vulkan_surface != VK_NULL_HANDLE) {
     const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
@@ -1577,30 +2052,39 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
-  VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
-  switch (acquire_result) {
-    case VK_SUCCESS:
-    case VK_SUBOPTIMAL_KHR:
-      break;
-    case VK_ERROR_DEVICE_LOST:
-      REXLOG_ERROR(
-          "VulkanPresenter: Failed to acquire the swapchain image as the "
-          "device has been lost");
-      return PaintResult::kGpuLostResponsible;
-    case VK_ERROR_OUT_OF_DATE_KHR:
-    case VK_ERROR_SURFACE_LOST_KHR:
-    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
-      // Not an error, reporting just as info (may normally occur while resizing
-      // on some platforms).
-      REXLOG_INFO(
-          "VulkanPresenter: Presentation to the swapchain image has been "
-          "dropped as the swapchain or the surface has become outdated");
-      return PaintResult::kNotPresentedConnectionOutdated;
-    default:
-      REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
-      return PaintResult::kNotPresented;
+#if REX_PLATFORM_WIN32
+  PaintContext::DxgiSwapchain* const dxgi_swapchain = paint_context_.dxgi_swapchain.get();
+  if (dxgi_swapchain) {
+    // Reuse of the image is awaited on the GPU through the submission.
+    swapchain_image_index = dxgi_swapchain->next_image_index();
+  } else
+#endif
+  {
+    VkResult acquire_result =
+        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                  VK_NULL_HANDLE, &swapchain_image_index);
+    switch (acquire_result) {
+      case VK_SUCCESS:
+      case VK_SUBOPTIMAL_KHR:
+        break;
+      case VK_ERROR_DEVICE_LOST:
+        REXLOG_ERROR(
+            "VulkanPresenter: Failed to acquire the swapchain image as the "
+            "device has been lost");
+        return PaintResult::kGpuLostResponsible;
+      case VK_ERROR_OUT_OF_DATE_KHR:
+      case VK_ERROR_SURFACE_LOST_KHR:
+      case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT:
+        // Not an error, reporting just as info (may normally occur while
+        // resizing on some platforms).
+        REXLOG_INFO(
+            "VulkanPresenter: Presentation to the swapchain image has been "
+            "dropped as the swapchain or the surface has become outdated");
+        return PaintResult::kNotPresentedConnectionOutdated;
+      default:
+        REXLOG_ERROR("VulkanPresenter: Failed to acquire the swapchain image");
+        return PaintResult::kNotPresented;
+    }
   }
 
   // Non-zero extents needed for both the viewport (width must not be zero) and
@@ -2163,6 +2647,28 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   dfn.vkCmdEndRenderPass(draw_command_buffer);
 
+#if REX_PLATFORM_WIN32
+  if (dxgi_swapchain) {
+    // Release the image to Direct3D, which copies it to the back buffer. No
+    // acquire is needed when drawing into it again, as its contents are
+    // discarded then (the render pass starts from UNDEFINED).
+    VkImageMemoryBarrier release_barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    release_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    release_barrier.dstAccessMask = 0;
+    release_barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    release_barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    release_barrier.srcQueueFamilyIndex = vulkan_device_->queue_family_graphics_compute();
+    release_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    release_barrier.image = paint_context_.swapchain_images[swapchain_image_index];
+    release_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    release_barrier.subresourceRange.levelCount = 1;
+    release_barrier.subresourceRange.layerCount = 1;
+    dfn.vkCmdPipelineBarrier(draw_command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &release_barrier);
+  }
+#endif
+
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2195,6 +2701,25 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   submit_info.pCommandBuffers = command_buffers;
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &present_semaphore;
+#if REX_PLATFORM_WIN32
+  VkTimelineSemaphoreSubmitInfo dxgi_timeline_submit_info = {
+      VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  VkSemaphore dxgi_copied_semaphore, dxgi_rendered_semaphore;
+  uint64_t dxgi_copied_frame, dxgi_rendered_frame;
+  if (dxgi_swapchain) {
+    dxgi_copied_semaphore = dxgi_swapchain->copied_semaphore();
+    dxgi_copied_frame = dxgi_swapchain->next_image_copied_frame();
+    dxgi_rendered_semaphore = dxgi_swapchain->rendered_semaphore();
+    dxgi_rendered_frame = dxgi_swapchain->next_frame();
+    dxgi_timeline_submit_info.waitSemaphoreValueCount = 1;
+    dxgi_timeline_submit_info.pWaitSemaphoreValues = &dxgi_copied_frame;
+    dxgi_timeline_submit_info.signalSemaphoreValueCount = 1;
+    dxgi_timeline_submit_info.pSignalSemaphoreValues = &dxgi_rendered_frame;
+    submit_info.pNext = &dxgi_timeline_submit_info;
+    submit_info.pWaitSemaphores = &dxgi_copied_semaphore;
+    submit_info.pSignalSemaphores = &dxgi_rendered_semaphore;
+  }
+#endif
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -2236,6 +2761,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       return PaintResult::kNotPresentedConnectionOutdated;
     }
   }
+
+#if REX_PLATFORM_WIN32
+  if (dxgi_swapchain) {
+    // A failure reconnects, and if the DXGI swapchain can't be rebuilt, the
+    // Vulkan swapchain takes over.
+    return dxgi_swapchain->Present() ? PaintResult::kPresented
+                                     : PaintResult::kNotPresentedConnectionOutdated;
+  }
+#endif
 
   VkPresentInfoKHR present_info;
   present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
