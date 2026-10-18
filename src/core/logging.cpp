@@ -32,6 +32,8 @@
 #include <rex/platform/env.h>
 
 #if REX_PLATFORM_WIN32
+#include <share.h>
+
 #include <spdlog/sinks/msvc_sink.h>
 #elif REX_PLATFORM_ANDROID
 #include <spdlog/sinks/android_sink.h>
@@ -117,7 +119,14 @@ class PathRotatingFileSink final : public spdlog::sinks::base_sink<std::mutex> {
     return path_.parent_path() / name;
   }
   void Open(std::string_view mode) {
+#if REX_PLATFORM_WIN32
+    // Shared, as spdlog's file sink opened it: tools read the log while the
+    // game runs, and _wfopen_s (rex::filesystem::OpenFile) shares nothing.
+    const std::wstring wmode(mode.begin(), mode.end());
+    file_ = _wfsopen(path_.c_str(), wmode.c_str(), _SH_DENYNO);
+#else
     file_ = rex::filesystem::OpenFile(path_, mode);
+#endif
     size_ = 0;
     if (file_ && rex::filesystem::Seek(file_, 0, SEEK_END)) {
       const int64_t end = rex::filesystem::Tell(file_);
