@@ -133,6 +133,29 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode (tears late frames) while vsync is off");
 
+REXCVAR_DEFINE_STRING(vulkan_present_mode, "auto", "UI/Vulkan",
+                      "Present mode: auto (by vsync and the vulkan_allow_present_mode_* "
+                      "switches), immediate (tears; under variable refresh rate the smoothest), "
+                      "fifo (vsync) or mailbox; one the driver lacks falls back to auto")
+    .allowed({"auto", "immediate", "fifo", "mailbox"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// VK_PRESENT_MODE_MAX_ENUM_KHR for auto.
+VkPresentModeKHR RequestedPresentMode(const std::string& mode) {
+  if (mode == "immediate") {
+    return VK_PRESENT_MODE_IMMEDIATE_KHR;
+  }
+  if (mode == "fifo") {
+    return VK_PRESENT_MODE_FIFO_KHR;
+  }
+  if (mode == "mailbox") {
+    return VK_PRESENT_MODE_MAILBOX_KHR;
+  }
+  return VK_PRESENT_MODE_MAX_ENUM_KHR;
+}
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(vulkan_present_wait, false, "UI/Vulkan",
                     "Pace presentation: after each present, wait (up to 50 ms) until the "
                     "previous one has reached the display (VK_KHR_present_wait), so at most "
@@ -921,10 +944,19 @@ class VulkanPresenter::PaintContext::DxgiSwapchain {
     if (tearing_supported) {
       swapchain_flags_ |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
-    if (REXCVAR_GET(vulkan_allow_present_mode_immediate) && tearing_supported) {
-      present_flags_ = DXGI_PRESENT_ALLOW_TEARING;
-    } else if (!REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
-               !REXCVAR_GET(vulkan_allow_present_mode_mailbox)) {
+    const VkPresentModeKHR requested_mode = RequestedPresentMode(REXCVAR_GET(vulkan_present_mode));
+    if (requested_mode == VK_PRESENT_MODE_MAX_ENUM_KHR) {
+      if (REXCVAR_GET(vulkan_allow_present_mode_immediate) && tearing_supported) {
+        present_flags_ = DXGI_PRESENT_ALLOW_TEARING;
+      } else if (!REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+                 !REXCVAR_GET(vulkan_allow_present_mode_mailbox)) {
+        sync_interval_ = 1;
+      }
+    } else if (requested_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+      if (tearing_supported) {
+        present_flags_ = DXGI_PRESENT_ALLOW_TEARING;
+      }
+    } else if (requested_mode == VK_PRESENT_MODE_FIFO_KHR) {
       sync_interval_ = 1;
     }
 
@@ -1488,6 +1520,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
                                                                  uint32_t new_surface_height,
                                                                  bool was_paintable,
                                                                  bool& is_vsync_implicit_out) {
+  const std::string present_mode = REXCVAR_GET(vulkan_present_mode);
+  [[maybe_unused]] const bool present_mode_changed =
+      present_mode != paint_context_.swapchain_present_mode;
+  paint_context_.swapchain_present_mode = present_mode;
   const VulkanInstance* const vulkan_instance = vulkan_device_->vulkan_instance();
   const VulkanInstance::Functions& ifn = vulkan_instance->functions();
   const VkInstance instance = vulkan_instance->instance();
@@ -1498,8 +1534,10 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 
   bool presenting_via_dxgi = false;
 #if REX_PLATFORM_WIN32
-  // HDR output needs the Vulkan swapchain's color spaces.
-  if (paint_context_.dxgi_swapchain && REXCVAR_GET(present_hdr)) {
+  // HDR output needs the Vulkan swapchain's color spaces, and Resize keeps the
+  // present mode the DXGI swapchain was made for.
+  if (paint_context_.dxgi_swapchain &&
+      (REXCVAR_GET(present_hdr) || present_mode_changed)) {
     paint_context_.DestroySwapchainAndVulkanSurface();
   }
   if (REXCVAR_GET(vulkan_present_via_dxgi) && !REXCVAR_GET(present_hdr) &&
@@ -2418,7 +2456,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // modes that tear are left out, so the swapchain is mailbox or FIFO, as
   // Direct3D 12 presents without its tearing flag. Unregistered counts as on.
   const bool vsync = rex::cvar::GetFlagByName("vsync") != "false";
-  if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  const VkPresentModeKHR requested_mode = RequestedPresentMode(REXCVAR_GET(vulkan_present_mode));
+  if (requested_mode != VK_PRESENT_MODE_MAX_ENUM_KHR &&
+      std::find(present_modes.cbegin(), present_modes.cend(), requested_mode) !=
+          present_modes.cend()) {
+    swapchain_create_info.presentMode = requested_mode;
+  } else if (!vsync && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
@@ -2641,6 +2684,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // changes.
   if (REXCVAR_GET(present_hdr) != paint_context_.swapchain_hdr &&
       (paint_context_.swapchain_hdr || hdr_output_offered.load(std::memory_order_relaxed))) {
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+  // vulkan_present_mode switched: recreate the swapchain in the new mode.
+  if (REXCVAR_GET(vulkan_present_mode) != paint_context_.swapchain_present_mode) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
   // Begin the submission in place of the one not currently potentially used on

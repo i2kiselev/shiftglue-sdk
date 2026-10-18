@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -575,6 +576,8 @@ class VulkanPresenter final : public Presenter {
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     bool swapchain_hdr = false;
+    // The vulkan_present_mode the swapchain was created for.
+    std::string swapchain_present_mode = "auto";
     // Per swapchain image when swapchain_hdr.
     std::vector<HdrImage> hdr_images;
   };
