@@ -5804,6 +5804,16 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // synchronization scope all commands that occur earlier in submission
     // order."
     const auto wait_start = std::chrono::steady_clock::now();
+    if (async_submission_) {
+      std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+      submission_worker_idle_.wait(lock, [&]() {
+        return submission_worker_submitted_ >= await_submission ||
+               submission_worker_submit_failed_;
+      });
+      if (submission_worker_submit_failed_) {
+        return;
+      }
+    }
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
@@ -5815,7 +5825,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR("Failed to await submission completion Vulkan fences (VkResult {})",
+                   int(wait_result));
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
         LogCheckpoints();
@@ -5825,6 +5836,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   // Check how far into the submissions the GPU currently is, in order because
   // submission themselves can be executed out of order, but Xenia serializes
   // that for simplicity.
+  if (async_submission_) {
+    std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+    fences_total =
+        std::min(fences_total, size_t(submission_worker_submitted_ - submission_completed_));
+  }
   while (fences_awaited < fences_total) {
     VkResult fence_status =
         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
@@ -6258,7 +6274,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
         submission_jobs_.push_back(SubmissionJob{std::move(tape), command_buffer,
                                                  current_submission_wait_semaphores_,
-                                                 current_submission_wait_stage_masks_, fence});
+                                                 current_submission_wait_stage_masks_, fence,
+                                                 GetCurrentSubmission()});
       }
       submission_worker_wake_.notify_one();
     } else if (!ExecuteSubmission(deferred_command_buffer_, command_buffer,
@@ -6423,7 +6440,11 @@ bool VulkanCommandProcessor::ExecuteSubmission(
     submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
   }
   if (submit_result != VK_SUCCESS) {
-    REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+    REXGPU_ERROR("Failed to submit a Vulkan command buffer (VkResult {})", int(submit_result));
+    if (async_submission_) {
+      std::lock_guard<std::mutex> lock(submission_worker_mutex_);
+      submission_worker_submit_failed_ = true;
+    }
     if (submit_result == VK_ERROR_DEVICE_LOST) {
       LogCheckpoints();
       if (!async_submission_) {
@@ -6546,6 +6567,8 @@ void VulkanCommandProcessor::StartSubmissionWorker() {
     return;
   }
   submission_worker_stop_ = false;
+  submission_worker_submitted_ = submission_completed_;
+  submission_worker_submit_failed_ = false;
   submission_worker_ = std::thread([this]() { SubmissionWorkerMain(); });
   REXGPU_INFO("Vulkan submissions replay on a worker thread (split every {} draws)",
               submission_split_draws_);
@@ -6594,11 +6617,10 @@ void VulkanCommandProcessor::SubmissionWorkerMain() {
     lock.lock();
     if (job.tape) {
       submission_free_tapes_.push_back(std::move(job.tape));
+      submission_worker_submitted_ = job.submission;
     }
     submission_worker_busy_ = false;
-    if (submission_jobs_.empty()) {
-      submission_worker_idle_.notify_all();
-    }
+    submission_worker_idle_.notify_all();
   }
 }
 

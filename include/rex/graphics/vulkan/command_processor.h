@@ -388,6 +388,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::vector<VkSemaphore> wait_semaphores;
     std::vector<VkPipelineStageFlags> wait_stage_masks;
     VkFence fence = VK_NULL_HANDLE;
+    uint64_t submission = 0;
     // Without a tape: work to run on the worker after the jobs before it (the
     // presenter's publish and paint).
     std::function<void()> callback;
@@ -427,6 +428,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::unique_ptr<DeferredCommandBuffer>> submission_free_tapes_;
   bool submission_worker_busy_ = false;
   bool submission_worker_stop_ = false;
+  // The last submission the worker has passed to vkQueueSubmit. A fence is
+  // externally synchronized, so the command processor waits for or polls
+  // only fences up to it; AMD loses the device on a wait racing the submit.
+  uint64_t submission_worker_submitted_ = 0;
+  // A failed vkQueueSubmit leaves its fence unsignaled for good, so waits for
+  // it end instead.
+  bool submission_worker_submit_failed_ = false;
   // The presenter's publish-and-paint step runs on the submission worker after
   // the swap's submission instead of the swap waiting for the worker
   // (vulkan_present_on_submission_worker).
