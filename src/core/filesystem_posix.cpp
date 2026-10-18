@@ -170,6 +170,10 @@ static uint64_t convertUnixtimeToWinFiletime(time_t unixtime) {
   return filetime;
 }
 
+std::filesystem::path ExtendedLengthPath(const std::filesystem::path& path) {
+  return path;
+}
+
 bool CreateEmptyFile(const std::filesystem::path& path) {
   int file = creat(path.c_str(), 0774);
   if (file >= 0) {

@@ -81,7 +81,9 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 }
 
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
-    : kernel_state_(kernel_state), root_path_(root_path) {}
+    : kernel_state_(kernel_state),
+      // Installed packages nest past MAX_PATH below a long user data root.
+      root_path_(rex::filesystem::ExtendedLengthPath(root_path)) {}
 
 ContentManager::~ContentManager() = default;
 

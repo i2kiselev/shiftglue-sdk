@@ -44,6 +44,11 @@ std::filesystem::path GetUserFolder();
 // attempting to create it.
 bool CreateParentFolder(const std::filesystem::path& path);
 
+// Returns the path in the form the host file APIs accept past MAX_PATH: on
+// Windows absolute, normalized and prefixed with \\?\ (\\?\UNC\ for a share);
+// unchanged elsewhere.
+std::filesystem::path ExtendedLengthPath(const std::filesystem::path& path);
+
 // Creates an empty file at the given path, overwriting if it exists.
 bool CreateEmptyFile(const std::filesystem::path& path);
 

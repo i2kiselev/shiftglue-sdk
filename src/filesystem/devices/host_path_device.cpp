@@ -26,7 +26,9 @@ HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                bool allow_share_delete)
     : Device(mount_path),
       name_("STFS"),
-      host_path_(host_path),
+      // Every entry's host path extends this root, so installed content nested
+      // past MAX_PATH stays reachable.
+      host_path_(ExtendedLengthPath(host_path)),
       read_only_(read_only),
       allow_share_delete_(allow_share_delete) {}
 

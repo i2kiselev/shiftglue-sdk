@@ -62,6 +62,23 @@ std::filesystem::path GetUserFolder() {
   return result;
 }
 
+std::filesystem::path ExtendedLengthPath(const std::filesystem::path& path) {
+  const std::wstring_view native = path.native();
+  if (native.starts_with(L"\\\\?\\") || native.starts_with(L"\\\\.\\")) {
+    return path;
+  }
+  std::error_code error;
+  auto absolute = std::filesystem::absolute(path, error);
+  if (error) {
+    return path;
+  }
+  const std::wstring full = absolute.lexically_normal().make_preferred().native();
+  if (full.starts_with(L"\\\\")) {
+    return L"\\\\?\\UNC\\" + full.substr(2);
+  }
+  return L"\\\\?\\" + full;
+}
+
 bool CreateEmptyFile(const std::filesystem::path& path) {
   auto handle =
       CreateFileW(path.c_str(), 0, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
