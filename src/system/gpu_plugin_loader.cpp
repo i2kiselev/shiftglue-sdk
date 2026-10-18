@@ -11,18 +11,35 @@
 
 #include <rex/system/gpu_plugin.h>
 
+#include <atomic>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 #include <fmt/format.h>
 
+#include <rex/assert.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/dynlib.h>
 
 namespace rex::system {
+
+namespace {
+std::atomic<HostGpuLossHandler> g_host_gpu_loss_handler{nullptr};
+}  // namespace
+
+void SetHostGpuLossHandler(HostGpuLossHandler handler) {
+  g_host_gpu_loss_handler.store(handler, std::memory_order_release);
+}
+
+void ReportHostGpuLoss() {
+  if (auto handler = g_host_gpu_loss_handler.load(std::memory_order_acquire)) {
+    handler();
+  }
+  rex::FatalError("Graphics device lost (probably due to an internal error)");
+}
 
 namespace {
 
@@ -60,13 +77,13 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
     REXSYS_ERROR(
         "GPU plugin '{}' not found at {}. Stage it next to the executable "
         "(GPU_PLUGINS {} in rexglue_configure_target).",
-        name, path.string(), name);
+        name, rex::path_to_utf8(path), name);
     return nullptr;
   }
 
   platform::DynamicLibrary library;
   if (!library.Load(path, platform::SymbolResolution::kImmediate)) {
-    REXSYS_ERROR("GPU plugin '{}' failed to load: {}", name, path.string());
+    REXSYS_ERROR("GPU plugin '{}' failed to load: {}", name, rex::path_to_utf8(path));
     return nullptr;
   }
 
@@ -74,14 +91,14 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
   auto create_fn = library.GetSymbol<GpuCreateFn>(kGpuCreateSymbol);
   if (!abi_version_fn || !create_fn) {
     REXSYS_ERROR("GPU plugin '{}' is not a rexglue GPU plugin (missing {} / {} exports): {}", name,
-                 kGpuAbiVersionSymbol, kGpuCreateSymbol, path.string());
+                 kGpuAbiVersionSymbol, kGpuCreateSymbol, rex::path_to_utf8(path));
     return nullptr;
   }
 
   uint32_t plugin_abi = abi_version_fn();
   if (plugin_abi != kGpuPluginAbiVersion) {
     REXSYS_ERROR("GPU plugin '{}' has ABI version {}, host expects {}: {}", name, plugin_abi,
-                 kGpuPluginAbiVersion, path.string());
+                 kGpuPluginAbiVersion, rex::path_to_utf8(path));
     return nullptr;
   }
 
@@ -98,7 +115,7 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
   }
 
   LoadedPlugins().push_back(std::move(library));
-  REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, path.filename().string());
+  REXSYS_DEBUG("GPU plugin '{}' loaded ({})", name, rex::path_to_utf8(path.filename()));
   return std::unique_ptr<IGraphicsSystem>(graphics_system);
 }
 

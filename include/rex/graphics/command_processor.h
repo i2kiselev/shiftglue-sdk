@@ -12,6 +12,12 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#if defined(_WIN32) && (defined(__x86_64__) || defined(_M_X64))
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>  // __rdtsc
+#endif
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -37,10 +43,15 @@ namespace rex::stream {
 class ByteStream;
 }  // namespace rex::stream
 
+namespace rex::system::d3d_draw {
+struct Description;
+}  // namespace rex::system::d3d_draw
+
 namespace rex::graphics {
 
 class GraphicsSystem;
 class Shader;
+struct D3dPageWatch;
 
 enum class ReadbackResolveMode {
   kDisabled,
@@ -99,6 +110,20 @@ class CommandProcessor {
   }
   uint64_t bin_mask() const { return bin_mask_; }
   uint64_t bin_select() const { return bin_select_; }
+  // FH1: the last resolve of the screen's shadow mask (any thread).
+  // fh1_shadow_mask_resolves counts them, so a title hook that keeps the mask
+  // lit sees when the game wrote it again.
+  void set_fh1_shadow_mask(uint32_t base, uint32_t length) {
+    fh1_shadow_mask_.store(uint64_t(base) << 32 | length, std::memory_order_relaxed);
+    fh1_shadow_mask_resolves_.fetch_add(1, std::memory_order_release);
+  }
+  bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const {
+    if (resolves) *resolves = fh1_shadow_mask_resolves_.load(std::memory_order_acquire);
+    const uint64_t mask = fh1_shadow_mask_.load(std::memory_order_relaxed);
+    *base = uint32_t(mask >> 32);
+    *length = uint32_t(mask);
+    return mask != 0;
+  }
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -154,6 +179,9 @@ class CommandProcessor {
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
+  // While paused, wakes the commands thread once to release the caches it
+  // can rebuild (OnReduceMemory), then pauses it again.
+  void ReduceMemoryWhilePaused();
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
@@ -179,6 +207,97 @@ class CommandProcessor {
   virtual void WriteRegister(uint32_t index, uint32_t value);
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
+  // As WriteRegistersFromMem with host byte order values: the recorder's runs,
+  // which the decoder swapped when recording them. The default swaps them back
+  // for backends that only override WriteRegistersFromMem.
+  virtual void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
+                                  uint32_t num_registers);
+  // Recorder time spent executing record batches since startup (the
+  // recorder thread only; RR-0.1's coverage check).
+  uint64_t record_batch_ns_ = 0;
+  // RR-0.1's clock: the time-stamp counter on x86 (a few cycles a read),
+  // steady-clock nanoseconds elsewhere; converted to nanoseconds when logged.
+  static uint64_t CostTicks() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+#endif
+  }
+  // With record_cost_enabled_ (gpu_draw_cost_model), the batch time by entry:
+  // draw records (IssueDraw and its record handling), single register writes
+  // and calls.
+  bool record_cost_enabled_ = false;
+  // In CostTicks units despite the names' unit, like record_batch_ticks_.
+  uint64_t record_draws_ns_ = 0, record_ones_ns_ = 0, record_calls_ns_ = 0;
+  uint64_t record_batch_ticks_ = 0, record_entries_ = 0;
+  // PD-0.2 entry census, with record_cost_enabled_: single registers by
+  // register, runs by class (render state, float, fetch, bool and loop,
+  // other) with their registers, calls and batches; and on the decoder,
+  // source runs and the sub-runs elision split them into.
+  struct RecordCensus {
+    uint64_t ones[RegisterFile::kRegisterCount] = {};
+    uint64_t ones_other = 0;
+    uint64_t runs[5] = {}, run_registers[5] = {};
+    uint64_t calls = 0, batches = 0, draws = 0;
+    // Scratch register writes: repeating the value, and written back.
+    uint64_t scratch_same = 0, scratch_writeback = 0;
+  };
+  std::unique_ptr<RecordCensus> record_census_;
+  static uint32_t RecordRunClass(uint32_t start_index);
+  std::atomic<uint64_t> decode_source_runs_{0}, decode_sub_runs_{0};
+  std::atomic<uint64_t> decode_shader_loads_{0}, decode_shader_loads_skipped_{0};
+  std::atomic<uint64_t> decode_scratch_writes_{0}, decode_scratch_recorded_{0};
+  // gpu_template_stats (DR-4.2's first stage, recorder thread): each draw's
+  // signature (register state, shaders, the fetch constants it uses, the draw
+  // packet) in the indirect buffer execution it belongs to, compared at the
+  // buffer's end with the same buffer's previous execution, to size what a
+  // compiled replay of repeated buffers could skip.
+  void TemplateStatsIbBegin(uint64_t ib_key, bool repeat);
+  void TemplateStatsIbEnd();
+  // Parts 0-5 are the guest-side signature (TemplateStatsDraw); 6-8 are
+  // filled after binding (TemplateStatsDrawHost, LS-3.3): the host image
+  // views and samplers bound, and whether the draw needed an EDRAM ownership
+  // transfer or a shared memory upload. A replayed command segment is invalid
+  // when its bound views differ or it would need a transfer the recording did
+  // not have; uploads only need revalidation.
+  static constexpr size_t kTemplateParts = 9;
+  static constexpr size_t kTemplateGuestParts = 6;
+  void TemplateStatsDraw(const uint64_t (&parts)[kTemplateGuestParts]);
+  void TemplateStatsDrawHost(uint64_t bound_views_hash, bool transferred, bool uploaded);
+  void TemplateStatsFrame();
+  struct TemplateStatsIb {
+    uint64_t key = 0;
+    bool repeat = false;
+    std::vector<std::array<uint64_t, kTemplateParts>> signatures;
+  };
+  std::vector<TemplateStatsIb> template_stats_stack_;
+  std::unordered_map<uint64_t, std::vector<std::array<uint64_t, kTemplateParts>>>
+      template_stats_last_;
+  std::unordered_map<uint64_t, uint32_t> template_stats_occurrences_;
+  struct TemplateStatsCounts {
+    uint64_t frames = 0, draws = 0, draws_in_ibs = 0, draws_in_repeated_ibs = 0,
+             draws_matching = 0, draws_in_matching_runs = 0, draws_in_matching_ibs = 0,
+             ibs = 0, matching_ibs = 0;
+    // Draws at a matching position whose part n matches.
+    uint64_t parts_matching[kTemplateParts] = {};
+    uint64_t draws_matching_with_constants = 0;
+    // LS-3.3: draws with a transfer or an upload; draws whose state matches
+    // and whose bound views match too without a transfer (replayable as
+    // recorded commands, with fresh constants); and buffers wholly so.
+    uint64_t draws_transferring = 0, draws_uploading = 0, draws_replayable = 0,
+             replayable_ibs = 0, draws_in_replayable_ibs = 0;
+  } template_stats_;
+  // A sample of buffers: the register file at their first draw, to count
+  // which registers differ from the previous execution's.
+  std::unordered_map<uint64_t, std::vector<uint32_t>> template_stats_registers_;
+  std::unordered_map<uint32_t, uint64_t> template_stats_register_diffs_;
+  // CommandProcessor::WriteRegistersFromMem's own work for host order values.
+  void WriteRegistersHostBase(uint32_t start_index, const uint32_t* values,
+                              uint32_t num_registers);
+  std::vector<uint32_t> write_registers_host_scratch_;
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
                                           uint32_t num_registers);
   void WriteALURangeFromRing(memory::RingBuffer* ring, uint32_t base, uint32_t num_registers);
@@ -301,16 +420,31 @@ class CommandProcessor {
   // changed register: equal hashes mean equal state, so derivations can be
   // reused across draws and frames, not only while nothing changes.
   uint64_t state_hash_ = 0;
+  // Bumped when a register of the render state block (0x2000-0x23FF: render
+  // backend, VGT, clipper and setup unit) other than a per-draw one changes:
+  // derivations that read only that block, such as the system constants, can
+  // be reused while it holds, across shader and fetch constant writes.
+  uint64_t render_state_epoch_ = 1;
+  static bool IsRenderStateRegister(uint32_t index) { return index - 0x2000u < 0x400u; }
   static uint64_t StateHashTerm(uint32_t index, uint32_t value) {
     uint64_t x = (uint64_t(index) << 32 | value) * UINT64_C(0x9E3779B97F4A7C15);
     x ^= x >> 29;
     x *= UINT64_C(0xBF58476D1CE4E5B9);
     return x ^ (x >> 32);
   }
+  // Registers left out of the state epoch and hash: per-draw ones, and ones
+  // no draw derivation reads that change on their own every frame - the
+  // command processor's (CP_RB_WPTR moves with every kick), the display
+  // controller's (D1GRPH_PRIMARY_SURFACE_ADDRESS alternates with the front
+  // buffer) and the host coherency range. With them in, the hash of the same
+  // draw differed between frames 98 % of the time (gpu_template_stats), so
+  // the hash-keyed memos missed across frames.
   static bool IsPerDrawRegister(uint32_t index) {
     return (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) ||
            (index >= XE_GPU_REG_VGT_EVENT_INITIATOR && index <= XE_GPU_REG_VGT_DRAW_INITIATOR) ||
-           index == XE_GPU_REG_COHER_STATUS_HOST || index >= 0x5000;
+           (index >= XE_GPU_REG_COHER_SIZE_HOST && index <= XE_GPU_REG_COHER_STATUS_HOST) ||
+           (index >= 0x01C0 && index <= 0x01FF) || (index >= 0x1800 && index <= 0x19FF) ||
+           index >= 0x5000;
   }
   // Returns once the recorder has run everything recorded so far; the
   // recorder is then idle until the next publish, so this thread may touch
@@ -336,7 +470,28 @@ class CommandProcessor {
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
-  std::queue<std::function<void()>> pending_fns_;
+  struct PendingCall {
+    std::function<void()> fn;
+    // Runs on the decoding thread even when a recorder thread is split off.
+    bool on_worker = false;
+  };
+  void CallInWorkerThread(std::function<void()> fn);
+  // On the worker thread, between guest commands: parks it until Resume,
+  // doing any memory reduction requested meanwhile.
+  void WorkerWaitWhilePaused();
+  // Called on the thread that records host GPU work, with the GPU idle.
+  virtual void OnReduceMemory() {}
+
+  // Pushed from other threads (the UI's lifecycle events), popped by the
+  // worker.
+  std::mutex pending_mutex_;
+  std::queue<PendingCall> pending_fns_;
+  std::atomic<bool> pending_any_{false};
+
+  std::mutex pause_mutex_;
+  std::condition_variable pause_signal_;
+  bool worker_paused_ = false;            // Protected by pause_mutex_.
+  bool reduce_memory_requested_ = false;  // Protected by pause_mutex_.
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -359,7 +514,31 @@ class CommandProcessor {
   std::unordered_map<uint32_t, uint32_t> extended_register_values_;
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
+  std::atomic<uint64_t> fh1_shadow_mask_{0};
+  std::atomic<uint32_t> fh1_shadow_mask_resolves_{0};
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+ public:
+  // gpu_trace_bins_vblank: swaps decoded, to trace one whole frame.
+  uint32_t trace_swaps_ = 0;
+  // Untiled predicated tiling (the Vulkan FH1 executor): the first tile's
+  // predicated packets run as if every tile's bins were selected.
+  bool untile_tiling_ = false;
+  bool untile_select_all_ = false;
+  // Draws the backend skipped for a later untile pass (gpu_replay_floor_probe
+  // counts drawn draws as the decoded ones minus these).
+  uint64_t untile_skipped_draws_ = 0;
+  // A bin select of a predicated tiling pass: 0 the first tile (bins 0-1),
+  // 1 and up the later ones, -1 not a tiling pass.
+  int32_t TilingPassOfSelect() const {
+    const uint32_t select = uint32_t(bin_select_);
+    if (select == 0xFFFFFFFFu || !(select & 0x7FFFFFFFu)) return -1;
+    return int32_t(rex::tzcnt(select & 0x7FFFFFFFu) / 2);
+  }
+  // gpu_trace_bins_vblank: the indirect buffer nesting depth.
+  uint32_t trace_ib_depth_ = 0;
+ protected:
+  // Forgets the shader cache's shaders (before the backend destroys them).
+  void D3dShaderCacheReset();
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
@@ -383,10 +562,30 @@ class CommandProcessor {
 #endif  // REX_HAS_VULKAN
 
  private:
+  // Leaves new elements uninitialized on resize: a register run is resized
+  // into the batch and then overwritten whole, so zeroing it first is wasted
+  // work on the decoder thread.
+  template <typename T>
+  struct DefaultInitAllocator : std::allocator<T> {
+    template <typename U>
+    struct rebind {
+      using other = DefaultInitAllocator<U>;
+    };
+    using std::allocator<T>::allocator;
+    template <typename U>
+    void construct(U* p) noexcept {
+      ::new (static_cast<void*>(p)) U;
+    }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) {
+      ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+  };
+  using RecordWords = std::vector<uint32_t, DefaultInitAllocator<uint32_t>>;
   struct RecordBatch {
-    // Records: kRecordRun start count dwords..., kRecordOne index value,
+    // Records: kRecordRun start count dwords (host order)..., kRecordOne index value,
     // kRecordCall function-index.
-    std::vector<uint32_t> words;
+    RecordWords words;
     std::vector<std::function<void()>> fns;
   };
   static constexpr uint32_t kRecordRun = 0;
@@ -396,11 +595,135 @@ class CommandProcessor {
     uint32_t packet;
     uint32_t initiator;
     uint32_t is_indexed;
-    uint32_t padding;
+    // PD-1.1: the draw packet's register writes the record carries instead of
+    // single-register entries: 0 (written as entries), 1 (VGT_DRAW_INITIATOR)
+    // or 3 (and VGT_DMA_BASE and VGT_DMA_SIZE).
+    uint32_t fused_registers;
+    uint32_t dma_base;
+    uint32_t dma_size;
     IndexBufferInfo index_buffer_info;
     const char* opcode_name;
   };
   static constexpr uint32_t kRecordDraw = 3;
+  // PD-1.2: an IM_LOAD as data (type, guest address, dword count, microcode
+  // pointer and hash, 64 bits each) instead of a closure.
+  static constexpr uint32_t kRecordLoadShader = 4;
+  static constexpr size_t kLoadShaderRecordWords = 7;
+  void ExecuteLoadShaderRecord(const uint32_t* words);
+  // The decoder's last recorded hashed load by shader type (vertex, pixel):
+  // a load repeating it would set the same active shader, so it is not
+  // recorded. Reset by an immediate load of the type.
+  struct LastShaderLoad {
+    bool valid = false;
+    uint64_t hash = 0;
+    uint32_t dword_count = 0;
+  } decode_last_shader_load_[2];
+  // DL-1.1 wrong-image ceiling (gpu_d3d_census_skip_visible, read at each
+  // indirect buffer): the decoder skips the draws, shader loads and (at 2)
+  // ALU constant packets of the buffers the D3D census counts as visible.
+  // A skipped shader load is kept by type and done before the next draw
+  // that runs, so the fallback draws still see their shaders.
+  int32_t d3d_skip_visible_ = 0;
+  struct SkippedShaderLoad {
+    bool valid = false;
+    xenos::ShaderType type = xenos::ShaderType::kVertex;
+    uint32_t address = 0;
+    const uint32_t* ucode = nullptr;
+    uint32_t dword_count = 0;
+  } d3d_skipped_load_[2];
+  bool d3d_skipped_loads_pending_ = false;
+  // The census half of a draw packet; true if the packet was skipped.
+  bool D3dCensusDraw(memory::RingBuffer* reader, uint32_t count);
+  // Skips an ALU constant packet of a visible buffer; true if skipped.
+  bool D3dCensusSkipConstants(memory::RingBuffer* reader, uint32_t opcode, uint32_t count);
+  // Registers [first, first + count) may be skipped in a visible buffer.
+  bool D3dCensusSkippableRange(uint32_t first, uint32_t count) const;
+  void FlushSkippedShaderLoads();
+  // An IM_LOAD's work (also a D3D-level draw's pointer load).
+  void LoadGuestShader(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords);
+  // An IM_LOAD_IMMEDIATE's work; ucode is copied when recorded.
+  void LoadInlineShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                        const uint32_t* ucode, uint32_t size_dwords);
+  // Registers [*first, *first + *count) a constant packet writes; false for
+  // other packets.
+  static bool ConstantPacketRange(const memory::RingBuffer& reader, uint32_t opcode,
+                                  uint32_t count, uint32_t* first, uint32_t* registers);
+  // A predicated type-3 packet that the bin mask and select drop.
+  bool PredicatedOut(uint32_t packet, uint32_t opcode) const;
+
+  // DL-1.2 D3D-level draws (rex/system/d3d_draw.h): a marker opens a window
+  // over the packets of one guest draw call, which ends at its draw packet.
+  // In verify mode the packets run and are compared with the description;
+  // in draw mode the packets the description covers are skipped and the
+  // description is applied and drawn at the draw packet.
+  struct D3dDrawWindow;
+  std::unique_ptr<D3dDrawWindow> d3d_draw_;
+  bool d3d_draw_open_ = false;
+  void D3dDrawMarker(uint32_t id, uint32_t mode);
+  // A packet inside an open window: true if it was consumed.
+  bool D3dDrawType0(memory::RingBuffer* reader, uint32_t packet);
+  bool D3dDrawType3(memory::RingBuffer* reader, uint32_t packet, uint32_t opcode,
+                    uint32_t count);
+  // Closes the window; in draw mode applies the skipped state first.
+  void D3dDrawAbort(uint32_t reason);
+  void D3dDrawApplyState(const system::d3d_draw::Description& description);
+  void D3dDrawVerify(const memory::RingBuffer& reader, uint32_t packet, uint32_t opcode,
+                     uint32_t count);
+  // Draws the description's draw packet (indexed, or auto-index with
+  // kFlagAutoIndex) as the packet `packet` would.
+  void D3dDrawIssue(const system::d3d_draw::Description& description, uint32_t packet);
+  void D3dDrawSwap();
+  // Counts a drawn description as a decoded draw (the scene measure).
+  void D3dDrawCountDraw();
+  // DL-2.1 slice: a replacement marker (kReplaceMagic, arena offset,
+  // (id << 2) | mode). Draw mode applies the description and draws it; verify
+  // mode opens a DL-1.2 window over the call's packets that follow.
+  void D3dSliceMarker(uint32_t offset, uint32_t id_mode);
+  // DL-2.1 list compiler (d3d_list_compiler.cpp): nested buffers (display
+  // lists) run from a compiled form, checked against their packet headers
+  // and control words at each run; register values, draw words and inline
+  // microcode are read from the buffer as it is at the run, so fixups are
+  // bindings. Mode (gpu_d3d_list_compile, read at each swap): 0 off, 1
+  // verify (compiled and modelled, then decoded and compared), 2 on.
+  struct D3dListCompiler;
+  std::unique_ptr<D3dListCompiler> d3d_lists_;
+  uint32_t d3d_list_mode_ = 0;
+  // Attempt 2 parts, read at each swap with the mode: the page watch
+  // validates compiled lists (gpu_d3d_list_watch) and watched lists replay
+  // their register writes from a host plan (gpu_d3d_list_host_regs).
+  bool d3d_list_watch_ = false;
+  bool d3d_list_host_regs_ = false;
+  // Write watch on guest physical pages (d3d_shader_cache.cpp), shared by the
+  // list compiler and the shader cache; made by the first user.
+  std::unique_ptr<D3dPageWatch> d3d_page_watch_;
+  D3dPageWatch& D3dPageWatchGet();
+  // Shader-load cache (d3d_shader_cache.cpp): IM_LOADs reuse their hash and,
+  // decoding inline, their shader while their microcode is unwritten
+  // (gpu_d3d_shader_cache, read at each swap: 0 off, 1 verify, 2 on).
+  struct D3dShaderCache;
+  std::unique_ptr<D3dShaderCache> d3d_shader_cache_;
+  uint32_t d3d_shader_cache_mode_ = 0;
+  // An IM_LOAD through the shader cache: true if it set the active shader;
+  // otherwise `hash` is the microcode's hash when the cache knows it (0 not).
+  bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
+                          const uint32_t* ucode, uint64_t& hash);
+  void D3dShaderCacheSwap();
+  // Runs a nested buffer from its compiled form; false to decode it.
+  bool D3dListExecute(uint32_t ptr, uint32_t count);
+  // Verify: the buffer at this depth was modelled; it is decoded now and
+  // compared at its draws, shader loads and end (~0u: none).
+  uint32_t d3d_list_verify_depth_ = ~0u;
+  void D3dListVerifyDraw();
+  void D3dListVerifyLoad(uint32_t type, uint32_t address, uint32_t dwords);
+  void D3dListVerifyEnd();
+  void D3dListSwap();
+  // Runs packets of [base, base + count words) from word `offset` on.
+  void ExecutePacketsFrom(const uint32_t* base, uint32_t count, uint32_t offset);
+  // PD-1.6: scratch registers whose writes do not write back (their
+  // SCRATCH_UMSK bit is clear) are recorded once, with their latest value,
+  // before anything that could observe them.
+  uint32_t decode_pending_scratch_ = 0;
+  void FlushPendingScratchWrites();
   static constexpr size_t kDrawRecordWords = (sizeof(DrawRecord) + 3) / 4;
   // The draw half of a draw packet (registers already written): the backend
   // draw and its failure reporting.
@@ -410,6 +733,7 @@ class CommandProcessor {
   void StopRecordThread();
   void RecordThreadMain();
   void ExecuteRecordBatch(RecordBatch& batch);
+  void ExecuteRecordBatchTimed(RecordBatch& batch);
   bool record_split_ = false;
   // gpu_record_elide_unchanged_registers, read when the split starts.
   bool elide_unchanged_registers_ = false;
@@ -418,6 +742,11 @@ class CommandProcessor {
   std::unique_ptr<RegisterFile> decode_register_file_;
   std::unordered_map<uint32_t, uint32_t> decode_extended_register_values_;
   std::unique_ptr<RecordBatch> record_batch_;
+  // The last float constant run recorded, while it is still the batch's last
+  // record: a following run a short gap after it extends it instead.
+  const RecordBatch* last_constant_run_batch_ = nullptr;
+  size_t last_constant_run_offset_ = 0;
+  size_t last_constant_run_end_ = 0;
   std::mutex record_mutex_;
   std::condition_variable record_ready_;
   std::condition_variable record_done_;
@@ -425,6 +754,11 @@ class CommandProcessor {
   std::vector<std::unique_ptr<RecordBatch>> record_free_;
   uint64_t record_published_ = 0;
   uint64_t record_completed_ = 0;
+  // PD-1.5, under record_mutex_: whether the recorder sleeps on record_ready_
+  // and how many RecordSync callers wait on record_done_, so each side
+  // notifies only when someone waits.
+  bool record_recorder_waiting_ = false;
+  uint32_t record_sync_waiters_ = 0;
   bool record_stop_ = false;
   system::object_ref<system::XHostThread> record_thread_;
 

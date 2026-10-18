@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -77,6 +78,15 @@ class TextureCache {
   virtual void ClearCache();
 
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
+  // For a while after this call (from any thread), textures unused for a
+  // second are destroyed down to a small floor instead of the usual limits.
+  static void RequestMemoryReduction();
+  // The device memory textures may take without pushing the device past its
+  // budget (LS-4.2), from the backend's VK_EXT_memory_budget reading; 0 when
+  // unknown. Lowers the configured limits, never raises them.
+  void SetMemoryBudgetLimitMb(uint32_t limit_mb) {
+    budget_limit_mb_.store(limit_mb, std::memory_order_relaxed);
+  }
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
@@ -125,6 +135,14 @@ class TextureCache {
     texture_bindings_in_sync_ &= ~mask;
   }
 
+  // Bindings not written since the last RequestTextures that derived them.
+  uint32_t texture_bindings_in_sync() const { return texture_bindings_in_sync_; }
+  uint64_t current_submission_index() const { return current_submission_index_; }
+  // Whether a texture may have become outdated since the last RequestTextures.
+  bool texture_may_have_become_outdated() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
+  }
+
   virtual void RequestTextures(uint32_t used_texture_mask);
 
   // "ActiveTexture" means as of the latest RequestTextures call.
@@ -132,6 +150,10 @@ class TextureCache {
   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
+  }
+  bool IsActiveTextureHostGamma(uint32_t fetch_constant_index) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    return binding && binding->host_gamma;
   }
   uint8_t GetActiveTextureSwizzledSigns(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
@@ -264,6 +286,10 @@ class TextureCache {
     uint32_t gpu_outdated_mask(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return gpu_outdated_mask_;
     }
+    // The texture cache's write log count when the data last loaded was read
+    // (0: never loaded), for band reloads.
+    uint64_t loaded_write_log_count() const { return loaded_write_log_count_; }
+    void set_loaded_write_log_count(uint64_t count) { loaded_write_log_count_ = count; }
 
     // The rows of an outdated base level a load has to bring up to date,
     // [first, end) in steps of 32: only those a resolve wrote when the level
@@ -304,6 +330,7 @@ class TextureCache {
     TextureKey key_;
     uint64_t allocation_id_;
     std::atomic<uint64_t> payload_generation_{0};
+    uint64_t loaded_write_log_count_ = 0;
 
     texture_util::TextureGuestLayout guest_layout_;
 
@@ -516,6 +543,10 @@ class TextureCache {
     // Whether the fetch requests normalized fixed-point output. Float texture
     // formats are excluded even though their num_format bit is normally zero.
     bool normalized_fixed_point;
+    // The host decodes the gamma (sRGB) components through the unsigned view,
+    // and swizzled_signs has them as unsigned: the fetch had X, Y and Z gamma
+    // and W not, in a format whose host image has an sRGB view.
+    bool host_gamma;
     // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
     // Signed version of the texture if the data in the signed version is
@@ -552,6 +583,9 @@ class TextureCache {
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
   virtual bool IsSignedVersionSeparateForFormat(TextureKey /*key*/) const { return false; }
+  // Whether gamma X, Y and Z of this texture may be decoded by the host sampler
+  // (an sRGB view) instead of the shader's piecewise linear conversion.
+  virtual bool IsHostGammaSupported(TextureKey /*key*/) const { return false; }
   // Parameters like whether the texture is tiled and its dimensions are checked
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
@@ -609,7 +643,46 @@ class TextureCache {
     first_out = loading_base_rows_first_;
     end_out = loading_base_rows_end_;
   }
+  // For a base-only load of a single-level tiled 2D texture: the guest texel
+  // rows [first, end) that changed since its last load, all by GPU writes, a
+  // whole number of 32-row macro tile rows from the top (the tiled layout
+  // keeps each such row contiguous). The implementation may load only those
+  // rows; end 0 means the whole texture.
+  uint32_t loading_rows_first() const { return loading_rows_first_; }
+  uint32_t loading_rows_end() const { return loading_rows_end_; }
+  // For a load of a tiled texture with several array layers: a mask of the
+  // layers that changed since its last load, all by GPU writes, in any of
+  // its levels. The implementation may load only those layers of each level
+  // it loads; 0 means every layer.
+  uint32_t loading_layers_mask() const { return loading_layers_mask_; }
 
+ public:
+  // A texture a resolve may write straight into instead of leaving it to
+  // reload (DR-2.2): current (not outdated), a single-level tiled 2D texture
+  // of the resolve's format, pitch and scaling, whose base level holds the
+  // resolve's written range, with the destination's first row a whole number
+  // of 32-row macro tile rows (row_offset) below its top.
+  struct DirectResolveTarget {
+    Texture* texture;
+    uint32_t row_offset;
+  };
+  void FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start, uint32_t extent_length,
+                                xenos::TextureFormat format, uint32_t pitch_texels,
+                                uint32_t dest_width, uint32_t dest_height, bool scaled,
+                                std::vector<DirectResolveTarget>& targets_out,
+                                bool from_origin = false);
+  // After MarkRangeAsResolved invalidated the targets: their data was written
+  // directly, so they are current again.
+  void CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets);
+
+ protected:
+  // Diagnostics: the textures whose base is at this guest address.
+  std::vector<Texture*> TexturesAtBase(uint32_t base_address) const {
+    std::vector<Texture*> textures;
+    auto range = textures_by_base_.equal_range(base_address);
+    for (auto it = range.first; it != range.second; ++it) textures.push_back(it->second);
+    return textures;
+  }
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
   // post-guest-swizzle signedness.
@@ -619,7 +692,9 @@ class TextureCache {
   // Makes all texture bindings invalid. Also requesting textures after calling
   // this will cause another attempt to create a texture or to untile it if
   // there was an error.
-  void ResetTextureBindings(bool from_destructor = false);
+  void ResetTextureBindings(bool from_destructor = false, bool keep_memo = false);
+  // Resets only the bindings of outdated textures, keeping the binding memo.
+  void ResetOutdatedTextureBindings();
 
   const TextureBinding* GetValidTextureBinding(uint32_t fetch_constant_index) const {
     const TextureBinding& binding = texture_bindings_[fetch_constant_index];
@@ -673,6 +748,16 @@ class TextureCache {
   static void OutdatedRowsGlobalWatchCallback(
       const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
       uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  // Appends every watched write to the write log.
+  static void WriteLogGlobalWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  // Sets loading_rows_first_ and loading_rows_end_ for a base-only reload.
+  void FindReloadRowBand(const std::unique_lock<std::recursive_mutex>& global_lock,
+                         const Texture& texture);
+  // Sets loading_layers_mask_.
+  void FindReloadLayers(const std::unique_lock<std::recursive_mutex>& global_lock,
+                        const Texture& texture);
 
   const RegisterFile& register_file_;
   SharedMemory& shared_memory_;
@@ -711,10 +796,27 @@ class TextureCache {
   uint32_t resolving_start_ = 0;
   uint32_t resolving_length_ = 0;
 
+  // Every watched write in order (its pages, and whether the GPU wrote it), so
+  // a reload knows what changed since a texture's last load.
+  struct WriteLogEntry {
+    uint32_t address_first;
+    uint32_t address_last;
+    bool by_gpu;
+  };
+  static constexpr uint32_t kWriteLogSize = 4096;
+  std::array<WriteLogEntry, kWriteLogSize> write_log_{};
+  uint64_t write_log_count_ = 0;
+  SharedMemory::GlobalWatchHandle write_log_global_watch_handle_ = nullptr;
+
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // The same textures by base address.
+  std::multimap<uint32_t, Texture*> textures_by_base_;
+  // The largest base level of any texture created, bounding the textures
+  // FindDirectResolveTargets has to look at below a destination.
+  uint32_t max_texture_base_size_ = 0;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 
@@ -723,6 +825,7 @@ class TextureCache {
   uint64_t total_host_memory_usage() const { return textures_total_host_memory_usage_; }
 
  private:
+  std::atomic<uint32_t> budget_limit_mb_{0};
 
   Texture* texture_used_first_ = nullptr;
   Texture* texture_used_last_ = nullptr;
@@ -734,6 +837,9 @@ class TextureCache {
   bool loading_resolve_sourced_ = false;
   uint32_t loading_base_rows_first_ = 0;
   uint32_t loading_base_rows_end_ = UINT32_MAX;
+  uint32_t loading_rows_first_ = 0;
+  uint32_t loading_rows_end_ = 0;
+  uint32_t loading_layers_mask_ = 0;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Recent derivations per fetch constant: while no binding has been reset
@@ -747,13 +853,22 @@ class TextureCache {
     uint32_t host_swizzle = 0;
     uint8_t swizzled_signs = 0;
     bool normalized_fixed_point = false;
+    bool host_gamma = false;
     Texture* texture = nullptr;
     Texture* texture_signed = nullptr;
   };
-  static constexpr uint32_t kBindingMemoWays = 4;
-  std::array<std::array<BindingMemo, kBindingMemoWays>, xenos::kTextureFetchConstantCount>
-      binding_memos_;
-  std::array<uint8_t, xenos::kTextureFetchConstantCount> binding_memo_next_ = {};
+  // One table for every fetch constant, by the words' hash: the derivation
+  // depends only on the words, and a slot cycling through more textures than
+  // a few ways per slot held (heavy race frames) missed and looked them up.
+  static constexpr size_t kBindingMemoCount = 4096;
+  static size_t BindingMemoSlot(const uint32_t* fetch_words) {
+    uint64_t hash = 0;
+    for (uint32_t i = 0; i < 6; ++i) {
+      hash = (hash ^ fetch_words[i]) * UINT64_C(0x9E3779B97F4A7C15);
+    }
+    return size_t(hash >> 52) & (kBindingMemoCount - 1);
+  }
+  std::unique_ptr<BindingMemo[]> binding_memos_{new BindingMemo[kBindingMemoCount]};
   uint64_t binding_memo_epoch_ = 1;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.

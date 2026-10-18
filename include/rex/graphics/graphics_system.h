@@ -85,6 +85,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
     return native_guest_output_renderer_.IsRegistered();
   }
   uint32_t draw_resolution_scale() const override;
+  bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const override;
   const system::NativeGuestOutputRendererRegistration&
   native_guest_output_renderer() const {
     return native_guest_output_renderer_;
@@ -103,8 +104,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
                                bool blocking) override;
 
   bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  void Pause() override;
+  void Resume() override;
+  void ReduceMemory() override;
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);

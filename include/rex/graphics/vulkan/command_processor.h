@@ -25,8 +25,11 @@
 #include <string_view>
 #include <unordered_map>
 #include <cstring>
+#include <map>
+#include <source_location>
 #include <utility>
 #include <vector>
+#include <chrono>
 
 #include <rex/assert.h>
 #include <rex/graphics/fh1_frame_dump.h>
@@ -59,6 +62,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
     kStorageBufferPairCompute,
+    // One storage image for compute shaders.
+    kStorageImageCompute,
     kCount,
   };
 
@@ -139,6 +144,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   ~VulkanCommandProcessor();
 
   void ClearCaches() override;
+  void OnReduceMemory() override;
   void InvalidateGpuMemory() override;
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
@@ -205,8 +211,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                               bool skip_if_equal = true);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
-  // `cause` names what ends an executor draw rendering, for its stats.
-  bool SubmitBarriers(bool force_end_render_pass, const char* cause = nullptr);
+  bool SubmitBarriers(bool force_end_render_pass,
+                      std::source_location caller = std::source_location::current());
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -236,6 +242,28 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t memexport_full_readbacks = 0;
   };
   Fh1FrameWaits TakeFh1FrameWaits() { return std::exchange(fh1_frame_waits_, {}); }
+  // Why each FH1 rendering began (AP-7.4: a tiler stores and reloads the
+  // attachments at every rendering boundary): barriers between draws to the
+  // same surfaces, barriers with a change of surfaces, a change of surfaces
+  // alone, or a rendering already ended by other work (transfers, clears,
+  // resolves, uploads).
+  enum Fh1RenderingCause : uint32_t {
+    kFh1RenderingBarriersSameSurfaces,
+    kFh1RenderingBarriersNewSurfaces,
+    kFh1RenderingNewSurfaces,
+    kFh1RenderingEndedElsewhere,
+    kFh1RenderingCauseCount,
+  };
+  std::array<uint64_t, kFh1RenderingCauseCount> TakeFh1RenderingCauses() {
+    return std::exchange(fh1_rendering_causes_, {});
+  }
+  // For kFh1RenderingEndedElsewhere: the functions that ended the previous
+  // rendering, with counts. Keyed by the source_location function name, a
+  // static string, so counting allocates nothing.
+  const char* last_rendering_ender() const { return in_render_pass_ ? "(open)" : last_rendering_ender_; }
+  std::map<const char*, uint64_t> TakeFh1RenderingEnders() {
+    return std::exchange(fh1_rendering_enders_, {});
+  }
   // vulkan_diagnostic_checkpoints: marks the command stream so a device loss
   // reports the last draws, copies, texture loads and executor passes the GPU
   // reached. Each marker is a serial number; a ring keeps what each recent
@@ -257,20 +285,34 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool checkpoints_enabled() const { return checkpoints_enabled_; }
   // A CPU-side record in the checkpoint ring (resource lifetimes, bindings).
   void NoteCheckpoint(std::string detail);
+  // vulkan_debug_labels: names GPU work for capture tools (Nsight Graphics
+  // GPU Trace, RenderDoc). Labels must not straddle a rendering's begin or
+  // end; FH1 renderings label themselves.
+  void BeginDebugLabel(const char* name) {
+    if (debug_labels_) deferred_command_buffer_.CmdVkBeginDebugLabel(name);
+  }
+  void EndDebugLabel() {
+    if (debug_labels_) deferred_command_buffer_.CmdVkEndDebugLabel();
+  }
+  // The label of the next FH1 rendering begun (a string literal), instead of
+  // the one its id implies.
+  void SetNextRenderingLabel(const char* label) { next_rendering_label_ = label; }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
+  bool in_render_pass() const { return in_render_pass_; }
   system::GraphicsShaderTranslationObserver GetShaderTranslationObserver() const;
   // Submits the open submission, waits for every queue operation and reopens
   // the submission if one was open (FH1 resolve read-backs).
   void Fh1AwaitAllQueueOperations();
+  const VulkanTextureCache& texture_cache() const { return *texture_cache_; }
   // fh1_frame_replay: replays a frame dump (recorded on D3D12) on Vulkan and
   // ends the process.
   void RunRequestedFrameReplay() override;
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
-  void EndRenderPass(const char* cause = nullptr);
+  void EndRenderPass(std::source_location caller = std::source_location::current());
 
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
@@ -284,6 +326,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorSetLayout GetTextureDescriptorSetLayout(bool is_vertex, size_t texture_count,
                                                       size_t sampler_count);
   // The returned reference is valid until a cache clear.
+  // The persistent driver pipeline cache for pipelines created outside the
+  // pipeline cache (FH1 native executor transfers and resolves), or null.
+  VkPipelineCache UsePersistentVkPipelineCache() {
+    return pipeline_cache_ ? pipeline_cache_->UsePersistentVkPipelineCache() : VK_NULL_HANDLE;
+  }
+  // A pending pipeline bind of the replayed submission: the pipeline once a
+  // worker has built it, or VK_NULL_HANDLE to skip its draws.
+  VkPipeline AwaitPendingGraphicsPipeline(void* handle) const;
   const VulkanPipelineCache::PipelineLayoutProvider* GetPipelineLayout(size_t texture_count_pixel,
                                                                        size_t sampler_count_pixel,
                                                                        size_t texture_count_vertex,
@@ -342,6 +392,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
+  void WriteRegistersHost(uint32_t start_index, const uint32_t* values,
+                          uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
   void FlushCpuVisibleResults() override;
@@ -368,7 +420,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
-  bool SupportsRecordThread() const override { return true; }
+  // The split recorder writes nothing into descriptor sets itself, while
+  // texture sets (where textures are not pushed, on Adreno) are written at
+  // decode time; with the recorder their draws intermittently sampled other
+  // textures (frame-to-frame noise on FH1's foliage, flags and signs).
+  bool SupportsRecordThread() const override { return push_pixel_texture_descriptors_; }
 
  private:
   struct CommandBuffer {
@@ -391,6 +447,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     // Without a tape: work to run on the worker after the jobs before it (the
     // presenter's publish and paint).
     std::function<void()> callback;
+    // With a tape: the submission's number.
+    uint64_t submission = 0;
   };
   // Replays `tape` into `command_buffer` and submits it signaling `fence`;
   // on failure still signals the fence (an empty submission) unless the
@@ -403,6 +461,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   void StopSubmissionWorker();
   void SubmissionWorkerMain();
   void AwaitSubmissionWorker();
+  // Waits until the worker has passed `submission` to vkQueueSubmit: its fence
+  // must not be waited for before (the fence is externally synchronized, and
+  // an AMD driver fails a wait for a fence that was never submitted).
+  void AwaitSubmissionWorkerSubmitted(uint64_t submission);
   void LogCheckpoints();
   bool checkpoints_enabled_ = false;
   // What each recent checkpoint serial was, for the device-loss report.
@@ -427,6 +489,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<std::unique_ptr<DeferredCommandBuffer>> submission_free_tapes_;
   bool submission_worker_busy_ = false;
   bool submission_worker_stop_ = false;
+  // The last submission the worker has submitted, and its signal.
+  std::atomic<uint64_t> submission_worker_submitted_{0};
+  std::condition_variable submission_worker_progress_;
   // The presenter's publish-and-paint step runs on the submission worker after
   // the swap's submission instead of the swap waiting for the worker
   // (vulkan_present_on_submission_worker).
@@ -601,6 +666,97 @@ class VulkanCommandProcessor : public CommandProcessor {
   void BeginFrameGpuTiming();
   void EndFrameGpuTiming();
   void ReadFrameGpuTiming();
+  // Once a second, the perf capture's memory gauges; every
+  // vulkan_memory_budget_log_seconds, a log line: each heap's usage against
+  // its budget (VK_EXT_memory_budget), the native surfaces, the texture cache
+  // and the resident size.
+  void LogMemoryBudget();
+
+  // RR-0.1, gpu_draw_cost_model: where a draw's recorder time goes. One draw
+  // in 16 is timed step by step; every draw's IssueDraw and every register
+  // run are timed whole, and the frame's record batch time is the total they
+  // are checked against. Logged by the frame's draw band every 600 frames.
+  enum DrawCostStep : uint32_t {
+    kCostAnalysis,          // shader and memexport analysis, census
+    kCostPrimitives,        // submission begin, primitive processing
+    kCostTranslation,       // translations
+    kCostSamplers,          // sampler parameters and UseSampler
+    kCostTextures,          // RequestTextures
+    kCostTargets,           // executor PrepareTargets and BindTargets
+    kCostPipeline,          // pipeline lookup and bind, layout
+    kCostDynamicState,      // viewport and dynamic state
+    kCostSystemConstants,   // UpdateSystemConstantValues
+    kCostConstantUploads,   // UpdateBindings: constant buffers
+    kCostImageInfos,        // UpdateBindings: image and sampler infos
+    kCostTextureBindings,   // UpdateBindings: set reuse and push checks
+    kCostConstantsSet,      // UpdateBindings: constants set lookup and writes
+    kCostTextureSets,       // UpdateBindings: texture set allocation and writes
+    kCostDescriptorUpdate,  // UpdateBindings: vkUpdateDescriptorSets
+    kCostDescriptorBinds,   // UpdateBindings: binds and pushes
+    kCostVertexBuffers,     // vertex residency
+    kCostMemexport,         // memexport ranges, shared memory use
+    kCostBeginRendering,    // executor BeginDrawRendering
+    kCostDraw,              // the draw command and what follows it
+    kCostStepCount
+  };
+  void DrawCostMark(DrawCostStep step) {
+    if (draw_cost_.sampling) {
+      const uint64_t now = DrawCostNow();
+      draw_cost_.pending[step] += now - draw_cost_.last;
+      draw_cost_.last = now;
+    }
+  }
+  static uint64_t DrawCostNow() { return CostTicks(); }
+  void DrawCostFrame();
+  struct DrawCostModel {
+    bool enabled = false;
+    bool sampling = false;
+    uint64_t last = 0;
+    uint64_t pending[kCostStepCount] = {};
+    uint64_t counter = 0;
+    uint64_t frame_draws = 0, frame_sampled = 0, frame_issue_ns = 0, frame_register_ns = 0;
+    uint64_t frame_steps[kCostStepCount] = {};
+    uint64_t batch_ns_at_frame = 0;
+    uint64_t draws_ns_at_frame = 0, ones_ns_at_frame = 0, calls_ns_at_frame = 0;
+    uint64_t batch_ticks_at_frame = 0, entries_at_frame = 0;
+    // Tick rate: ticks and steady nanoseconds at the start of the window.
+    uint64_t window_ticks = 0, window_ns = 0;
+    struct Band {
+      uint64_t frames = 0, draws = 0, sampled = 0, issue_ns = 0, register_ns = 0, batch_ns = 0;
+      uint64_t draw_records_ns = 0, ones_ns = 0, calls_ns = 0, batch_ticks = 0, entries = 0;
+      uint64_t steps[kCostStepCount] = {};
+    } bands[3];
+    uint64_t frames = 0;
+  } draw_cost_;
+  // RR-2.1 census, with the cost model: uploads by constant buffer (system,
+  // float vertex, float pixel, bool and loop, fetch), their bytes, and how
+  // many repeat the buffer's previous upload byte for byte.
+  struct ConstantCensus {
+    uint64_t draws = 0;
+    uint64_t uploads[5] = {}, bytes[5] = {}, repeats[5] = {};
+    std::vector<uint8_t> last[5];
+  } constant_census_;
+  bool constant_census_enabled_ = false;
+  // PD-4: the bindless indices last written after the fetch constants
+  // (vertex block, then pixel block).
+  uint32_t bindless_indices_[SpirvShaderTranslator::kBindlessIndicesPerStage * 2] = {};
+  // The inputs of the last computed indices: when the shaders, the texture
+  // bindings and the sampler slots are the same, so are the indices.
+  const void* bindless_indices_vertex_shader_ = nullptr;
+  const void* bindless_indices_pixel_shader_ = nullptr;
+  uint64_t bindless_indices_bindings_generation_ = UINT64_MAX;
+  uint64_t bindless_indices_sampler_generation_ = UINT64_MAX;
+  uint64_t bindless_sampler_generation_ = 0;
+  uint64_t bindless_indices_computed_ = 0, bindless_indices_draws_ = 0;
+  // PD-3.3 census, with the cost model: constants set lookups by outcome.
+  uint64_t constants_set_last_ = 0, constants_set_table_ = 0, constants_set_new_ = 0;
+  uint64_t prepare_calls_at_window_ = 0, prepare_hits_at_window_ = 0;
+  void CountConstantUpload(uint32_t buffer, const void* data, size_t size);
+  std::chrono::steady_clock::time_point memory_sampled_{};
+  std::chrono::steady_clock::time_point memory_budget_logged_{};
+  bool memory_over_budget_ = false;
+  std::vector<uint64_t> memory_heap_peak_;
+  uint64_t memory_resident_peak_ = 0;
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
@@ -666,6 +822,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
+  // UP-1.7: (re)creates the object slot image at the given size; it starts
+  // undefined, and the swap's camera pass initialises it.
+  bool CreateObjectSlotImage(uint32_t width, uint32_t height);
+  void DestroyObjectSlotImage();
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
@@ -782,6 +942,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageImage;
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
@@ -791,10 +952,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct ConstantsDescriptorSetKey {
     VkBuffer buffers[SpirvShaderTranslator::kConstantBufferCount] = {};
     uint32_t ranges[SpirvShaderTranslator::kConstantBufferCount] = {};
+    // Five ranges leave the key 4 bytes short of its alignment: an explicit
+    // member keeps operator==, which compares the bytes, off indeterminate
+    // padding (which made equal keys miss, PD-3.3).
+    uint32_t padding = 0;
     bool operator==(const ConstantsDescriptorSetKey& other) const {
       return std::memcmp(this, &other, sizeof(*this)) == 0;
     }
   };
+  static_assert(sizeof(ConstantsDescriptorSetKey) ==
+                    sizeof(VkBuffer) * SpirvShaderTranslator::kConstantBufferCount +
+                        sizeof(uint32_t) * (SpirvShaderTranslator::kConstantBufferCount + 1),
+                "ConstantsDescriptorSetKey must have no padding");
   struct ConstantsDescriptorSetKeyHasher {
     size_t operator()(const ConstantsDescriptorSetKey& key) const {
       size_t hash = 0;
@@ -805,8 +974,73 @@ class VulkanCommandProcessor : public CommandProcessor {
       return hash;
     }
   };
-  std::unordered_map<ConstantsDescriptorSetKey, VkDescriptorSet, ConstantsDescriptorSetKeyHasher>
-      constants_descriptor_sets_frame_;
+  // Open addressing with a generation per entry: clearing it each frame is a
+  // counter bump, and a new key allocates nothing (an unordered_map's node
+  // allocations and clears were 1 % of the recorder).
+  class ConstantsDescriptorSetTable {
+   public:
+    void Clear() {
+      if (++generation_ == 0) {
+        for (Entry& entry : entries_) {
+          entry.generation = 0;
+        }
+        generation_ = 1;
+      }
+      size_ = 0;
+    }
+    VkDescriptorSet* Find(const ConstantsDescriptorSetKey& key) {
+      if (entries_.empty()) {
+        return nullptr;
+      }
+      const size_t mask = entries_.size() - 1;
+      for (size_t i = ConstantsDescriptorSetKeyHasher()(key) & mask;; i = (i + 1) & mask) {
+        Entry& entry = entries_[i];
+        if (entry.generation != generation_) {
+          return nullptr;
+        }
+        if (entry.key == key) {
+          return &entry.set;
+        }
+      }
+    }
+    void Insert(const ConstantsDescriptorSetKey& key, VkDescriptorSet set) {
+      if ((size_ + 1) * 2 > entries_.size()) {
+        Grow();
+      }
+      const size_t mask = entries_.size() - 1;
+      size_t i = ConstantsDescriptorSetKeyHasher()(key) & mask;
+      while (entries_[i].generation == generation_) {
+        i = (i + 1) & mask;
+      }
+      entries_[i].key = key;
+      entries_[i].set = set;
+      entries_[i].generation = generation_;
+      ++size_;
+    }
+
+   private:
+    struct Entry {
+      ConstantsDescriptorSetKey key;
+      VkDescriptorSet set = VK_NULL_HANDLE;
+      uint32_t generation = 0;
+    };
+    void Grow() {
+      std::vector<Entry> old = std::move(entries_);
+      entries_.assign(std::max(old.size() * 2, size_t(1024)), Entry());
+      const uint32_t old_generation = generation_;
+      generation_ = 1;
+      size_ = 0;
+      for (const Entry& entry : old) {
+        if (entry.generation == old_generation) {
+          Insert(entry.key, entry.set);
+        }
+      }
+    }
+    std::vector<Entry> entries_;
+    uint32_t generation_ = 1;
+    size_t size_ = 0;
+  };
+  ConstantsDescriptorSetTable constants_descriptor_sets_frame_;
   uint64_t constants_descriptor_sets_frame_index_ = 0;
   ConstantsDescriptorSetKey last_constants_descriptor_set_key_;
   VkDescriptorSet last_constants_descriptor_set_ = VK_NULL_HANDLE;
@@ -814,6 +1048,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorBufferInfo
       constants_descriptor_write_infos_[SpirvShaderTranslator::kConstantBufferCount] = {};
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_storage_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>, size_t(SingleTransientDescriptorLayout::kCount)>
       single_transient_descriptors_free_;
@@ -839,6 +1074,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::unique_ptr<Fh1FrameDump> frame_dump_;
   // Identifies the open dynamic rendering scope of the executor (0: none).
   uint64_t current_fh1_rendering_id_ = 0;
+  bool debug_labels_ = false;
+  // An FH1 rendering opened a label its end closes.
+  bool rendering_label_open_ = false;
+  const char* next_rendering_label_ = nullptr;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 
@@ -855,6 +1094,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   int32_t sampler_anisotropic_override_ = 0;
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
+  // R32_UINT over the whole shared memory (vulkan_shared_memory_texel_buffer).
+  VkBufferView shared_memory_texel_buffer_view_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
@@ -925,6 +1166,77 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
+  // present_hdr: the HUD's coverage into the guest output's alpha
+  // (hdr_hud_mask.cs.glsl), created on first use.
+  bool EnsureSwapHudMask();
+  bool swap_hud_mask_failed_ = false;
+  VkDescriptorSetLayout swap_hud_mask_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_hud_mask_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_hud_mask_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_hud_mask_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hud_mask_descriptor_sets_{};
+  // UP-1.2: the guest output without the HUD for a temporal upscaler (the
+  // pre-HUD snapshot through the gamma ramp, the HUD mask in alpha), with
+  // its own descriptor sets so it can run beside present_hdr's mask.
+  bool EnsureSwapHudless();
+  bool swap_hudless_failed_ = false;
+  VkDescriptorPool swap_hudless_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_source_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_destination_sets_{};
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_hudless_mask_sets_{};
+  // UP-1.3 and UP-1.4: the guest output's depth and camera motion from the
+  // executor's depth snapshot and reprojection (fh1_camera.cpp), written by
+  // swap_camera_pipeline_ (EnsureSwapCamera, command_processor.cpp).
+  bool EnsureSwapCamera();
+  bool swap_camera_failed_ = false;
+  VkDescriptorSetLayout swap_camera_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_camera_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_camera_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_camera_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_camera_sets_{};
+  // UP-1.7: the scene's object slots (R32_UINT, (depth << 8) | slot, the
+  // nearest fragment's), written by scene pixel shaders through binding
+  // kObjectSlotImageBinding of the shared memory set when not using
+  // fragment shader interlock, read and cleared by the swap's camera pass,
+  // and the swapped frame's reprojection by slot for that pass.
+  VkImage object_slot_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory object_slot_image_memory_ = VK_NULL_HANDLE;
+  VkImageView object_slot_image_view_ = VK_NULL_HANDLE;
+  uint32_t object_slot_image_width_ = 0;
+  uint32_t object_slot_image_height_ = 0;
+  uint32_t object_slot_wanted_width_ = 0;
+  uint32_t object_slot_wanted_height_ = 0;
+  bool object_slot_image_initialized_ = false;
+  bool object_slot_set_binding_ = false;
+  uint32_t object_slot_draws_ = 0;
+  uint32_t object_slot_fallback_draws_ = 0;
+  // Draws of the current frame recorded with a pipeline still being built
+  // (vulkan_async_pipeline_bind_on_replay).
+  uint32_t pending_pipeline_binds_ = 0;
+  std::array<VkBuffer, kMaxFramesInFlight> swap_object_table_buffers_{};
+  std::array<VkDeviceMemory, kMaxFramesInFlight> swap_object_table_memories_{};
+  std::array<uint32_t, kMaxFramesInFlight> swap_object_table_memory_types_{};
+  std::array<void*, kMaxFramesInFlight> swap_object_table_mappings_{};
+  // Scene-only post (scene_post.cpp): FXAA and a host 3D LUT on the pixels
+  // the HUD left alone, told apart with the pre-HUD snapshot.
+  bool EnsureSwapScenePost();
+  // Loads scene_lut_path when it changed and records the upload; false
+  // without a usable LUT (an identity one is bound then).
+  bool UpdateSceneLut();
+  void DestroySceneLut();
+  bool swap_scene_post_failed_ = false;
+  VkDescriptorSetLayout swap_scene_post_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout swap_scene_post_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline swap_scene_post_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool swap_scene_post_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kMaxFramesInFlight> swap_scene_post_descriptor_sets_{};
+  std::string scene_lut_path_;
+  bool scene_lut_loaded_ = false;
+  bool scene_lut_real_ = false;
+  uint32_t scene_lut_size_ = 0;
+  VkImage scene_lut_image_ = VK_NULL_HANDLE;
+  VkDeviceMemory scene_lut_memory_ = VK_NULL_HANDLE;
+  VkImageView scene_lut_view_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
@@ -998,6 +1310,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t barrier_batch_count_ = 0;
   uint64_t rendering_begin_count_ = 0;
   Fh1FrameWaits fh1_frame_waits_;
+  std::array<uint64_t, kFh1RenderingCauseCount> fh1_rendering_causes_{};
+  std::map<const char*, uint64_t> fh1_rendering_enders_;
+  const char* last_rendering_ender_ = "";
+  VkDescriptorSet last_constants_bound_debug_ = VK_NULL_HANDLE;
+  // gpu_barrier_census: pipeline barriers by caller, stages, accesses, kind.
+  std::unordered_map<std::string, uint64_t> barrier_census_;
   struct ActiveOcclusionQuery {
     uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
@@ -1048,6 +1366,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool dynamic_stencil_write_mask_back_update_needed_;
   bool dynamic_stencil_reference_front_update_needed_;
   bool dynamic_stencil_reference_back_update_needed_;
+  VkExtent2D dynamic_fragment_shading_rate_ = {1, 1};
+  bool dynamic_fragment_shading_rate_update_needed_ = true;
+  // The draw's pixel shader kills pixels or its coverage depends on alpha.
+  bool draw_coverage_from_shader_ = false;
 
   // Currently used samplers.
   std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> current_samplers_vertex_;
@@ -1065,6 +1387,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanTextureCache::SamplerParameters parameters;
     VkSampler sampler = VK_NULL_HANDLE;
     uint64_t submission = 0;
+    // PD-4: the sampler's bindless slot, taken when the sampler is.
+    uint32_t bindless_slot = 0;
   };
   std::vector<SamplerCacheEntry> sampler_cache_vertex_;
   // Sampler parameters by fetch words, binding filters and the filtering
@@ -1079,6 +1403,57 @@ class VulkanCommandProcessor : public CommandProcessor {
     VulkanTextureCache::SamplerParameters parameters;
   };
   static constexpr size_t kSamplerParametersMemoCount = 1024;
+  // PD-3.4: the fetch words as the sampler parameters read them. The base
+  // and mip addresses matter only by whether their pages are zero (mips and
+  // the base level present), so a texture moving to another address keeps
+  // its slot's sampler.
+  static void SamplerFetchKey(const uint32_t* fetch, uint32_t (&key)[6]) {
+    for (uint32_t word = 0; word < 6; ++word) key[word] = fetch[word];
+    key[1] = (fetch[1] & 0xFFF) | (((fetch[1] >> 12) & 0x1FFFF) ? 0x1000 : 0);
+    key[5] = (fetch[5] & 0xFFF) | (((fetch[5] >> 12) & 0x1FFFF) ? 0x1000 : 0);
+  }
+  struct SamplerCensus {
+    uint64_t slots = 0, slot_hits = 0, memo_hits = 0, use_sampler = 0, verified_different = 0;
+  } sampler_census_;
+  // NL-3.2: the inputs of the last full sampler stage. A draw with the same
+  // shaders, the same submission and filtering, and none of the fetch
+  // constants its samplers read written since (the texture cache's in-sync
+  // bits, set by the last draw's texture request) keeps current_samplers_*.
+  struct SamplerStageInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    uint64_t submission = 0;
+    uint32_t fetch_mask = 0;
+    int32_t anisotropic_override = 0;
+    bool force_trilinear = false;
+    bool fetch_key = false;
+    bool scene_filtering = false;
+    bool valid = false;
+  } sampler_stage_inputs_;
+  // NL-3.2: bumped whenever a draw derives its samplers or requests its
+  // textures in full, so an unchanged value means every draw since kept the
+  // same samplers and texture bindings.
+  uint64_t texture_inputs_generation_ = 0;
+  // NL-3.2: the inputs of the last UpdateBindings texture section; with the
+  // same shaders, layout, frame and texture inputs, its image infos and sets
+  // are the last ones again.
+  struct TextureSectionInputs {
+    const VulkanShader* vertex_shader = nullptr;
+    const VulkanShader* pixel_shader = nullptr;
+    const void* layout = nullptr;
+    uint64_t frame = 0;
+    uint64_t texture_inputs_generation = UINT64_MAX;
+    bool valid = false;
+  } texture_section_inputs_;
+  bool texture_section_skip_allowed_ = false;
+  bool texture_section_verify_ = false;
+  // Verify mode: the samplers a kept sampler stage assumed.
+  std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>> verify_samplers_[2];
+  // NL-3.2: draws whose stages found their inputs unchanged.
+  struct UnchangedCensus {
+    uint64_t draws = 0, samplers = 0, textures = 0, texture_sections = 0;
+    uint64_t mismatches = 0, texture_mismatches = 0;
+  } unchanged_census_;
   std::unique_ptr<SamplerParametersMemo[]> sampler_parameters_memos_{
       new SamplerParametersMemo[kSamplerParametersMemoCount]};
   // The last texture descriptor set written per stage (vertex, pixel) and its
@@ -1120,6 +1495,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   uint64_t StateMemoKey() const;
   std::unique_ptr<PipelineMemo[]> pipeline_memos_{new PipelineMemo[kStateMemoCount]};
+  // The last draw's, to prefetch the next draw's pipeline memo entry.
+  uint32_t last_pipeline_render_pass_key_ = 0;
   mutable std::atomic<ui::vulkan::VulkanDevice*> vulkan_device_cache_{nullptr};
   // Draws issued since the draw counter was last updated (at each swap): the
   // counter is a thread-local lookup in another module.
@@ -1135,6 +1512,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t interpolator_mask = 0;
     uint32_t ps_param_gen_pos = 0;
     uint32_t depth_control = 0;
+    // UP-1.7: whether the pixel shader writes the object slot.
+    bool object_slot = false;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
@@ -1149,6 +1528,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t color_mask = 0;
     uint32_t resolution_scale = 0;
     double hud_squeeze = 0.0;
+    double hud_scale = 0.0;
     draw_util::ViewportInfo info;
   };
   std::unique_ptr<ViewportMemo[]> viewport_memos_{new ViewportMemo[kStateMemoCount]};
@@ -1213,6 +1593,21 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
+  // RR-2.3: the inputs of the register-derived system constants at the last
+  // draw. While they hold, only the per-texture fields are derived again.
+  struct SystemConstantsMemoKey {
+    uint64_t state_epoch;
+    uint32_t words[24];
+    bool operator==(const SystemConstantsMemoKey& other) const {
+      return state_epoch == other.state_epoch &&
+             std::memcmp(words, other.words, sizeof(words)) == 0;
+    }
+  };
+  SystemConstantsMemoKey system_constants_memo_key_ = {};
+  bool system_constants_memo_valid_ = false;
+  uint64_t system_constants_memo_miss_words_[25] = {};
+  uint64_t system_constants_memo_hits_ = 0, system_constants_memo_calls_ = 0,
+           system_constants_memo_mismatches_ = 0, system_constants_memo_frames_ = 0;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

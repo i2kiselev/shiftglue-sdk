@@ -20,13 +20,18 @@
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
+#include <rex/ppc/probe.h>
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
+#include <fstream>
+#include <string>
+
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
+#include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/string/numeric.h>
@@ -38,6 +43,9 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/keybinds.h>
 #include <rex/version.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/ui/vulkan/android_gpu_driver.h>
+#endif
 
 #include <fmt/format.h>
 #include <imgui.h>
@@ -52,8 +60,8 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Graphics API the GPU plugin uses: any (its first compiled backend), "
-                      "d3d12 or vulkan")
-    .allowed({"any", "d3d12", "vulkan"})
+                      "d3d12, vulkan, or null (guest GPU packets only, nothing drawn)")
+    .allowed({"any", "d3d12", "vulkan", "null"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
@@ -173,7 +181,7 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = rex::path_to_utf8(exe_dir / "logs");
   }
 
   rex::InitLogging(log_config);
@@ -185,21 +193,21 @@ bool ReXApp::SetupEnvironment() {
   OnPostInitLogging();
 
   if (std::filesystem::exists(config_path_))
-    REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+    REXLOG_DEBUG("Loaded config: {}", rex::path_to_utf8(config_path_.filename()));
 
   REXLOG_DEBUG("{} starting", GetName());
   if (!game_data_root_.empty()) {
-    REXLOG_DEBUG("  Game directory: {}", game_data_root_.string());
+    REXLOG_DEBUG("  Game directory: {}", rex::path_to_utf8(game_data_root_));
   }
   if (!user_data_root_.empty()) {
-    REXLOG_DEBUG("  User data:      {}", user_data_root_.string());
+    REXLOG_DEBUG("  User data:      {}", rex::path_to_utf8(user_data_root_));
   }
   if (!update_data_root_.empty()) {
-    REXLOG_DEBUG("  Update data:    {}", update_data_root_.string());
+    REXLOG_DEBUG("  Update data:    {}", rex::path_to_utf8(update_data_root_));
   }
-  REXLOG_DEBUG("  Cache root:     {}", cache_root_.string());
+  REXLOG_DEBUG("  Cache root:     {}", rex::path_to_utf8(cache_root_));
   if (!metadata_root_.empty()) {
-    REXLOG_DEBUG("  Metadata root:  {}", metadata_root_.string());
+    REXLOG_DEBUG("  Metadata root:  {}", rex::path_to_utf8(metadata_root_));
   }
 
   return true;
@@ -213,7 +221,8 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     return false;
   }
   if (!std::filesystem::is_directory(paths.game_data_root)) {
-    auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
+    auto msg =
+        fmt::format("--game_data_root does not exist: {}", rex::path_to_utf8(paths.game_data_root));
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
@@ -281,7 +290,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
     if (!std::filesystem::is_regular_file(xex_host)) {
-      auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
+      auto msg = fmt::format("Entrypoint XEX not found: {}", rex::path_to_utf8(xex_host));
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;
@@ -304,6 +313,58 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
       return false;
     }
   }
+
+  // In the background the activity's window is gone and the player is not
+  // there: stop the GPU commands (guest threads then wait as on a stalled
+  // frame) and the audio, and restart both on return. Guest time stops too,
+  // so the title does not integrate the pause as one long step.
+  app_context().AddLifecycleListener([this](rex::ui::WindowedAppContext::LifecycleEvent event) {
+    if (!runtime_) {
+      return;
+    }
+    auto* graphics = runtime_->graphics_system();
+    auto* audio = runtime_->audio_system();
+    switch (event) {
+      case rex::ui::WindowedAppContext::LifecycleEvent::kWillEnterBackground:
+        REXLOG_INFO("App entering the background: pausing GPU, audio and guest time");
+        if (audio) audio->Pause();
+        if (graphics) graphics->Pause();
+        rex::chrono::Clock::set_guest_time_paused(true);
+#if REX_PLATFORM_ANDROID
+        rex::ui::vulkan::SetAndroidGpuTurbo(false);
+#endif
+        break;
+      case rex::ui::WindowedAppContext::LifecycleEvent::kDidEnterForeground:
+        REXLOG_INFO("App back in the foreground: resuming guest time, GPU and audio");
+        rex::chrono::Clock::set_guest_time_paused(false);
+#if REX_PLATFORM_ANDROID
+        rex::ui::vulkan::SetAndroidGpuTurbo(true);
+#endif
+        if (graphics) graphics->Resume();
+        if (audio) audio->Resume();
+        break;
+      case rex::ui::WindowedAppContext::LifecycleEvent::kLowMemory: {
+        // The system is about to kill background apps, or this one: record
+        // what the process holds so a kill is diagnosable afterwards, and
+        // give back the textures the renderer can reload.
+        std::string resident = "unknown";
+#if REX_PLATFORM_LINUX
+        std::ifstream status("/proc/self/status");
+        for (std::string line; std::getline(status, line);) {
+          if (line.rfind("VmRSS:", 0) == 0) {
+            resident = line.substr(6);
+            break;
+          }
+        }
+#endif
+        REXLOG_WARN("Low memory reported by the system; resident:{}", resident);
+        if (graphics) graphics->ReduceMemory();
+        break;
+      }
+      default:
+        break;
+    }
+  });
 
   OnPostSetup();
 
@@ -349,9 +410,11 @@ bool ReXApp::SetupPresentation() {
     return false;
   }
 
-  // Set window title with SDK build stamp
-  std::string title = std::string(GetName()) + " " + REXGLUE_BUILD_TITLE;
-  window_->SetTitle(title);
+  // The host's build label when it set one, else the SDK's stamp.
+  std::string label = rex::ui::GetBuildLabel();
+  window_->SetTitle(label == REXGLUE_BUILD_STAMP
+                        ? std::string(GetName()) + " " + REXGLUE_BUILD_TITLE
+                        : label);
 
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
@@ -414,6 +477,10 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
   // gated eager font upload in SetImmediateDrawer is skipped (font uploads
   // lazily on the first Draw instead).
   imgui_drawer_->SetPresenterAndImmediateDrawer(presenter, drawer);
+  // Controller chords (pad_chord_*) trigger binds from the input thread.
+  rex::ui::SetBindDispatcher([this](std::function<void()> callback) {
+    app_context().CallInUIThreadDeferred(std::move(callback));
+  });
   rex::ui::RegisterBind("bind_debug_overlay", "F3", "Toggle debug overlay", [this] {
     if (debug_overlay_) {
       debug_overlay_.reset();
@@ -531,6 +598,12 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
   // lock still held by a straggler TerminateTitle left running. Flush (not
   // ShutdownLogging, which frees loggers a straggler may still use); the OS
   // reclaims the rest.
+  // The probe build's counts would be lost with the process; write them here.
+  if (runtime_ && rex::ppc::ProbeActive()) {
+    auto path = runtime_->user_data_root() / "logs" / "probe.json";
+    if (rex::ppc::ProbeDump(path))
+      REXLOG_INFO("Probe data written to {}", path.string());
+  }
   REXLOG_INFO("Title terminated; hard-exiting process.");
   rex::FlushLogging();
   std::_Exit(0);

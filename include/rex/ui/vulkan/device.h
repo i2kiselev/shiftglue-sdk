@@ -58,6 +58,7 @@ class VulkanDevice {
     uint32_t maxImageDimension3D = 256;
     uint32_t maxImageDimensionCube = 4096;
     uint32_t maxImageArrayLayers = 256;
+    uint32_t maxTexelBufferElements = 65536;
     uint32_t maxStorageBufferRange = uint32_t(1) << 27;
     uint32_t maxSamplerAllocationCount = 4000;
     uint32_t maxPerStageDescriptorSamplers = 16;
@@ -184,6 +185,35 @@ class VulkanDevice {
     // VK_EXT_robustness2
 
     bool nullDescriptor = false;
+
+    // VK_KHR_present_id (#295) and VK_KHR_present_wait (#249)
+
+    bool presentId = false;
+    bool presentWait = false;
+
+    // VK_KHR_pipeline_executable_properties (#270), only with
+    // vulkan_pipeline_statistics.
+
+    bool pipelineExecutableInfo = false;
+
+    // VK_KHR_fragment_shading_rate (#227), only the pipeline (and dynamic)
+    // rate, with vulkan_fragment_shading_rate.
+
+    bool pipelineFragmentShadingRate = false;
+
+    // Descriptor indexing (promoted to 1.2), for bindless textures
+    // (RECORDER_PER_DRAW_BACKLOG PD-4). Enabled only on Vulkan 1.2+ devices.
+
+    bool shaderSampledImageArrayDynamicIndexing = false;
+    bool runtimeDescriptorArray = false;
+    bool descriptorBindingSampledImageUpdateAfterBind = false;
+    bool descriptorBindingPartiallyBound = false;
+    bool descriptorBindingUpdateUnusedWhilePending = false;
+    uint32_t maxDescriptorSetUpdateAfterBindSampledImages = 0;
+    uint32_t maxDescriptorSetUpdateAfterBindSamplers = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+    uint32_t maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+    uint32_t maxUpdateAfterBindDescriptorsInAllPools = 0;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -221,6 +251,15 @@ class VulkanDevice {
     // Windows only, for presenting through DXGI.
     bool ext_KHR_external_memory_win32 = false;     // #74
     bool ext_KHR_external_semaphore_win32 = false;  // #79
+    // Have optional features not implied by these being true.
+    bool ext_KHR_present_id = false;    // #295
+    bool ext_KHR_present_wait = false;  // #249
+    // The mastering levels of an HDR10 swapchain.
+    bool ext_EXT_hdr_metadata = false;  // #106
+    // Only with vulkan_pipeline_statistics.
+    bool ext_KHR_pipeline_executable_properties = false;  // #270
+    // Has optional features not implied by this being true.
+    bool ext_KHR_fragment_shading_rate = false;  // #227
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -252,16 +291,39 @@ class VulkanDevice {
     // VK_KHR_external_semaphore_win32 (#79)
 #include <rex/ui/vulkan/functions/device_khr_external_semaphore_win32.inc>
 #endif
+    // VK_KHR_present_wait (#249)
+#include <rex/ui/vulkan/functions/device_khr_present_wait.inc>
+    // VK_EXT_hdr_metadata (#106)
+#include <rex/ui/vulkan/functions/device_ext_hdr_metadata.inc>
+    // VK_KHR_fragment_shading_rate (#227)
+#include <rex/ui/vulkan/functions/device_khr_fragment_shading_rate.inc>
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };
 
   const Functions& functions() const { return functions_; }
 
+  // vkWaitForFences until the fences signal or the device fails. Waits a
+  // second at a time: an Adreno 830 driver (Snapdragon 8 Elite) returns
+  // VK_TIMEOUT at once for a UINT64_MAX timeout, which callers took for a
+  // failure and treated unfinished submissions as done.
+  VkResult WaitForFences(uint32_t fence_count, const VkFence* fences, VkBool32 wait_all) const {
+    for (;;) {
+      const VkResult result = functions_.vkWaitForFences(device_, fence_count, fences, wait_all,
+                                                         UINT64_C(1000000000));
+      if (result != VK_TIMEOUT) {
+        return result;
+      }
+    }
+  }
+
+  // Debug names for objects (VK_EXT_debug_utils), for capture tools.
+  bool object_names_enabled() const { return object_names_enabled_; }
+
   template <typename Object>
   void SetObjectName(const VkObjectType object_type, const Object object_handle,
                      const char* const object_name) const {
-    if (!vulkan_instance()->extensions().ext_EXT_debug_utils) {
+    if (!object_names_enabled_) {
       return;
     }
     VkDebugUtilsObjectNameInfoEXT object_name_info;
@@ -332,6 +394,8 @@ class VulkanDevice {
   VkDevice device_ = nullptr;
 
   Functions functions_;
+
+  bool object_names_enabled_ = false;
 
   std::vector<QueueFamily> queue_families_;
   uint32_t queue_family_graphics_compute_ = UINT32_MAX;

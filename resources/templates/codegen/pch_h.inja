@@ -16,6 +16,7 @@
 {% endif %}{% if config_flags.cr_as_local %}#define REX_CONFIG_CR_AS_LOCAL
 {% endif %}{% if config_flags.non_argument_as_local %}#define REX_CONFIG_NON_ARGUMENT_AS_LOCAL
 {% endif %}{% if config_flags.non_volatile_as_local %}#define REX_CONFIG_NON_VOLATILE_AS_LOCAL
+{% endif %}{% if config_flags.interior_resume %}#define REX_CONFIG_INTERIOR_RESUME
 {% endif %}
 #define REX_IMAGE_BASE {{ image_base }}ull
 #define REX_IMAGE_SIZE {{ image_size }}ull
@@ -30,6 +31,9 @@
 //=============================================================================
 
 #include <rex/ppc.h>
+#include <rex/ppc/abi_poison.h>
+#include <rex/ppc/probe.h>
+#include <rex/ppc/reference.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/chrono/clock.h>
@@ -50,7 +54,7 @@
 //=============================================================================
 
 extern const rex::PPCImageInfo PPCImageConfig;
-extern PPCFuncMapping PPCFuncMappings[];
+extern const PPCFuncMapping PPCFuncMappings[];
 
 //=============================================================================
 // Function Definition Macros
@@ -137,10 +141,16 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Memory Access
 //=============================================================================
 
-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
-#define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
-#elif REX_PLATFORM_MAC
+// The 0xE0000000 physical view starts 4 KB into the physical heap. Where the
+// runtime maps it there, a guest access is base + address and nothing else:
+// Windows (placeholder views; the runtime refuses to start without them),
+// x86-64 macOS (4 KB pages) and Linux or Android builds made for 4 KB-page
+// kernels (REX_PHYSICAL_HEAP_4K_PAGES). Elsewhere the view is mapped rounded
+// down to the page size and accesses at or above 0xE0000000 add 0x1000 back.
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && !REX_ARCH_ARM64) || defined(REX_PHYSICAL_HEAP_4K_PAGES)
 #define REX_PHYS_HOST_OFFSET(addr) 0u
+#elif REX_PLATFORM_MAC
+#define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 // Linux and Android: 0x1000 only on kernels with pages larger than 4 KB,
 // chosen by the runtime at startup.
@@ -163,7 +173,70 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
+// Accesses based on the stack pointer (r1). Guest stacks are allocated in the
+// stack range at 0x70000000, never in the 0xE0000000 physical view, so these
+// skip the physical-heap offset select. With REX_PLAIN_STACK they are also
+// not volatile: a thread's stack is its own, so the compiler may forward a
+// spilled value to its reload and drop a dead spill within the function.
+#ifdef REX_PLAIN_STACK
+#define REX_STACK_QUAL
+#else
+#define REX_STACK_QUAL volatile
+#endif
+#define REX_STACK_LOAD_U8(x) (*(REX_STACK_QUAL u8*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U16(x) __builtin_bswap16(*(REX_STACK_QUAL u16*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U32(x) __builtin_bswap32(*(REX_STACK_QUAL u32*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U64(x) __builtin_bswap64(*(REX_STACK_QUAL u64*)(base + (u32)(x)))
+#define REX_STACK_STORE_U8(x, y)  (*(REX_STACK_QUAL u8*)(base + (u32)(x)) = (y))
+#define REX_STACK_STORE_U16(x, y) (*(REX_STACK_QUAL u16*)(base + (u32)(x)) = __builtin_bswap16(y))
+#define REX_STACK_STORE_U32(x, y) (*(REX_STACK_QUAL u32*)(base + (u32)(x)) = __builtin_bswap32(y))
+#define REX_STACK_STORE_U64(x, y) (*(REX_STACK_QUAL u64*)(base + (u32)(x)) = __builtin_bswap64(y))
+
+// Reference copies (reference_functions): the generator wraps a `ref_sub_X`
+// body in push_macro/pop_macro and points the store macros here, so every
+// store is logged for the verifier's rollback and comparison (rex/ppc/reference.h).
+#define REX_REF_STORE_U8(x, y)   ::rex::ppc::RefStore<u8>((volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), (u8)(y))
+#define REX_REF_STORE_U16(x, y)                                                                ::rex::ppc::RefStore<u16>((volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap16(y))
+#define REX_REF_STORE_U32(x, y)                                                                ::rex::ppc::RefStore<u32>((volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap32(y))
+// A whole aligned vector store (stvx, stvx128): `v` is the simde__m128i the
+// optimized code would store, already in guest byte order.
+#define REX_REF_STORE_V128(x, v) do { const simde__m128i rex_ref_v = (v); ::rex::ppc::RefStoreBytes((void*)REX_RAW_ADDR(x), (u32)(x), &rex_ref_v, 16); } while (0)
+// A save-area store (the link-register slot, a GPR save) that the optimized form
+// keeps in a host local instead: logged for the rollback, not compared.
+#define REX_REF_STORE_UNCHECKED_U32(x, y) ::rex::ppc::RefStore<u32>((volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), __builtin_bswap32(y), false)
+#define REX_REF_STORE_UNCHECKED_U64(x, y) ::rex::ppc::RefStore<u64>((volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x), __builtin_bswap64(y), false)
+#define REX_REF_STORE_U64(x, y)                                                                ::rex::ppc::RefStore<u64>((volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (u32)(x),                             __builtin_bswap64(y))
+
 #define REX_MEMORY_SIZE 0x100000000ull
+
+//=============================================================================
+// Memory Barriers
+//=============================================================================
+
+// The guest's barriers, for host CPUs that reorder more than the guest code
+// assumes. x86-64 keeps every load and store in order except a store followed
+// by a load, which the title tolerates as it always has, so they cost nothing
+// there and the x86-64 code is unchanged. AArch64 reorders freely: sync is a
+// full barrier, lwsync orders everything but a store before a later load,
+// eieio orders stores (device and memory), and isync after a reservation
+// loop makes it an acquire.
+#if REX_ARCH_ARM64
+#define REX_PPC_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define REX_PPC_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_ISYNC() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#else
+#define REX_PPC_SYNC() ((void)0)
+#define REX_PPC_LWSYNC() ((void)0)
+#define REX_PPC_EIEIO() ((void)0)
+#define REX_PPC_ISYNC() ((void)0)
+#endif
+#define REX_PPC_DB16CYC()                                                          \
+  do {                                                                             \
+    if (int hint = rex::ppc::g_db16cyc_hint.load(std::memory_order_relaxed)) {     \
+      rex::ppc::Db16cycHint(hint);                                                 \
+    }                                                                              \
+  } while (0)
 
 //=============================================================================
 // MMIO
@@ -266,6 +339,28 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 {% include "codegen/_indirect_call.inja" %}
 
 //=============================================================================
+// ABI poison checks (abi_poison_checks, checking builds only)
+//=============================================================================
+
+// Emitted around every direct and indirect guest call when the generator ran
+// with abi_poison_checks: the caller snapshots the PowerPC non-volatile
+// registers before the call, checks after it that the callee preserved them,
+// and overwrites the volatile registers the ABI leaves dead at a return with
+// poison, so a caller that still reads one changes the route results.
+#define REX_ABI_POISON_PRE(site) ::rex::ppc::AbiPoisonPreCall(ctx, (site))
+#define REX_ABI_POISON_POST(site) ::rex::ppc::AbiPoisonPostCall(ctx, (site))
+// host_local_lr under abi_poison_checks: the guest LR slot holds a poison that
+// names the function, and every reload of the local checks it is still there.
+#define REX_LR_SLOT_POISON(function) ::rex::ppc::AbiPoisonLrSlotValue(function)
+#define REX_LR_SLOT_CHECK(function, site, value) \
+  ::rex::ppc::AbiPoisonLrSlotCheck((function), (site), (value))
+
+// Probe build (call_probes): a counter per function entry and the targets of
+// every indirect call site, written to probe.json at shutdown (rex/ppc/probe.h).
+#define REX_PROBE_CALL(site) ::rex::ppc::ProbeCall(REX_CODE_BASE, REX_CODE_SIZE, (site))
+#define REX_PROBE_INDIRECT(site, target) ::rex::ppc::ProbeIndirect((site), (target))
+
+//=============================================================================
 // Flush Mode
 //=============================================================================
 
@@ -329,26 +424,10 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // Interrupt Locks
 //=============================================================================
 
-inline std::atomic<i32>& ppc_global_lock_count_() {
-  static std::atomic<i32> count{0};
-  return count;
-}
-
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
-
-#define REX_ENTER_GLOBAL_LOCK()                          \
-  do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
-  } while (0)
-
-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
-  do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
-    rex::thread::global_critical_region::mutex().unlock();                                \
-  } while (0)
+// mtmsrd r13 disables interrupts; the runtime maps those sections onto the
+// global critical region. mfmsr reports this thread's state without locking.
+#define REX_CHECK_GLOBAL_LOCK() rex::thread::global_critical_region::GuestCheck()
+#define REX_ENTER_GLOBAL_LOCK() rex::thread::global_critical_region::GuestEnter()
+#define REX_ENTER_GLOBAL_LOCK_RESERVATION() \
+  rex::thread::global_critical_region::GuestEnterReservation()
+#define REX_LEAVE_GLOBAL_LOCK() rex::thread::global_critical_region::GuestLeave()

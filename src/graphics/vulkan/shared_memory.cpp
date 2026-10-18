@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -19,12 +20,19 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(vulkan_sparse_shared_memory_turnip, 1, "GPU/Vulkan",
+                      "Sparse shared memory on Turnip: 0 never, 1 on the Adreno 740 only "
+                      "(checked with Turnip gen8-v37, NN-6.1), 2 on every Adreno")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
@@ -57,11 +65,35 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.flags = sparse_flags;
   buffer_create_info.size = kBufferSize;
   buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                             VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  // Turnip (Mesa, loaded on Android through android_gpu_driver) advertises
+  // sparse residency. With an older Turnip, resolves written into the sparse
+  // buffer read back as zeros on the Adreno 740, so the whole frame came out
+  // black; with the bundled gen8-v37 the Odin 2 (Adreno 740) race renders as
+  // with a dense buffer and its device memory falls by 290 MB (NN-6.1). Other
+  // Adrenos have not been checked, so they keep the dense buffer by default.
+  bool sparse_broken = false;
+  if (vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP) {
+    switch (REXCVAR_GET(vulkan_sparse_shared_memory_turnip)) {
+      case 0:
+        sparse_broken = true;
+        break;
+      case 1:
+        sparse_broken = std::string_view(vulkan_device->properties().deviceName).find("740") ==
+                        std::string_view::npos;
+        break;
+      default:
+        break;
+    }
+  }
+  if (sparse_broken && REXCVAR_GET(vulkan_sparse_shared_memory)) {
+    REXGPU_INFO("Shared memory: not using sparse residency on Turnip");
+  }
+  if (REXCVAR_GET(vulkan_sparse_shared_memory) && !sparse_broken &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
@@ -273,6 +305,23 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_page_ranges) {
+    PERF_counter_add(kGpuUploadBytes, int64_t(upload_range.second) << page_size_log2());
+  }
+  // An upload while a rendering is open ends it: count it by what it was for.
+  if (command_processor_.in_render_pass()) {
+    switch (upload_kind()) {
+      case UploadKind::kIndex:
+        PERF_counter_inc(kGpuUploadSplitsIndex);
+        break;
+      case UploadKind::kTexture:
+        PERF_counter_inc(kGpuUploadSplitsTexture);
+        break;
+      default:
+        PERF_counter_inc(kGpuUploadSplitsVertex);
+        break;
+    }
+  }
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
@@ -280,7 +329,22 @@ bool VulkanSharedMemory::UploadRanges(
                      (upload_page_ranges.back().first + upload_page_ranges.back().second -
                       upload_page_ranges.front().first)
                          << page_size_log2()));
-  command_processor_.SubmitBarriers(true, "end_memory_upload");
+  command_processor_.SubmitBarriers(true);
+  Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
+  const uint64_t gpu_timing =
+      gpu_profile_executor ? gpu_profile_executor->BeginLabelGpuTiming("upload") : UINT64_MAX;
+  struct EndTiming {
+    Fh1NativeExecutor* executor;
+    uint64_t token;
+    ~EndTiming() {
+      if (executor) executor->EndLabelGpuTiming(token);
+    }
+  } end_timing{gpu_profile_executor, gpu_timing};
+  command_processor_.BeginDebugLabel("shared memory upload");
+  struct EndLabel {
+    VulkanCommandProcessor& processor;
+    ~EndLabel() { processor.EndDebugLabel(); }
+  } end_label{command_processor_};
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
@@ -336,8 +400,10 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
                                        VkAccessFlags& access_mask) const {
   switch (usage) {
     case Usage::kComputeWrite:
+      // Resolves write the buffer: the write must be made available to the
+      // next usage (tiled GPUs do not tolerate a read-only source mask).
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;

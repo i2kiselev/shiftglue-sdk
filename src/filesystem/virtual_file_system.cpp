@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/perf/counter.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/string.h>
@@ -22,6 +23,11 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
 
 namespace rex::filesystem {
 
+std::recursive_mutex& tree_mutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
 VirtualFileSystem::VirtualFileSystem() {}
 
 VirtualFileSystem::~VirtualFileSystem() {
@@ -32,13 +38,13 @@ VirtualFileSystem::~VirtualFileSystem() {
 }
 
 bool VirtualFileSystem::RegisterDevice(std::unique_ptr<Device> device) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   devices_.emplace_back(std::move(device));
   return true;
 }
 
 bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   for (auto it = devices_.begin(); it != devices_.end(); ++it) {
     if ((*it)->mount_path() == path) {
       REXFS_DEBUG("Unregistered device: {}", (*it)->mount_path());
@@ -50,7 +56,7 @@ bool VirtualFileSystem::UnregisterDevice(const std::string_view path) {
 }
 
 bool VirtualFileSystem::ReplaceDevice(std::unique_ptr<Device> device) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   for (auto& existing : devices_) {
     if (existing->mount_path() == device->mount_path()) {
       REXFS_DEBUG("Replaced device: {}", device->mount_path());
@@ -63,7 +69,7 @@ bool VirtualFileSystem::ReplaceDevice(std::unique_ptr<Device> device) {
 
 bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
                                              const std::string_view target) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   symlinks_.insert({std::string(path), std::string(target)});
   REXFS_DEBUG("Registered symbolic link: {} => {}", path, target);
 
@@ -71,7 +77,7 @@ bool VirtualFileSystem::RegisterSymbolicLink(const std::string_view path,
 }
 
 bool VirtualFileSystem::UnregisterSymbolicLink(const std::string_view path) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
   auto it = std::find_if(symlinks_.cbegin(), symlinks_.cend(), [&](const auto& s) {
     return rex::string::utf8_equal_case(path, s.first);
   });
@@ -115,7 +121,7 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
 }
 
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
 
   // Resolve relative paths
   auto normalized_path(rex::string::utf8_canonicalize_guest_path(path));
@@ -132,12 +138,20 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return rex::string::utf8_starts_with_case(normalized_path, d->mount_path());
   });
   if (it == devices_.cend()) {
+    // A bare file name names no device: titles probe names their data lists
+    // but the disc never shipped (FH1's AMB_Festival.fsb), and fail the same
+    // way on the console. Only a missing named device is worth a warning.
+    if (path.find(':') == std::string_view::npos) {
+      REXFS_DEBUG("VFS: '{}' has no device prefix; not found", path);
+      return nullptr;
+    }
     REXFS_WARN("VFS: '{}' -> [no device]", path);
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
       REXFS_ERROR("ResolvePath({}) failed - device not found", path);
     }
+    PERF_counter_inc(kHostPathLookupMisses);
     return nullptr;
   }
 
@@ -154,6 +168,7 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
                   entry->absolute_path());
     }
   } else {
+    PERF_counter_inc(kHostPathLookupMisses);
     if (had_symlink) {
       REXFS_DEBUG("VFS: entry not found for '{}' (via symlink '{}') on device '{}'", path,
                   normalized_path, device->mount_path());

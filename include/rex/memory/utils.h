@@ -113,6 +113,10 @@ bool Protect(void* base_address, size_t length, PageAccess access,
 // rights. The length will start from the first byte of the first page of
 // the region.
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out);
+// Whether the host page holding address can be read without a fault. Cheap
+// enough for every page of a range each frame: QueryProtect parses
+// /proc/self/maps on Linux and Android.
+bool IsHostReadable(const void* address);
 
 // Allocates a block of memory for a type with the given alignment.
 // The memory must be freed with AlignedFree.
@@ -151,6 +155,14 @@ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::pat
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,
                   size_t file_offset);
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);
+// Whether MapFileView honours any page-aligned (4 KB) file_offset. Windows'
+// MapViewOfFileEx rounds offsets to the 64 KB allocation granularity, but the
+// placeholder views of Windows 10 1803+ (VirtualAlloc2, MapViewOfFile3) take
+// any page-aligned offset; on POSIX it is whether the page size is 4 KB. The
+// 0xE0000000 physical view starts 4 KB into the physical heap, so where this
+// is false the runtime maps it rounded down and adds the offset back on every
+// guest access (PhysicalHeap::host_address_offset).
+bool MapFileViewOffsetsAreExact();
 
 inline size_t hash_combine(size_t seed) {
   return seed;

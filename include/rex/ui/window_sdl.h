@@ -34,6 +34,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  SafeAreaInsets GetSafeAreaInsets() const override;
   void ApplyConfiguredSizeAndMonitor() override;
   bool SetRelativeMouseMode(bool enable) override;
   bool WarpMouseToCenter(int32_t& x_out, int32_t& y_out) override;
@@ -44,7 +45,13 @@ class WindowSDL final : public Window {
   void HandleTextInputEvent(SDL_Event& event);
   void HandleMouseEvent(SDL_Event& event);
   void HandleDropEvent(SDL_Event& event);
+  // Touch screen fingers, in physical pixels (AP-4.2); SDL also turns them
+  // into mouse events, which the menus use.
+  void HandleFingerEvent(SDL_Event& event);
   void HandlePaintEvent();
+  // The platform destroys the native window behind the surface when the
+  // app goes to the background and makes a new one on its return.
+  void HandleAppBackground(bool background);
 
  protected:
   uint32_t GetLatestDpiImpl() const override;

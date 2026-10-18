@@ -56,6 +56,13 @@ bool SDLWindowedAppContext::Initialize() {
   }
   const char* video_driver_in_use = SDL_GetCurrentVideoDriver();
   REXLOG_INFO("SDL video driver: {}", video_driver_in_use ? video_driver_in_use : "unknown");
+#if REX_PLATFORM_ANDROID
+  // SDL's Android SDL_WaitEvent pumps with a new poll sentinel on every pass,
+  // and adding it posts a wake to the very thread about to wait, so the UI
+  // thread spun at a full core with no events. Nothing here polls in cycles
+  // (the loop waits), so the sentinel is not needed.
+  SDL_SetEventEnabled(SDL_EVENT_POLL_SENTINEL, false);
+#endif
   uint32_t first = SDL_RegisterEvents(2);
   if (first == 0) {
     REXLOG_ERROR("SDL_RegisterEvents failed: {}", SDL_GetError());
@@ -169,6 +176,15 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       }
       break;
     }
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      if (WindowSDL* window = GetWindow(event.tfinger.windowID)) {
+        window->HandleFingerEvent(event);
+      }
+      break;
+    }
     case SDL_EVENT_DROP_FILE: {
       if (WindowSDL* window = GetWindow(event.drop.windowID)) {
         window->HandleDropEvent(event);
@@ -182,6 +198,33 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+  // Application events are sent while SDL pumps in this thread; on Android
+  // it then blocks the loop until the activity returns, so they are handled
+  // here, before the window behind the surface is destroyed.
+  if (SDL_IsMainThread() && context->IsInUIThread()) {
+    switch (event->type) {
+      case SDL_EVENT_WILL_ENTER_BACKGROUND:
+        for (const auto& [id, window] : context->windows_) {
+          window->HandleAppBackground(true);
+        }
+        context->NotifyLifecycleEvent(LifecycleEvent::kWillEnterBackground);
+        break;
+      case SDL_EVENT_DID_ENTER_FOREGROUND:
+        context->NotifyLifecycleEvent(LifecycleEvent::kDidEnterForeground);
+        for (const auto& [id, window] : context->windows_) {
+          window->HandleAppBackground(false);
+        }
+        break;
+      case SDL_EVENT_LOW_MEMORY:
+        context->NotifyLifecycleEvent(LifecycleEvent::kLowMemory);
+        break;
+      case SDL_EVENT_TERMINATING:
+        context->NotifyLifecycleEvent(LifecycleEvent::kTerminating);
+        break;
+      default:
+        break;
+    }
+  }
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,

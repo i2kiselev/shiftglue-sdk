@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     test_memory.cpp
+    audio/host_music_test.cpp
     audio/xma_packet_test.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
@@ -9,8 +10,10 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/hash_test.cpp
+    core/logging_file_sink_test.cpp
     core/stream_test.cpp
     core/chrono_test.cpp
+    core/threading_wait_test.cpp
     codegen/resume_entry_test.cpp
     codegen/resume_template_test.cpp
     ppc/import_function_test.cpp
@@ -20,18 +23,27 @@ add_executable(unit_tests
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
+    input/joystick_mapping_test.cpp
+    input/wheel_test.cpp
+    input/dualsense_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    codegen/host_local_lr_test.cpp
+    codegen/register_locals_test.cpp
     filesystem/cache_mount_test.cpp
     filesystem/long_path_test.cpp
     graphics/native_guest_output_test.cpp
+    graphics/vulkan_shader_overrides_test.cpp
+    graphics/cube_lut_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
 )
 
 target_include_directories(unit_tests PRIVATE

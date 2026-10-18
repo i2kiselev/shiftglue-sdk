@@ -1573,11 +1573,20 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   // run. One-off captures such as a car thumbnail are a few runs over a new,
   // large range; per-frame targets and periodic updates (reflection faces
   // every few frames) keep a range busy. While a range is new, the first
-  // frames of each run are read back.
+  // frames of each run are read back. So is a resolve to a range already
+  // resolved more times this frame than in the previous one: a capture drawn
+  // after the frame into one of its own targets, such as the photo mode
+  // picture the game encodes (#399).
   constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
                      kNewFrames = 120;
   constexpr uint32_t kMinLength = 256 * 1024;
   ResolveReadback& readback = resolve_readbacks_[(uint64_t(address) << 32) | length];
+  if (readback.count_frame != frame_) {
+    readback.previous_count = readback.count_frame + 1 == frame_ ? readback.count : 0;
+    readback.count = 0;
+    readback.count_frame = frame_;
+  }
+  ++readback.count;
   if (!readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames) {
     if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames) {
       readback.new_since_frame = frame_;
@@ -1585,9 +1594,10 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
     readback.run_start_frame = frame_;
   }
   readback.last_used_frame = frame_;
+  const bool extra = readback.previous_count && readback.count > readback.previous_count;
   return REXCVAR_GET(fh1_native_readback_new_resolves) && length >= kMinLength &&
-         frame_ < readback.run_start_frame + kRunReadbackFrames &&
-         frame_ < readback.new_since_frame + kNewFrames;
+         (extra || (frame_ < readback.run_start_frame + kRunReadbackFrames &&
+                    frame_ < readback.new_since_frame + kNewFrames));
 }
 
 void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) {
@@ -1686,11 +1696,11 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   command_processor_.Fh1AwaitAllQueueOperations();
   // In order: a later resolve over the same bytes wins, as on the GPU.
   for (PendingReadback& pending : pending_readbacks_) {
-    uint8_t* destination = memory_.TranslatePhysical(pending.address);
     void* mapped = nullptr;
     D3D12_RANGE range = {0, pending.length};
-    if (destination && SUCCEEDED(pending.buffer->Map(0, &range, &mapped))) {
-      std::memcpy(destination, mapped, pending.length);
+    if (SUCCEEDED(pending.buffer->Map(0, &range, &mapped))) {
+      native_memory_->CopyReadbackToGuest(pending.address, static_cast<const uint8_t*>(mapped),
+                                          pending.length);
       D3D12_RANGE written = {0, 0};
       pending.buffer->Unmap(0, &written);
     }
@@ -1781,11 +1791,16 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
       native_textures_->MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
       // One-off captures the CPU reads also need the guest layout: resolved
       // again unscaled into the guest memory mirror, from each guest pixel's
-      // first host pixel, and read back.
-      if (written_address &&
-          command_processor_.Fh1ReadbackResolveMode() == ReadbackResolveMode::kDisabled &&
-          IsOneOffResolve(resolve_info.copy_dest_extent_start,
-                          resolve_info.copy_dest_extent_length)) {
+      // first host pixel, and read back. So are small resolves, without the
+      // readback, as in the Vulkan executor (#444).
+      constexpr uint32_t kUnscaledCopyMaxLength = 4096;
+      const bool unscaled_copy =
+          written_address &&
+          command_processor_.Fh1ReadbackResolveMode() == ReadbackResolveMode::kDisabled;
+      const bool one_off = unscaled_copy && IsOneOffResolve(resolve_info.copy_dest_extent_start,
+                                                            resolve_info.copy_dest_extent_length);
+      if (one_off ||
+          (unscaled_copy && resolve_info.copy_dest_extent_length <= kUnscaledCopyMaxLength)) {
         native_memory_->RequestRange(resolve_info.copy_dest_extent_start,
                                      resolve_info.copy_dest_extent_length);
         bool unscaled_complete = true;
@@ -1801,7 +1816,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
               ResolveToMemory(source, plan.resolve_key, plan.sample_select, plan.dest_info,
                               plan.dest_base, plan.dest_pitch, 0, true);
         }
-        if (unscaled_complete) {
+        if (unscaled_complete && one_off) {
           QueueResolveReadback(resolve_info.copy_dest_extent_start,
                                resolve_info.copy_dest_extent_length);
         }

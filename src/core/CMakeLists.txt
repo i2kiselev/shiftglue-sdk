@@ -17,6 +17,7 @@ add_library(rexcore OBJECT
     mutex.cpp
     ring_buffer.cpp
     string_buffer.cpp
+    sync_census.cpp
     threading.cpp
     timer_queue.cpp
     utf8.cpp
@@ -43,7 +44,6 @@ if(WIN32)
         filesystem_win.cpp
         fiber_win32.cpp
         mapped_memory_win.cpp
-        math_msvc.cpp
         memory_win.cpp
         platform/console_win.cpp
         platform/env_win.cpp
@@ -65,7 +65,6 @@ elseif(UNIX)
         filesystem_posix.cpp
         fiber_posix.cpp
         mapped_memory_posix.cpp
-        math_gcc.cpp
         memory_posix.cpp
         platform/console_posix.cpp
         platform/env_posix.cpp
@@ -74,6 +73,9 @@ elseif(UNIX)
         system_posix.cpp
         threading_posix.cpp
     )
+    if(ANDROID)
+        target_sources(rexcore PRIVATE system_android.cpp)
+    endif()
 endif()
 
 # Xenos data-format layer (stateless; headers under include/rex/graphics/).
@@ -102,6 +104,9 @@ if(WIN32)
     target_link_libraries(rexcore PUBLIC ws2_32 advapi32)
 elseif(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)
+    # Bionic has pthreads and rt in libc.
+    target_link_libraries(rexcore PRIVATE dl log android)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()

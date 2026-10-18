@@ -22,14 +22,12 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/platform.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/thread.h>
 #include <rex/ui/presenter.h>
+#include <rex/ui/upscaler.h>
 #include <rex/ui/window.h>
 
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-#include <ffx_api/ffx_api.h>
-#include <ffx_api/ffx_upscale.h>
-#endif
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
@@ -58,16 +56,12 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 // The guest output paint settings apply live: GraphicsSystem passes each
 // change to Presenter::RefreshGuestOutputPaintConfigFromUIThread.
 #if defined(REX_HAS_FIDELITYFX_SDK)
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"});
-#else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
-                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening)")
-    .allowed({"bilinear", "cas", "fsr"});
-#endif
+                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening), fsr2 and fsr3 "
+                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX); "
+                      "FSR 1 when the temporal upscaler is unavailable")
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -121,14 +115,16 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   if (lowered == "fsr3") {
     return GuestOutputPaintConfig::Effect::kFsr3;
   }
+  if (lowered == "dlss") {
+    return GuestOutputPaintConfig::Effect::kDlss;
+  }
 #endif
   return GuestOutputPaintConfig::Effect::kBilinear;
 }
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
 bool IsTemporalFsrCompatibilityEffect(GuestOutputPaintConfig::Effect effect) {
-  return effect == GuestOutputPaintConfig::Effect::kFsr2 ||
-         effect == GuestOutputPaintConfig::Effect::kFsr3;
+  return GuestOutputPaintConfig::IsTemporalEffect(effect);
 }
 
 GuestOutputPaintConfig::FsrQualityMode ParsePresentFsrQualityMode(const std::string& mode_name) {
@@ -155,94 +151,34 @@ GuestOutputPaintConfig::FsrQualityMode ParsePresentFsrQualityMode(const std::str
   return GuestOutputPaintConfig::FsrQualityMode::kAuto;
 }
 
-bool GetFsrQualityModeApiValue(GuestOutputPaintConfig::FsrQualityMode mode,
-                               uint32_t& api_mode_out) {
-  switch (mode) {
-    case GuestOutputPaintConfig::FsrQualityMode::kAuto:
-      return false;
-    case GuestOutputPaintConfig::FsrQualityMode::kNativeAa:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_NATIVEAA;
-#else
-      api_mode_out = 0;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kQuality:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_QUALITY;
-#else
-      api_mode_out = 1;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kBalanced:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_BALANCED;
-#else
-      api_mode_out = 2;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kPerformance:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
-#else
-      api_mode_out = 3;
-#endif
-      return true;
-    case GuestOutputPaintConfig::FsrQualityMode::kUltraPerformance:
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-      api_mode_out = FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE;
-#else
-      api_mode_out = 4;
-#endif
-      return true;
-  }
-  return false;
-}
-
-float GetFsrQualityModeRatioFallback(GuestOutputPaintConfig::FsrQualityMode mode) {
+rex::ui::UpscalerMode ToUpscalerMode(GuestOutputPaintConfig::FsrQualityMode mode) {
   switch (mode) {
     case GuestOutputPaintConfig::FsrQualityMode::kNativeAa:
-      return 1.0f;
+      return rex::ui::UpscalerMode::kNativeAa;
     case GuestOutputPaintConfig::FsrQualityMode::kQuality:
-      return 1.5f;
+      return rex::ui::UpscalerMode::kQuality;
     case GuestOutputPaintConfig::FsrQualityMode::kBalanced:
-      return 1.7f;
+      return rex::ui::UpscalerMode::kBalanced;
     case GuestOutputPaintConfig::FsrQualityMode::kPerformance:
-      return 2.0f;
+      return rex::ui::UpscalerMode::kPerformance;
     case GuestOutputPaintConfig::FsrQualityMode::kUltraPerformance:
-      return 3.0f;
+      return rex::ui::UpscalerMode::kUltraPerformance;
     case GuestOutputPaintConfig::FsrQualityMode::kAuto:
     default:
-      return 1.0f;
+      return rex::ui::UpscalerMode::kAuto;
   }
 }
 
+// The render size of a quality mode, by the ratios FSR, DLSS and XeSS share.
 bool QueryTemporalFsrRenderResolutionFromQualityMode(uint32_t display_width,
                                                      uint32_t display_height,
                                                      GuestOutputPaintConfig::FsrQualityMode mode,
                                                      uint32_t& render_width_out,
                                                      uint32_t& render_height_out) {
-  uint32_t api_mode = 0;
-  if (!GetFsrQualityModeApiValue(mode, api_mode)) {
+  if (mode == GuestOutputPaintConfig::FsrQualityMode::kAuto) {
     return false;
   }
-
-#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
-  ffxQueryDescUpscaleGetRenderResolutionFromQualityMode query_desc = {};
-  query_desc.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE;
-  query_desc.header.pNext = nullptr;
-  query_desc.displayWidth = display_width;
-  query_desc.displayHeight = display_height;
-  query_desc.qualityMode = api_mode;
-  query_desc.pOutRenderWidth = &render_width_out;
-  query_desc.pOutRenderHeight = &render_height_out;
-  if (ffxQuery(nullptr, &query_desc.header) == FFX_API_RETURN_OK && render_width_out &&
-      render_height_out) {
-    return true;
-  }
-#endif
-
-  float ratio = GetFsrQualityModeRatioFallback(mode);
+  float ratio = rex::ui::GetUpscalerModeRatio(ToUpscalerMode(mode));
   render_width_out = std::max(uint32_t(1), uint32_t(float(display_width) / ratio + 0.5f));
   render_height_out = std::max(uint32_t(1), uint32_t(float(display_height) / ratio + 0.5f));
   return true;
@@ -251,9 +187,10 @@ bool QueryTemporalFsrRenderResolutionFromQualityMode(uint32_t display_width,
 void LogTemporalFsrCompatibilityPathOnce() {
   static std::atomic<bool> temporal_fsr_compatibility_logged = false;
   if (!temporal_fsr_compatibility_logged.exchange(true)) {
-    REXLOG_WARN(
-        "present_effect=fsr2/fsr3 uses an experimental temporal upscaler path "
-        "with synthesized depth/motion inputs and may fall back to spatial FSR");
+    REXLOG_INFO(
+        "present_effect=fsr2/fsr3: temporal FSR with the game's depth, camera motion "
+        "and jitter where the title provides them; FSR 1 when the FidelityFX runtime "
+        "is unavailable");
   }
 }
 
@@ -295,7 +232,7 @@ namespace ui {
 
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  rex::system::ReportHostGpuLoss();
 }
 
 Presenter::~Presenter() {
@@ -712,8 +649,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
       new_config.GetFsrSharpnessReduction()) {
     modified = true;
     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+        GuestOutputPaintConfig::IsTemporalEffect(new_config.GetEffect())) {
       request_repaint = true;
     }
   }
@@ -729,8 +665,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
     modified = true;
     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
         new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+        GuestOutputPaintConfig::IsTemporalEffect(new_config.GetEffect())) {
       request_repaint = true;
     }
   }
@@ -742,8 +677,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (guest_output_paint_config_.GetFsrQualityMode() != new_config.GetFsrQualityMode()) {
     modified = true;
-    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+    if (GuestOutputPaintConfig::IsTemporalEffect(new_config.GetEffect())) {
       request_repaint = true;
     }
   }
@@ -1089,8 +1023,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
 #if defined(REX_HAS_FIDELITYFX_SDK)
   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
+      GuestOutputPaintConfig::IsTemporalEffect(config.GetEffect())) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
     // good for up to 2x2 upscaling due to the way they fetch texels.
     // CAS is primarily a sharpening filter, not an upscaling one (its upscaling
@@ -1112,8 +1045,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       ffx_last_size.first = properties.frontbuffer_width;
       ffx_last_size.second = properties.frontbuffer_height;
     }
-    bool is_temporal_effect = config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-                              config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
+    bool is_temporal_effect = GuestOutputPaintConfig::IsTemporalEffect(config.GetEffect());
     bool temporal_quality_mode_forced =
         is_temporal_effect &&
         config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto;

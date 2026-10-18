@@ -223,6 +223,8 @@ endif()
 # FidelityFX (optional, fetched on demand)
 #=============================================================================
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_ffx_api_headers.cmake)
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_dlss.cmake)
 
 #=============================================================================
 # imgui - Immediate mode GUI (no CMakeLists.txt, manual target)
@@ -290,7 +292,7 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
 # one in use stays a runtime choice.
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     set(SDL_X11               ON  CACHE BOOL "" FORCE)
     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
@@ -302,6 +304,17 @@ if(UNIX AND NOT APPLE)
 endif()
 
 add_subdirectory(sdl3)
+
+#=============================================================================
+# libadrenotools (Android): custom Vulkan drivers such as Mesa Turnip, and the
+# Adreno GPU's clocks. Its hooks are shared libraries packaged beside the game.
+#=============================================================================
+if(ANDROID)
+    if(NOT CMAKE_ANDROID_ARCH_ABI)
+        set(CMAKE_ANDROID_ARCH_ABI ${ANDROID_ABI})
+    endif()
+    add_subdirectory(libadrenotools EXCLUDE_FROM_ALL)
+endif()
 
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)

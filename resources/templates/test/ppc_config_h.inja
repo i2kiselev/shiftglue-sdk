@@ -93,7 +93,48 @@
 #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
+// Accesses based on the stack pointer (r1). Guest stacks are allocated in the
+// stack range at 0x70000000, never in the 0xE0000000 physical view, so these
+// skip the physical-heap offset select.
+#define REX_STACK_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x)))
+#define REX_STACK_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x)))
+#define REX_STACK_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x)) = (y))
+#define REX_STACK_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x)) = __builtin_bswap16(y))
+#define REX_STACK_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x)) = __builtin_bswap32(y))
+#define REX_STACK_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x)) = __builtin_bswap64(y))
+
 #define REX_MEMORY_SIZE 0x100000000ull
+
+//=============================================================================
+// Memory Barriers
+//=============================================================================
+
+// The guest's barriers, for host CPUs that reorder more than the guest code
+// assumes. x86-64 keeps every load and store in order except a store followed
+// by a load, which the title tolerates as it always has, so they cost nothing
+// there and the x86-64 code is unchanged. AArch64 reorders freely: sync is a
+// full barrier, lwsync orders everything but a store before a later load,
+// eieio orders stores (device and memory), and isync after a reservation
+// loop makes it an acquire.
+#if REX_ARCH_ARM64
+#define REX_PPC_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
+#define REX_PPC_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define REX_PPC_ISYNC() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#else
+#define REX_PPC_SYNC() ((void)0)
+#define REX_PPC_LWSYNC() ((void)0)
+#define REX_PPC_EIEIO() ((void)0)
+#define REX_PPC_ISYNC() ((void)0)
+#endif
+#define REX_PPC_DB16CYC()                                                          \
+  do {                                                                             \
+    if (int hint = rex::ppc::g_db16cyc_hint.load(std::memory_order_relaxed)) {     \
+      rex::ppc::Db16cycHint(hint);                                                 \
+    }                                                                              \
+  } while (0)
 
 //=============================================================================
 // Function Dispatch
@@ -167,27 +208,11 @@ inline void ppc_trap(PPCContext& ctx, u8* base, u16 trap_type) {
 // Interrupt Locks
 //=============================================================================
 
-inline std::atomic<i32>& ppc_global_lock_count_() {
-  static std::atomic<i32> count{0};
-  return count;
-}
-
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
-
-#define REX_ENTER_GLOBAL_LOCK()                          \
-  do {                                                   \
-    rex::thread::global_critical_region::mutex().lock(); \
-    ppc_global_lock_count_().fetch_add(1);               \
-  } while (0)
-
-#define REX_LEAVE_GLOBAL_LOCK()                                                           \
-  do {                                                                                    \
-    auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
-    assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
-    rex::thread::global_critical_region::mutex().unlock();                                \
-  } while (0)
+// mtmsrd r13 disables interrupts; the runtime maps those sections onto the
+// global critical region. mfmsr reports this thread's state without locking.
+#define REX_CHECK_GLOBAL_LOCK() rex::thread::global_critical_region::GuestCheck()
+#define REX_ENTER_GLOBAL_LOCK() rex::thread::global_critical_region::GuestEnter()
+#define REX_ENTER_GLOBAL_LOCK_RESERVATION() \
+  rex::thread::global_critical_region::GuestEnterReservation()
+#define REX_LEAVE_GLOBAL_LOCK() rex::thread::global_critical_region::GuestLeave()
 

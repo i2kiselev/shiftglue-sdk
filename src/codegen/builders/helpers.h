@@ -14,6 +14,7 @@
 #include "builder_context.h"
 
 #include <cstring>
+#include <string>
 
 #include <rex/codegen/function_scanner.h>
 #include <rex/logging.h>
@@ -221,8 +222,14 @@ inline void emitStoreWithUpdate(BuilderContext& ctx, const char* store_macro, co
   // EA = displacement + rA
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  // MEM[EA] = rS
-  ctx.println("\t{}({}, {}.{});", store_macro, ctx.ea(), ctx.r(ctx.insn.operands[0]), field);
+  // MEM[EA] = rS. Based on r1 (the frame push), the address is on the guest
+  // stack, which is never in the physical view.
+  if (ctx.insn.operands[2] == 1 && strncmp(store_macro, "REX_STORE_", 10) == 0) {
+    ctx.println("\tREX_STACK_STORE_{}({}, {}.{});", store_macro + 10, ctx.ea(),
+                ctx.r(ctx.insn.operands[0]), field);
+  } else {
+    ctx.println("\t{}({}, {}.{});", store_macro, ctx.ea(), ctx.r(ctx.insn.operands[0]), field);
+  }
   // rA = EA (update)
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
 }
@@ -331,7 +338,11 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
  */
 inline void emitSignExtendLoadDForm(BuilderContext& ctx, const char* cast_type,
                                     const char* load_macro) {
-  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, load_macro);
+  // r1 is the stack pointer: guest stacks are never in the physical view.
+  std::string macro = load_macro;
+  if (ctx.insn.operands[2] == 1 && macro.starts_with("REX_LOAD_"))
+    macro = "REX_STACK_LOAD_" + macro.substr(9);
+  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, macro);
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}));", static_cast<int32_t>(ctx.insn.operands[1]));

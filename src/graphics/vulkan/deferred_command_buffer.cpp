@@ -41,6 +41,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
+  // A pipeline that was still being built when its draws were recorded and is
+  // still missing now: those draws are left out until the next bind.
+  bool skip_graphics_draws = false;
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -100,6 +103,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       case Command::kVkBindPipeline: {
         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
         dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
+        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+          skip_graphics_draws = false;
+        }
+      } break;
+
+      case Command::kBindPendingGraphicsPipeline: {
+        auto& args = *reinterpret_cast<const ArgsBindPendingGraphicsPipeline*>(stream);
+        VkPipeline pipeline = command_processor_.AwaitPendingGraphicsPipeline(args.handle);
+        skip_graphics_draws = pipeline == VK_NULL_HANDLE;
+        if (!skip_graphics_draws) {
+          dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        }
       } break;
 
       case Command::kVkBindVertexBuffers: {
@@ -165,6 +180,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
       } break;
 
+      case Command::kVkCopyImageToBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
+        dfn.vkCmdCopyImageToBuffer(command_buffer, args.src_image, args.src_image_layout,
+                                   args.dst_buffer, 1, &args.region);
+      } break;
       case Command::kVkCopyQueryPoolResults: {
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
@@ -179,12 +199,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       } break;
 
       case Command::kVkDraw: {
+        if (skip_graphics_draws) {
+          break;
+        }
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
       } break;
 
       case Command::kVkDrawIndexed: {
+        if (skip_graphics_draws) {
+          break;
+        }
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);
@@ -309,6 +335,22 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                 args.query_count);
       } break;
 
+      case Command::kVkBeginDebugLabel: {
+        auto& args = *reinterpret_cast<const ArgsVkBeginDebugLabel*>(stream);
+        const auto& ifn = command_processor_.GetVulkanDevice()->vulkan_instance()->functions();
+        if (ifn.vkCmdBeginDebugUtilsLabelEXT) {
+          VkDebugUtilsLabelEXT label = {};
+          label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+          label.pLabelName = args.name;
+          ifn.vkCmdBeginDebugUtilsLabelEXT(command_buffer, &label);
+        }
+      } break;
+
+      case Command::kVkEndDebugLabel: {
+        const auto& ifn = command_processor_.GetVulkanDevice()->vulkan_instance()->functions();
+        if (ifn.vkCmdEndDebugUtilsLabelEXT) ifn.vkCmdEndDebugUtilsLabelEXT(command_buffer);
+      } break;
+
       case Command::kVkSetCheckpointNV: {
         auto& args = *reinterpret_cast<const ArgsVkSetCheckpointNV*>(stream);
         dfn.vkCmdSetCheckpointNV(command_buffer,
@@ -324,6 +366,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       case Command::kVkSetBlendConstants: {
         auto& args = *reinterpret_cast<const ArgsVkSetBlendConstants*>(stream);
         dfn.vkCmdSetBlendConstants(command_buffer, args.blend_constants);
+      } break;
+
+      case Command::kVkSetFragmentShadingRateKHR: {
+        auto& args = *reinterpret_cast<const ArgsVkSetFragmentShadingRateKHR*>(stream);
+        // Shaded once per block, the block's rate kept whatever the
+        // primitive or an attachment would choose.
+        const VkFragmentShadingRateCombinerOpKHR combiner_ops[2] = {
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+            VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR};
+        dfn.vkCmdSetFragmentShadingRateKHR(command_buffer, &args.fragment_size, combiner_ops);
       } break;
 
       case Command::kVkSetDepthBias: {

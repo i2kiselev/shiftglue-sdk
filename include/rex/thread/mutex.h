@@ -11,9 +11,31 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 
+#include <rex/runtime_api.h>
+
 namespace rex::thread {
+
+// Who takes the global critical region, for critical_region_census (NN-3.10,
+// rex/thread/sync_census.h). Untagged acquisitions count as kOther.
+enum class LockSource : uint8_t {
+  kOther,
+  kGuestSection,      // recompiled interrupts-off sections (mtmsrd r13)
+  kGuestReservation,  // single-reservation sections that took the mutex
+  kObjectLookup,      // ObjectTable::LookupObject (handle imports)
+  kNativeObject,      // XObject::GetNativeObject (pointer imports)
+  kWriteWatchArm,     // PhysicalHeap::EnableAccessCallbacks
+  kWriteWatchFault,   // the access-violation handler
+  kWriteWatchAnnounced,  // guest Protect/Decommit/Release, host-announced writes
+  kSharedMemory,      // GPU shared memory validity and watches
+  kTextureCache,
+  kInterrupt,         // FunctionDispatcher::ExecuteInterrupt
+  kNotify,            // XNotifyListener
+  kCount
+};
 
 // The global critical region mutex singleton.
 // This must guard any operation that may suspend threads or be sensitive to
@@ -58,24 +80,67 @@ class global_critical_region {
   static std::recursive_mutex& mutex();
 
   // Locks the global mutex, counting the acquisitions that had to wait
-  // (the kCriticalRegionContentions performance counter).
-  static void LockCounted() {
+  // (the kCriticalRegionContentions performance counter). With
+  // critical_region_census on, every acquisition is also counted by source.
+  static void LockCounted(LockSource source = LockSource::kOther) {
+    if (census_enabled_.load(std::memory_order_relaxed)) {
+      LockCensus(source);
+      return;
+    }
     if (!mutex().try_lock()) {
       LockContended();
     }
   }
 
+  // Recompiled guest code: sections with interrupts disabled (mtmsrd r13 to
+  // enter, any other register to leave) hold the region, and mfmsr reads
+  // whether this thread is in one (0, or 0x8000 with interrupts enabled).
+  static void GuestEnter() { GuestEnterFrom(LockSource::kGuestSection); }
+  // NN-3.1: a section the code generator found to hold one load-reserve/
+  // store-conditional pair and nothing else. Its store-conditional is a host
+  // compare-exchange, so with guest_reservation_sections_unlocked it runs
+  // without the mutex; mfmsr still sees interrupts off. The section's leave
+  // is the next GuestLeave this thread makes, since the section holds no
+  // call or nested section.
+  static void GuestEnterReservation() {
+    if (guest_hold_log_ms_ < 0) {
+      GuestHoldLogInit();  // also reads the cvar
+    }
+    if (!reservation_sections_unlocked_.load(std::memory_order_relaxed)) {
+      GuestEnterFrom(LockSource::kGuestReservation);
+      return;
+    }
+    ++unlocked_depth_;
+    ++guest_depth_;
+    CountReservationSection();
+  }
+  static void GuestLeave() {
+    if (unlocked_depth_) {
+      --unlocked_depth_;
+      --guest_depth_;
+      return;
+    }
+    if (--guest_depth_ == 0 && guest_hold_log_ms_ > 0) {
+      GuestHoldEnd();
+    }
+    mutex().unlock();
+  }
+  static uint64_t GuestCheck() { return guest_depth_ ? 0 : 0x8000; }
+
   // Acquires a lock on the global critical section.
   // Use this when keeping an instance is not possible. Otherwise, prefer
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
-  static std::unique_lock<std::recursive_mutex> AcquireDirect() {
-    LockCounted();
+  static std::unique_lock<std::recursive_mutex> AcquireDirect(
+      LockSource source = LockSource::kOther) {
+    LockCounted(source);
     return std::unique_lock<std::recursive_mutex>(mutex(), std::adopt_lock);
   }
 
   // Acquires a lock on the global critical section.
-  inline std::unique_lock<std::recursive_mutex> Acquire() { return AcquireDirect(); }
+  inline std::unique_lock<std::recursive_mutex> Acquire(LockSource source = LockSource::kOther) {
+    return AcquireDirect(source);
+  }
 
   // Acquires a deferred lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> AcquireDeferred() {
@@ -91,6 +156,48 @@ class global_critical_region {
  private:
   // Counts the contention and the time blocked (kCriticalRegionBlockedNs).
   static void LockContended();
+  // LockCounted with critical_region_census on: the same, plus the census.
+  static void LockCensus(LockSource source);
+  static void GuestEnterFrom(LockSource source) {
+    LockCounted(source);
+    if (guest_depth_++ == 0 && GuestHoldLogEnabled()) {
+      GuestHoldBegin();
+    }
+  }
+  static inline thread_local int32_t guest_depth_ = 0;
+
+  // critical_region_hold_log_ms: guest sections held at least that long are
+  // logged with the recompiled function that entered them.
+  static bool GuestHoldLogEnabled() {
+    if (guest_hold_log_ms_ < 0) {
+      GuestHoldLogInit();
+    }
+    return guest_hold_log_ms_ > 0;
+  }
+  static void GuestHoldLogInit();
+  static void GuestHoldBegin();
+  static void GuestHoldEnd();
+  // Defined once in mutex.cpp, not inline: an inline static is a weak symbol
+  // that each shared library resolves to its own copy on Android, so the
+  // generated code in libmain never saw the runtime's writes. The
+  // thread_locals below stay inline and are only used by the generated code,
+  // except the hold timestamps, which GuestHoldBegin/End keep in the runtime.
+  // On Windows the generated code reads this and
+  // reservation_sections_unlocked_ through rexruntime's import table
+  // (REX_RUNTIME_DATA).
+  static REX_RUNTIME_DATA int32_t guest_hold_log_ms_;
+  static void CountReservationSection();
+
+ public:
+  // guest_reservation_sections_unlocked (NN-3.1), mirrored for generated code.
+  static REX_RUNTIME_DATA std::atomic<bool> reservation_sections_unlocked_;
+  // critical_region_census is on (set by census::Frame every frame).
+  static REX_RUNTIME_DATA std::atomic<bool> census_enabled_;
+
+ private:
+  static inline thread_local int32_t unlocked_depth_ = 0;
+  static inline thread_local int64_t guest_hold_start_ns_ = 0;
+  static inline thread_local const void* guest_hold_site_ = nullptr;
 };
 
 }  // namespace rex::thread

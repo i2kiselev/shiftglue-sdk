@@ -16,6 +16,7 @@
 #include <atomic>
 #include <string>
 
+#include <rex/perf/counter.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -28,9 +29,16 @@
 #include <rex/system/user_module.h>
 #include <rex/system/util/string_utils.h>
 #include <rex/system/xevent.h>
+#include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(rtl_critical_section_pcr_thread, true, "Kernel",
+                    "RtlEnter/TryEnterCriticalSection read the calling guest thread from its "
+                    "PCR (r13) instead of host thread-local storage (NN-3.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -377,8 +385,19 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
 }
 
-void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
+// The guest thread object of the caller. Guest code runs with r13 at its
+// thread's PCR, whose PRCB names the current thread; reading it there avoids
+// the host's dynamic TLS lookup (a resolver call from this library).
+uint32_t CriticalSectionThread(const PPCContext& ctx, uint8_t* base) {
+  if (REXCVAR_GET(rtl_critical_section_pcr_thread)) {
+    const auto* pcr = rex::memory::GuestPtr<const X_KPCR*>(base, ctx.r13.u32);
+    return pcr->prcb_data.current_thread;
+  }
+  PERF_counter_inc(kRtlCriticalSectionThreadLookups);
+  return XThread::GetCurrentThread()->guest_object();
+}
+
+void RtlEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cur_thread) {
   // The title's spin counts (up to 255 * 256) were tuned for the Xenon; cap
   // them, and read before each compare-exchange with a pause so waiters do
   // not keep stealing the cache line the owner needs to release the lock.
@@ -408,7 +427,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
     // Create a full waiter.
-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
+    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs), 8, 0, 0, nullptr);
   }
 
   assert_true(cs->owning_thread == 0);
@@ -416,8 +435,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   cs->recursion_count = 1;
 }
 
-u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  uint32_t thread = XThread::GetCurrentThread()->guest_object();
+uint32_t RtlTryEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t thread) {
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
     // Able to steal the lock right away.
@@ -627,9 +645,28 @@ REX_EXPORT(__imp__RtlInitializeCriticalSection,
            rex::kernel::xboxkrnl::RtlInitializeCriticalSection_entry)
 REX_EXPORT(__imp__RtlInitializeCriticalSectionAndSpinCount,
            rex::kernel::xboxkrnl::RtlInitializeCriticalSectionAndSpinCount_entry)
-REX_EXPORT(__imp__RtlEnterCriticalSection, rex::kernel::xboxkrnl::RtlEnterCriticalSection_entry)
-REX_EXPORT(__imp__RtlTryEnterCriticalSection,
-           rex::kernel::xboxkrnl::RtlTryEnterCriticalSection_entry)
+// Raw hooks: the current thread comes from the caller's r13 (see
+// CriticalSectionThread).
+extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
+  REX_TRACE_IMPORT_REACH(__imp__RtlEnterCriticalSection);
+  using namespace rex::kernel::xboxkrnl;
+  // GuestPtr adds the 0xE0000000 view's host offset (Apple silicon), as
+  // RtlLeaveCriticalSection's translated pointer does: critical sections in
+  // physical memory must be entered and left at the same host address.
+  RtlEnterCriticalSection(rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32),
+                          CriticalSectionThread(ctx, base));
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlEnterCriticalSection(
+    "__imp__RtlEnterCriticalSection", &__imp__RtlEnterCriticalSection);
+extern "C" REX_FUNC(__imp__RtlTryEnterCriticalSection) {
+  REX_TRACE_IMPORT_REACH(__imp__RtlTryEnterCriticalSection);
+  using namespace rex::kernel::xboxkrnl;
+  ctx.r3.u64 = RtlTryEnterCriticalSection(
+      rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32),
+      CriticalSectionThread(ctx, base));
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlTryEnterCriticalSection(
+    "__imp__RtlTryEnterCriticalSection", &__imp__RtlTryEnterCriticalSection);
 REX_EXPORT(__imp__RtlLeaveCriticalSection, rex::kernel::xboxkrnl::RtlLeaveCriticalSection_entry)
 REX_EXPORT(__imp__RtlTimeToTimeFields, rex::kernel::xboxkrnl::RtlTimeToTimeFields_entry)
 REX_EXPORT(__imp__RtlTimeFieldsToTime, rex::kernel::xboxkrnl::RtlTimeFieldsToTime_entry)

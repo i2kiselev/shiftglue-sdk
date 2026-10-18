@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -80,6 +81,8 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Requests that had pages to upload, since startup (LS-3.3's census).
+  uint64_t upload_request_count() const { return upload_request_count_; }
 
   // What the current requests are for, to size uploads by kind (NP-2.8).
   enum class UploadKind : uint32_t { kOther, kVertex, kIndex, kTexture, kMemexport, kCount };
@@ -106,6 +109,7 @@ class SharedMemory {
   const UploadStats& upload_stats(UploadKind kind) const {
     return upload_stats_[size_t(kind)];
   }
+  UploadKind upload_kind() const { return upload_kind_; }
 
   // Command-processor thread only. Copy CPU-authoritative bytes, rejecting any
   // GPU-written page and leaving destination unchanged on rejection. Callers
@@ -133,6 +137,13 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+
+  // Writes bytes read back from a resolve to guest memory, except on pages the
+  // CPU has written since the resolve made them valid. A resolve's extent
+  // spans whole rows (and tiles) while the GPU writes only its rectangle, and
+  // a readback lands once the GPU is done, so a page the CPU wrote in between
+  // would get the GPU's older copy of it.
+  void CopyReadbackToGuest(uint32_t start, const uint8_t* source, uint32_t length);
 
   // Diagnostics: pages in the range currently valid, and valid because the GPU
   // wrote them.
@@ -205,10 +216,17 @@ class SharedMemory {
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
   UploadKind upload_kind_ = UploadKind::kOther;
   UploadStats upload_stats_[size_t(UploadKind::kCount)];
+  uint64_t upload_request_count_ = 0;
   uint32_t upload_frame_ = 1;
   std::vector<uint32_t> page_upload_frame_;
+  // write_watch_fault_trace (NN-3.12): per page, the UploadKind that last made
+  // it valid (census::kPageKindGpuWritten for GPU writes, kPageKindNone before
+  // any), allocated when the census first runs. Read by the fault path.
+  std::atomic<std::atomic<uint8_t>*> page_upload_kind_{nullptr};
+  void NotePageUploadKind(uint32_t page_first, uint32_t page_last, bool written_by_gpu);
   // RequestRanges scratch for the merged request list.
   std::vector<std::pair<uint32_t, uint32_t>> request_ranges_scratch_;
+
 
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing

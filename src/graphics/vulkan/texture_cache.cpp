@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <fstream>
 #include <utility>
 
 #include <rex/assert.h>
@@ -20,8 +21,10 @@
 #include <rex/chrono/clock.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/perf/counter.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -29,13 +32,60 @@
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
+// FH1's bloom and luminance chains (320x192 down to 2x2) reloaded every
+// frame because only textures of 256x256 texels or more could be resolved
+// into directly.
+REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DECLARE(bool, texture_gamma_host_srgb);
+REXCVAR_DEFINE_BOOL(vulkan_small_texture_copy_views, true, "GPU/Vulkan",
+                    "Give textures of any size with 4-byte texels the raw-bits view resolves "
+                    "write directly through, not only those of 256x256 texels or more")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+// On Android too: the raw-bits view it gives large textures also lets
+// resolves write them directly (fh1_resolve_to_textures) instead of reloading
+// them. On the Odin 2 Portal (Adreno 740) a 1x drive's GPU frame falls from
+// 36 to 32 ms, texture reloads from 3.6 to 2.3 ms, whatever the storage
+// usage costs the framebuffer compression.
+REXCVAR_DEFINE_BOOL(vulkan_texture_load_compute_copy, true, "GPU/Vulkan",
+                    "Write loaded texture data into large single-level 2D textures with a compute "
+                    "shader instead of a buffer-to-image copy, which NVIDIA runs on the copy "
+                    "engine serialized with the frame")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// A low-spec setting (#515): the host image of a mipmapped texture larger
+// than this starts at the first guest level that fits, so its larger
+// levels take no video memory and are never uploaded. Shaders address
+// textures in normalized coordinates (unnormalized fetches are divided by
+// the guest size), so a smaller image samples the same, only blurrier.
+REXCVAR_DEFINE_UINT32(vulkan_texture_max_size, 0, "GPU/Vulkan",
+                      "Largest width or height of a mipmapped texture's top level; "
+                      "larger ones drop their top levels (0: no limit, otherwise at "
+                      "least 64)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_force_bc_decode, false, "GPU/Vulkan",
+                    "Decode BC (DXT, DXN) textures to uncompressed formats on the GPU as on a "
+                    "device without them, to measure that path where BC is supported")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#ifdef __ANDROID__
+constexpr int32_t kTextureMemoryPreallocMBDefault = 256;
+#else
+constexpr int32_t kTextureMemoryPreallocMBDefault = 0;
+#endif
+REXCVAR_DEFINE_INT32(vulkan_texture_memory_prealloc_mb, kTextureMemoryPreallocMBDefault,
+                     "GPU/Vulkan",
+                     "Allocate this much texture memory at startup, in 64 MB blocks that later "
+                     "growth adds one at a time. On Android, VMA's growing blocks (64, 128, "
+                     "256 MB) each stalled the GPU thread 10 ms or more as the driver cleared "
+                     "them during gameplay; 0 leaves texture memory to VMA's default pools")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -47,6 +97,9 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/texture_load_16bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_16bpb_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_32bpb_cs.h"
+#include "../shaders/vulkan_spirv/texture_copy_buffer_image_1w_cs.h"
+#include "../shaders/vulkan_spirv/texture_copy_buffer_image_2w_cs.h"
+#include "../shaders/vulkan_spirv/texture_copy_buffer_image_4w_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_32bpb_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_64bpb_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_64bpb_scaled_cs.h"
@@ -441,6 +494,7 @@ VulkanTextureCache::~VulkanTextureCache() {
   const VkDevice device = vulkan_device->device();
 
   ClearSamplers();
+  ShutdownBindless();
 
   ShutdownScaledResolveBuffer();
   ReleaseInheritedBuffer();
@@ -481,14 +535,97 @@ VulkanTextureCache::~VulkanTextureCache() {
   if (load_pipeline_layout_ != VK_NULL_HANDLE) {
     dfn.vkDestroyPipelineLayout(device, load_pipeline_layout_, nullptr);
   }
+  for (VkPipeline& copy_pipeline : copy_pipelines_) {
+    if (copy_pipeline != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, copy_pipeline, nullptr);
+      copy_pipeline = VK_NULL_HANDLE;
+    }
+  }
+  if (copy_pipeline_layout_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineLayout(device, copy_pipeline_layout_, nullptr);
+    copy_pipeline_layout_ = VK_NULL_HANDLE;
+  }
 
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
+  DestroyRetiredReplacementResources(UINT64_MAX);
   DestroyAllTextures(true);
 
+  if (texture_pool_ != VK_NULL_HANDLE) {
+    vmaDestroyPool(vma_allocator_, texture_pool_);
+    texture_pool_ = VK_NULL_HANDLE;
+  }
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
   }
+}
+
+VkResult VulkanTextureCache::CreateTextureImage(const VkImageCreateInfo& image_create_info,
+                                                VkImage& image, VmaAllocation& allocation) {
+  VmaAllocationCreateInfo allocation_create_info = {};
+  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  if (texture_pool_ != VK_NULL_HANDLE) {
+    // VMA does not check a pool's memory type against the image's, so images
+    // that cannot use it take the default pools below.
+    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    VkImage pool_image;
+    if (dfn.vkCreateImage(device, &image_create_info, nullptr, &pool_image) == VK_SUCCESS) {
+      VkMemoryRequirements memory_requirements;
+      dfn.vkGetImageMemoryRequirements(device, pool_image, &memory_requirements);
+      if (memory_requirements.memoryTypeBits & (uint32_t(1) << texture_pool_memory_type_)) {
+        VmaAllocationCreateInfo pool_allocation_create_info = {};
+        pool_allocation_create_info.pool = texture_pool_;
+        if (vmaAllocateMemoryForImage(vma_allocator_, pool_image, &pool_allocation_create_info,
+                                      &allocation, nullptr) == VK_SUCCESS) {
+          if (vmaBindImageMemory(vma_allocator_, allocation, pool_image) == VK_SUCCESS) {
+            image = pool_image;
+            return VK_SUCCESS;
+          }
+          vmaFreeMemory(vma_allocator_, allocation);
+        }
+      }
+      dfn.vkDestroyImage(device, pool_image, nullptr);
+    }
+  }
+  return vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
+                        &allocation, nullptr);
+}
+
+void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+  DestroyRetiredReplacementResources(completed_submission_index);
+}
+
+void VulkanTextureCache::DestroyRetiredReplacementResources(uint64_t completed_submission_index) {
+  if (retired_replacement_resources_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  auto end = std::remove_if(
+      retired_replacement_resources_.begin(), retired_replacement_resources_.end(),
+      [&](const RetiredReplacementResources& retired) {
+        if (retired.submission > completed_submission_index) {
+          return false;
+        }
+        for (VkImageView view : retired.bindless_views) {
+          ReleaseBindlessView(view);
+        }
+        for (VkImageView view : retired.views) {
+          dfn.vkDestroyImageView(device, view, nullptr);
+        }
+        if (retired.image != VK_NULL_HANDLE) {
+          vmaDestroyImage(vma_allocator_, retired.image, retired.allocation);
+        }
+        if (retired.buffer != VK_NULL_HANDLE) {
+          vmaDestroyBuffer(vma_allocator_, retired.buffer, retired.buffer_allocation);
+        }
+        return true;
+      });
+  retired_replacement_resources_.erase(end, retired_replacement_resources_.end());
 }
 
 void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
@@ -506,7 +643,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
           false);
     }
-    command_processor_.SubmitBarriers(true, "end_texture_load");
+    command_processor_.SubmitBarriers(true);
     DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
     VkClearColorValue null_image_clear_color = kInvalidTextureFetchFallbackColor;
     for (size_t i = 0; i < rex::countof(null_images); ++i) {
@@ -527,6 +664,15 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
 
 void VulkanTextureCache::BeginFrame() {
   TextureCache::BeginFrame();
+
+  // A reload of texture replacements: rescan the folders and clear the
+  // caches, so every texture loads again (through replacements) at the next
+  // use.
+  if (texture_replacement::ReloadRequested()) {
+    texture_replacement::Reset();
+    command_processor_.ClearCaches();
+    REXGPU_INFO("Texture replacements: reloading");
+  }
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 
@@ -647,7 +793,7 @@ void VulkanTextureCache::ResampleInheritedResolves() {
       const uint32_t constants[] = {length, inherited_scale_, scale, run.bpb_log2};
       command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                         sizeof(constants), constants);
-      command_processor_.SubmitBarriers(true, "end_texture_load");
+      command_processor_.SubmitBarriers(true);
       const uint64_t dest_words = length * dest_area / 4;
       command_buffer.CmdVkDispatch(uint32_t((dest_words + 255) / 256), 1, 1);
       guest_bytes += length;
@@ -683,28 +829,42 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  TextureCache::RequestTextures(used_texture_mask);
-
-  // Pre-create 3D-as-2D wrappers while still in texture request phase.
-  if (REXCVAR_GET(gpu_3d_to_2d_texture)) {
-    uint32_t textures_3d = used_texture_mask;
-    uint32_t index_3d;
-    while (rex::bit_scan_forward(textures_3d, &index_3d)) {
-      textures_3d &= ~(uint32_t(1) << index_3d);
-      const TextureBinding* binding = GetValidTextureBinding(index_3d);
-      if (!binding || binding->key.dimension != xenos::DataDimension::k3D) {
+  // NL-3.2: nothing written, nothing outdated, and each texture already used
+  // and sampled in this submission: the full request would change nothing.
+  const bool reload_probe = REXCVAR_GET(fh1_texture_reload_probe);
+  if (skip_unchanged_requests_ && !reload_probe &&
+      !(used_texture_mask & ~(texture_bindings_in_sync() & sampled_ready_mask_)) &&
+      sampled_ready_submission_ == current_submission_index() &&
+      sampled_ready_usage_generation_ == usage_generation_ &&
+      !texture_may_have_become_outdated()) {
+    ++unchanged_request_hits_;
+    if (!verify_unchanged_requests_) {
+      return;
+    }
+    // Verify: what the skip assumes, checked, then the full request anyway.
+    uint32_t remaining = used_texture_mask;
+    uint32_t verify_index;
+    bool mismatch = false;
+    while (rex::bit_scan_forward(remaining, &verify_index)) {
+      remaining &= ~(uint32_t(1) << verify_index);
+      const TextureBinding* binding = GetValidTextureBinding(verify_index);
+      if (!binding) {
         continue;
       }
-      VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
-      if (texture) {
-        texture->GetOrCreate3DAs2DImageView(false, binding->host_swizzle);
-      }
-      VulkanTexture* texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
-      if (texture_signed) {
-        texture_signed->GetOrCreate3DAs2DImageView(true, binding->host_swizzle);
+      for (Texture* texture : {binding->texture, binding->texture_signed}) {
+        mismatch |= texture && static_cast<VulkanTexture*>(texture)->usage() !=
+                                   VulkanTexture::Usage::kGuestShaderSampled;
       }
     }
+    unchanged_request_mismatches_ += mismatch;
   }
+  // Ready bits from earlier requests stay valid only while no usage changed
+  // outside RequestTextures: everything this request loads, it also binds and
+  // transitions back for sampling below.
+  const bool ready_still_valid = sampled_ready_submission_ == current_submission_index() &&
+                                 sampled_ready_usage_generation_ == usage_generation_;
+
+  TextureCache::RequestTextures(used_texture_mask);
 
   // Transition the textures into the needed usage.
   VkPipelineStageFlags dst_stage_mask;
@@ -712,6 +872,10 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
   VkImageLayout new_layout;
   GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled, dst_stage_mask, dst_access_mask,
                        new_layout);
+  // One pass over the used textures (PD-2.4): 3D-as-2D wrappers are
+  // pre-created while still in the texture request phase, then the textures
+  // are marked as used and transitioned.
+  const bool create_3d_as_2d = REXCVAR_GET(gpu_3d_to_2d_texture);
   uint32_t textures_remaining = used_texture_mask;
   uint32_t index;
   while (rex::bit_scan_forward(textures_remaining, &index)) {
@@ -720,10 +884,30 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (!binding) {
       continue;
     }
+    if (create_3d_as_2d && binding->key.dimension == xenos::DataDimension::k3D) {
+      if (binding->texture) {
+        static_cast<VulkanTexture*>(binding->texture)
+            ->GetOrCreate3DAs2DImageView(false, binding->host_swizzle);
+      }
+      if (binding->texture_signed) {
+        static_cast<VulkanTexture*>(binding->texture_signed)
+            ->GetOrCreate3DAs2DImageView(true, binding->host_swizzle);
+      }
+    }
     VulkanTexture* binding_texture = static_cast<VulkanTexture*>(binding->texture);
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
+      if (reload_probe && binding_texture->GetGuestBaseSize() >= (1u << 20)) {
+        const TextureKey& k = binding_texture->key();
+        REXGPU_INFO("FH1 texture sampled {:X} base {:08X} format {} {}x{} endian {} outdated {} "
+                    "dim {} tiled {} packed {} mip_page {:X} depth {} pitch {} mips {} signed {}",
+                    uintptr_t(binding_texture), uint32_t(k.base_page << 12), uint32_t(k.format),
+                    k.GetWidth(), k.GetHeight(), uint32_t(k.endianness),
+                    binding_texture->outdated_mask(), uint32_t(k.dimension), uint32_t(k.tiled),
+                    uint32_t(k.packed_mips), uint32_t(k.mip_page), k.GetDepthOrArraySize(),
+                    uint32_t(k.pitch), uint32_t(k.mip_max_level), uint32_t(k.signed_separate));
+      }
       VulkanTexture::Usage old_usage =
           binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
@@ -753,6 +937,295 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
                                                   dst_access_mask, old_layout, new_layout);
       }
     }
+  }
+  sampled_ready_mask_ = (ready_still_valid ? sampled_ready_mask_ : 0) | used_texture_mask;
+  sampled_ready_submission_ = current_submission_index();
+  sampled_ready_usage_generation_ = usage_generation_;
+}
+
+uint32_t VulkanTextureCache::AllocateBindlessSlot(uint32_t array) {
+  std::vector<uint32_t>& free_slots = bindless_.free[array];
+  if (!free_slots.empty()) {
+    const uint32_t slot = free_slots.back();
+    free_slots.pop_back();
+    return slot;
+  }
+  if (bindless_.next[array] < bindless_.capacity[array]) {
+    return bindless_.next[array]++;
+  }
+  if (!bindless_.overflows++) {
+    REXGPU_ERROR("VulkanTextureCache: Bindless array {} is full ({} slots); views drawn as null",
+                 array, bindless_.capacity[array]);
+  }
+  return 0;
+}
+
+void VulkanTextureCache::WriteBindlessImage(uint32_t array, uint32_t slot, VkImageView view) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkDescriptorImageInfo image_info = {};
+  image_info.imageView = view;
+  image_info.imageLayout =
+      view != VK_NULL_HANDLE ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = bindless_.set;
+  write.dstBinding = array;
+  write.dstArrayElement = slot;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  write.pImageInfo = &image_info;
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
+                                                    nullptr);
+}
+
+void VulkanTextureCache::WriteBindlessSampler(uint32_t slot, VkSampler sampler) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkDescriptorImageInfo image_info = {};
+  image_info.sampler = sampler;
+  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = bindless_.set;
+  write.dstBinding = SpirvShaderTranslator::kBindlessBindingSamplers;
+  write.dstArrayElement = slot;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+  write.pImageInfo = &image_info;
+  vulkan_device->functions().vkUpdateDescriptorSets(vulkan_device->device(), 1, &write, 0,
+                                                    nullptr);
+}
+
+uint32_t VulkanTextureCache::BindlessViewSlot(VkImageView view, uint32_t array) {
+  if (view == VK_NULL_HANDLE) {
+    return 0;
+  }
+  auto it = bindless_view_slots_.find(view);
+  if (it != bindless_view_slots_.end()) {
+    return it->second.second;
+  }
+  const uint32_t slot = AllocateBindlessSlot(array);
+  if (slot) {
+    WriteBindlessImage(array, slot, view);
+  }
+  bindless_view_slots_.emplace(view, std::make_pair(array, slot));
+  return slot;
+}
+
+void VulkanTextureCache::ReleaseBindlessView(VkImageView view) {
+  if (!bindless()) {
+    return;
+  }
+  auto it = bindless_view_slots_.find(view);
+  if (it == bindless_view_slots_.end()) {
+    return;
+  }
+  if (it->second.second) {
+    bindless_.free[it->second.first].push_back(it->second.second);
+  }
+  bindless_view_slots_.erase(it);
+}
+
+uint32_t VulkanTextureCache::GetSamplerBindlessIndex(VkSampler sampler) const {
+  auto it = bindless_sampler_slots_.find(sampler);
+  return it != bindless_sampler_slots_.end() ? it->second : 0;
+}
+
+uint32_t VulkanTextureCache::GetActiveBindingBindlessIndexSlow(uint32_t fetch_constant_index,
+                                                               xenos::FetchOpDimension dimension,
+                                                               bool is_signed) {
+  // 3D as 2D views, null views and views not known yet.
+  uint32_t array;
+  switch (dimension) {
+    case xenos::FetchOpDimension::k3DOrStacked:
+      array = SpirvShaderTranslator::kBindlessBindingImages3D;
+      break;
+    case xenos::FetchOpDimension::kCube:
+      array = SpirvShaderTranslator::kBindlessBindingImagesCube;
+      break;
+    default:
+      array = SpirvShaderTranslator::kBindlessBindingImages2DArray;
+      break;
+  }
+  return BindlessViewSlot(GetActiveBindingOrNullImageView(fetch_constant_index, dimension, is_signed),
+                          array);
+}
+
+bool VulkanTextureCache::InitializeBindless() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const ui::vulkan::VulkanDevice::Properties& properties = vulkan_device->properties();
+  // 3D and cube views are few; 2D array views take the rest of the limit.
+  const uint32_t image_limit =
+      std::min({properties.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                properties.maxDescriptorSetUpdateAfterBindSampledImages,
+                properties.maxUpdateAfterBindDescriptorsInAllPools / 2, UINT32_C(65536) + 8192});
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages3D] = 4096;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImagesCube] = 4096;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray] =
+      image_limit > 8192 ? image_limit - 8192 : 0;
+  bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] =
+      std::min({properties.maxPerStageDescriptorUpdateAfterBindSamplers,
+                properties.maxDescriptorSetUpdateAfterBindSamplers, sampler_max_count_ + 1});
+  if (bindless_.capacity[SpirvShaderTranslator::kBindlessBindingImages2DArray] < 4096 ||
+      bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers] < 256) {
+    REXGPU_WARN("VulkanTextureCache: Device limits too small for bindless textures");
+    return false;
+  }
+  VkDescriptorSetLayoutBinding bindings[SpirvShaderTranslator::kBindlessBindingCount];
+  VkDescriptorBindingFlags binding_flags[SpirvShaderTranslator::kBindlessBindingCount];
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kBindlessBindingCount; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = i == SpirvShaderTranslator::kBindlessBindingSamplers
+                                     ? VK_DESCRIPTOR_TYPE_SAMPLER
+                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = bindless_.capacity[i];
+    bindings[i].stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
+    bindings[i].pImmutableSamplers = nullptr;
+    binding_flags[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                       VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                       VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+  }
+  VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+  binding_flags_info.bindingCount = SpirvShaderTranslator::kBindlessBindingCount;
+  binding_flags_info.pBindingFlags = binding_flags;
+  VkDescriptorSetLayoutCreateInfo layout_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  layout_info.pNext = &binding_flags_info;
+  layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+  layout_info.bindingCount = SpirvShaderTranslator::kBindlessBindingCount;
+  layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &bindless_.layout) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless descriptor set layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2];
+  pool_sizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  pool_sizes[0].descriptorCount =
+      bindless_.capacity[0] + bindless_.capacity[1] + bindless_.capacity[2];
+  pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+  pool_sizes[1].descriptorCount = bindless_.capacity[SpirvShaderTranslator::kBindlessBindingSamplers];
+  VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+  pool_info.maxSets = 1;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &bindless_.pool) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless descriptor pool");
+    return false;
+  }
+  VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate_info.descriptorPool = bindless_.pool;
+  allocate_info.descriptorSetCount = 1;
+  allocate_info.pSetLayouts = &bindless_.layout;
+  VkDescriptorSet set;
+  if (dfn.vkAllocateDescriptorSets(device, &allocate_info, &set) != VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to allocate the bindless descriptor set");
+    return false;
+  }
+  bindless_.set = set;
+  // Slot 0: null views (true null descriptors when supported) and a default
+  // sampler.
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImages2DArray, 0,
+                     null_image_view_2d_array_);
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImages3D, 0, null_image_view_3d_);
+  WriteBindlessImage(SpirvShaderTranslator::kBindlessBindingImagesCube, 0, null_image_view_cube_);
+  VkSamplerCreateInfo sampler_info = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = VK_FILTER_NEAREST;
+  sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+  if (dfn.vkCreateSampler(device, &sampler_info, nullptr, &bindless_.default_sampler) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("VulkanTextureCache: Failed to create the bindless default sampler");
+    return false;
+  }
+  WriteBindlessSampler(0, bindless_.default_sampler);
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kBindlessBindingCount; ++i) {
+    bindless_.next[i] = 1;
+  }
+  REXGPU_INFO(
+      "VulkanTextureCache: Bindless textures (PD-4): {} 2D array, {} 3D, {} cube views, {} "
+      "samplers",
+      bindless_.capacity[0], bindless_.capacity[1], bindless_.capacity[2], bindless_.capacity[3]);
+  return true;
+}
+
+void VulkanTextureCache::ShutdownBindless() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (bindless_.default_sampler != VK_NULL_HANDLE) {
+    dfn.vkDestroySampler(device, bindless_.default_sampler, nullptr);
+  }
+  if (bindless_.pool != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorPool(device, bindless_.pool, nullptr);
+  }
+  if (bindless_.layout != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorSetLayout(device, bindless_.layout, nullptr);
+  }
+  bindless_ = {};
+  bindless_view_slots_.clear();
+  bindless_sampler_slots_.clear();
+}
+
+void VulkanTextureCache::DebugDumpTextures(uint32_t base_address, const std::string& path) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  uint32_t n = 0;
+  for (Texture* base_texture : TexturesAtBase(base_address)) {
+    auto& texture = static_cast<VulkanTexture&>(*base_texture);
+    const TextureKey& key = texture.key();
+    const uint32_t width = key.GetWidth(), height = key.GetHeight();
+    const VkDeviceSize size = VkDeviceSize(width) * height * 16;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, buffer, memory)) {
+      continue;
+    }
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+    const VulkanTexture::Usage usage = texture.SetUsage(VulkanTexture::Usage::kUndefined);
+    texture.SetUsage(usage);
+    GetTextureUsageMasks(usage, stage_mask, access_mask, layout);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        stage_mask ? stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        access_mask, VK_ACCESS_TRANSFER_READ_BIT, layout, VK_IMAGE_LAYOUT_GENERAL);
+    command_processor_.SubmitBarriers(true);
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {width, height, 1};
+    command_processor_.deferred_command_buffer().CmdVkCopyImageToBuffer(
+        texture.image(), VK_IMAGE_LAYOUT_GENERAL, buffer, region);
+    command_processor_.PushImageMemoryBarrier(
+        texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        stage_mask ? stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+        access_mask, VK_IMAGE_LAYOUT_GENERAL, layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                                  ? VK_IMAGE_LAYOUT_GENERAL
+                                                  : layout);
+    command_processor_.Fh1AwaitAllQueueOperations();
+    void* mapped = nullptr;
+    if (dfn.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS) {
+      VkMappedMemoryRange mapped_range = {};
+      mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      mapped_range.memory = memory;
+      mapped_range.size = VK_WHOLE_SIZE;
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
+      std::ofstream(fmt::format("{}-{}-f{}-{}x{}.bin", path, n, uint32_t(key.format), width, height),
+                    std::ios::binary)
+          .write(static_cast<const char*>(mapped), std::streamsize(size));
+      dfn.vkUnmapMemory(device, memory);
+    }
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    dfn.vkFreeMemory(device, memory, nullptr);
+    ++n;
   }
 }
 
@@ -800,7 +1273,7 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
 }
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
-    const VulkanShader::SamplerBinding& binding) const {
+    const VulkanShader::SamplerBinding& binding, int32_t anisotropic_override) const {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
@@ -869,7 +1342,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
                                                  &mip_min_level, &mip_max_level);
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
-  int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  parameters.no_lod_bias = anisotropic_override == kNoSceneFiltering;
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
@@ -940,6 +1413,16 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
         --custom_border_color_sampler_count_;
       }
     }
+    if (bindless()) {
+      auto slot_it = bindless_sampler_slots_.find(sampler_used_first_->second.sampler);
+      if (slot_it != bindless_sampler_slots_.end()) {
+        if (slot_it->second) {
+          bindless_.free[SpirvShaderTranslator::kBindlessBindingSamplers].push_back(
+              slot_it->second);
+        }
+        bindless_sampler_slots_.erase(slot_it);
+      }
+    }
     dfn.vkDestroySampler(device, sampler_used_first_->second.sampler, nullptr);
     if (sampler_used_first_->second.used_next) {
       sampler_used_first_->second.used_next->second.used_previous =
@@ -998,7 +1481,9 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   {
     const float max_bias = command_processor_.GetVulkanDevice()->properties().maxSamplerLodBias;
     sampler_create_info.mipLodBias =
-        std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
+        parameters.no_lod_bias
+            ? 0.0f
+            : std::clamp(float(REXCVAR_GET(texture_mip_lod_bias)), -max_bias, max_bias);
   }
   if (parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
     sampler_create_info.anisotropyEnable = VK_TRUE;
@@ -1079,6 +1564,14 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
             .first);
   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", samplers_.size());
   new_sampler.second.sampler = vulkan_sampler;
+  if (bindless()) {
+    const uint32_t slot = AllocateBindlessSlot(SpirvShaderTranslator::kBindlessBindingSamplers);
+    if (slot) {
+      WriteBindlessSampler(slot, vulkan_sampler);
+    }
+    new_sampler.second.bindless_slot = slot;
+    bindless_sampler_slots_[vulkan_sampler] = slot;
+  }
   new_sampler.second.uses_custom_border_color = uses_custom_border_color;
   new_sampler.second.last_usage_submission = submission_current;
   new_sampler.second.used_previous = sampler_used_last_;
@@ -1120,8 +1613,13 @@ void VulkanTextureCache::ClearSamplers() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   for (const std::pair<const SamplerParameters, Sampler>& sampler_pair : samplers_) {
+    if (sampler_pair.second.bindless_slot) {
+      bindless_.free[SpirvShaderTranslator::kBindlessBindingSamplers].push_back(
+          sampler_pair.second.bindless_slot);
+    }
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
+  bindless_sampler_slots_.clear();
   samplers_.clear();
   custom_border_color_sampler_count_ = 0;
   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
@@ -1220,6 +1718,48 @@ bool VulkanTextureCache::IsScaledResolveSupportedForFormat(TextureKey key) const
          load_pipelines_scaled_[load_shader] != VK_NULL_HANDLE;
 }
 
+namespace {
+// The sRGB version of an unsigned host format that has one, or undefined.
+VkFormat GetSrgbHostFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+      return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+      return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+      return VK_FORMAT_BC2_SRGB_BLOCK;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+      return VK_FORMAT_BC3_SRGB_BLOCK;
+    default:
+      return VK_FORMAT_UNDEFINED;
+  }
+}
+}  // namespace
+
+bool VulkanTextureCache::IsHostGammaSupported(TextureKey key) const {
+  if (!REXCVAR_GET(texture_gamma_host_srgb) || key.dimension == xenos::DataDimension::k3D ||
+      key.signed_separate) {
+    return false;
+  }
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  if (GetSrgbHostFormat(host_format_pair.format_unsigned.format) == VK_FORMAT_UNDEFINED) {
+    return false;
+  }
+  // The guest X, Y and Z must come from the host red, green and blue (which
+  // the sRGB view decodes) or be constant, and W from alpha or a constant.
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t component = (host_format_pair.swizzle >> (3 * i)) & 0b111;
+    if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_0 ||
+        component == xenos::XE_GPU_TEXTURE_SWIZZLE_1) {
+      continue;
+    }
+    if ((i == 3) != (component == xenos::XE_GPU_TEXTURE_SWIZZLE_A)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 uint32_t VulkanTextureCache::GetHostFormatSwizzle(TextureKey key) const {
   return GetHostFormatPair(key).swizzle;
 }
@@ -1263,7 +1803,31 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
   }
 }
 
-std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(TextureKey key) {
+uint32_t VulkanTextureCache::GetTextureLevelsToSkip(const TextureKey& key) {
+  uint32_t max_size = REXCVAR_GET(vulkan_texture_max_size);
+  // Resolve output (scaled or loaded from guest memory) has no mips, and 3D
+  // textures would also halve their depth.
+  if (!max_size || !key.mip_max_level || key.scaled_resolve ||
+      key.dimension == xenos::DataDimension::k3D) {
+    return 0;
+  }
+  // At least 64 so the new top level is above the packed mip tail, which
+  // holds the levels of 16 texels and less.
+  max_size = std::max(max_size, UINT32_C(64));
+  const uint32_t size = std::max(key.GetWidth(), key.GetHeight());
+  uint32_t skip = 0;
+  while (skip < key.mip_max_level && (size >> skip) > max_size) {
+    ++skip;
+  }
+  return skip;
+}
+
+VkResult VulkanTextureCache::CreateTextureImageForKey(TextureKey key, uint32_t scale_log2,
+                                                      uint32_t levels, VkImage& image,
+                                                      VmaAllocation& allocation,
+                                                      uint32_t& copy_words_out,
+                                                      uint32_t skip_levels) {
+  copy_words_out = 0;
   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   const HostFormatPair& host_format = GetHostFormatPair(key);
   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {
@@ -1288,7 +1852,7 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   }
   if (formats[0] == VK_FORMAT_UNDEFINED) {
     unsupported_format_features_used_[uint32_t(key.format)] |= kUnsupportedResourceBit;
-    return nullptr;
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -1317,38 +1881,385 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     image_create_info.extent.width *= draw_resolution_scale_x();
     image_create_info.extent.height *= draw_resolution_scale_y();
   }
+  // A texture replacement 2, 4 or 8 times the guest size.
+  image_create_info.extent.width <<= scale_log2;
+  image_create_info.extent.height <<= scale_log2;
+  image_create_info.extent.width =
+      std::max(image_create_info.extent.width >> skip_levels, UINT32_C(1));
+  image_create_info.extent.height =
+      std::max(image_create_info.extent.height >> skip_levels, UINT32_C(1));
   image_create_info.extent.depth = is_3d ? depth_or_array_size : 1;
-  image_create_info.mipLevels = key.mip_max_level + 1;
+  image_create_info.mipLevels = levels;
   image_create_info.arrayLayers = is_3d ? 1 : depth_or_array_size;
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  // Large single-level 2D textures in 4-, 8- or 16-byte uncompressed formats
+  // can be written by the buffer-to-image copy compute shader through a
+  // raw-bits view instead of vkCmdCopyBufferToImage (the copy engine).
+  uint32_t copy_words = 0;
+  VkFormat copy_format = VK_FORMAT_UNDEFINED;
+  if (REXCVAR_GET(vulkan_texture_load_compute_copy) && copy_pipeline_layout_ != VK_NULL_HANDLE &&
+      !scale_log2 && !is_3d && key.dimension == xenos::DataDimension::k2DOrStacked && !key.mip_max_level) {
+    const HostFormat& copy_host_format =
+        formats[0] == host_format.format_signed.format && formats[0] != host_format.format_unsigned.format
+            ? host_format.format_signed
+            : host_format.format_unsigned;
+    const uint32_t texels = key.GetWidth() * key.GetHeight() *
+                            (key.scaled_resolve ? draw_resolution_scale_x() * draw_resolution_scale_y()
+                                                : 1);
+    // Small 4-byte textures get the view too: resolves write them directly
+    // through it (fh1_resolve_to_textures) instead of them reloading.
+    if (!copy_host_format.block_compressed &&
+        copy_host_format.load_shader != kLoadShaderIndexUnknown &&
+        (texels >= 256 * 256 ||
+         (REXCVAR_GET(vulkan_small_texture_copy_views) &&
+          GetLoadShaderInfo(copy_host_format.load_shader).bytes_per_host_block == 4))) {
+      switch (GetLoadShaderInfo(copy_host_format.load_shader).bytes_per_host_block) {
+        case 4:
+          copy_words = 1;
+          copy_format = VK_FORMAT_R32_UINT;
+          break;
+        case 8:
+          copy_words = 2;
+          copy_format = VK_FORMAT_R32G32_UINT;
+          break;
+        case 16:
+          copy_words = 4;
+          copy_format = VK_FORMAT_R32G32B32A32_UINT;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  VkFormat view_formats[4] = {formats[0], formats[1], VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+  uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
+  // Gamma textures may be sampled through an sRGB view of the same image.
+  if (IsHostGammaSupported(key) && GetSrgbHostFormat(formats[0]) != VK_FORMAT_UNDEFINED) {
+    image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    view_formats[view_format_count++] = GetSrgbHostFormat(formats[0]);
+  }
+  if (copy_words) {
+    image_create_info.flags |=
+        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    view_formats[view_format_count++] = copy_format;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VkImageFormatListCreateInfo image_format_list_create_info;
-  if (formats[1] != VK_FORMAT_UNDEFINED &&
-      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+  if (view_format_count > 1 && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
     image_create_info_last->pNext = &image_format_list_create_info;
     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
     image_format_list_create_info.pNext = nullptr;
-    image_format_list_create_info.viewFormatCount = 2;
-    image_format_list_create_info.pViewFormats = formats;
+    image_format_list_create_info.viewFormatCount = view_format_count;
+    image_format_list_create_info.pViewFormats = view_formats;
   }
 
-  VmaAllocationCreateInfo allocation_create_info = {};
-  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  copy_words_out = copy_words;
+  return CreateTextureImage(image_create_info, image, allocation);
+}
 
+std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(TextureKey key) {
   VkImage image;
   VmaAllocation allocation;
-  if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
-                     &allocation, nullptr)) {
+  uint32_t copy_words = 0;
+  const uint32_t skip_levels = GetTextureLevelsToSkip(key);
+  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1 - skip_levels, image, allocation,
+                               copy_words, skip_levels) != VK_SUCCESS) {
     return nullptr;
   }
+  auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
+  texture->set_copy_words(copy_words);
+  texture->set_skipped_levels(skip_levels);
+  return texture;
+}
 
-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
+void VulkanTextureCache::VulkanTexture::SwapImage(VkImage image, VmaAllocation allocation,
+                                                  uint32_t copy_words, uint32_t scale_log2,
+                                                  uint32_t levels) {
+  auto& cache = static_cast<VulkanTextureCache&>(texture_cache());
+  RetiredReplacementResources retired;
+  retired.submission = cache.command_processor_.GetCurrentSubmission();
+  retired.image = image_;
+  retired.allocation = allocation_;
+  for (const auto& view_pair : views_) {
+    retired.bindless_views.push_back(view_pair.second);
+    retired.views.push_back(view_pair.second);
+  }
+  if (copy_view_ != VK_NULL_HANDLE) {
+    retired.views.push_back(copy_view_);
+  }
+  if (copy_view_2d_ != VK_NULL_HANDLE) {
+    retired.views.push_back(copy_view_2d_);
+  }
+  cache.retired_replacement_resources_.push_back(std::move(retired));
+  image_ = image;
+  allocation_ = allocation;
+  views_.clear();
+  last_views_[0] = LastView();
+  last_views_[1] = LastView();
+  copy_view_ = VK_NULL_HANDLE;
+  copy_view_2d_ = VK_NULL_HANDLE;
+  copy_words_ = copy_words;
+  usage_ = Usage::kUndefined;
+  replacement_scale_log2_ = scale_log2;
+  replacement_levels_ = scale_log2 ? levels : 0;
+  skipped_levels_ = 0;
+  VmaAllocationInfo allocation_info;
+  vmaGetAllocationInfo(cache.vma_allocator_, allocation_, &allocation_info);
+  SetHostMemoryUsage(uint64_t(allocation_info.size));
+}
+
+void VulkanTextureCache::OnTextureImageSwitched(Texture& texture) {
+  uint32_t bindings = 0;
+  for (uint32_t index = 0; index < 32; ++index) {
+    const TextureBinding* binding = GetValidTextureBinding(index);
+    if (binding && (binding->texture == &texture || binding->texture_signed == &texture)) {
+      bindings |= uint32_t(1) << index;
+    }
+  }
+  if (bindings) {
+    UpdateTextureBindingsImpl(bindings);
+  }
+}
+
+void VulkanTextureCache::UseGuestImage(VulkanTexture& texture) {
+  if (!texture.replacement_scale_log2()) {
+    return;
+  }
+  const TextureKey key = texture.key();
+  VkImage image;
+  VmaAllocation allocation;
+  uint32_t copy_words = 0;
+  const uint32_t skip_levels = GetTextureLevelsToSkip(key);
+  if (CreateTextureImageForKey(key, 0, key.mip_max_level + 1 - skip_levels, image, allocation,
+                               copy_words, skip_levels) != VK_SUCCESS) {
+    return;
+  }
+  texture.SwapImage(image, allocation, copy_words, 0, 0);
+  texture.set_skipped_levels(skip_levels);
+  OnTextureImageSwitched(texture);
+}
+
+bool VulkanTextureCache::TryLoadTextureReplacement(VulkanTexture& texture) {
+  const TextureKey key = texture.key();
+  const texture_replacement::Source source{key.format,
+                                           key.dimension,
+                                           key.GetWidth(),
+                                           key.GetHeight(),
+                                           key.GetDepthOrArraySize(),
+                                           key.mip_max_level,
+                                           key.base_page,
+                                           key.mip_page,
+                                           bool(key.tiled),
+                                           bool(key.packed_mips),
+                                           bool(key.scaled_resolve),
+                                           bool(key.signed_separate),
+                                           uint32_t(key.endianness),
+                                           texture.force_load_3d_tiling()};
+  if (!texture_replacement::IsEligible(source)) {
+    return false;
+  }
+  // The host image must hold the guest's blocks as they are, not decoded on
+  // load as on a device without BC (#516).
+  VkFormat block_format = VK_FORMAT_UNDEFINED;
+  switch (key.format) {
+    case xenos::TextureFormat::k_DXT1:
+      block_format = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+      break;
+    case xenos::TextureFormat::k_DXT2_3:
+      block_format = VK_FORMAT_BC2_UNORM_BLOCK;
+      break;
+    case xenos::TextureFormat::k_DXT4_5:
+      block_format = VK_FORMAT_BC3_UNORM_BLOCK;
+      break;
+    case xenos::TextureFormat::k_DXT5A:
+      block_format = VK_FORMAT_BC4_UNORM_BLOCK;
+      break;
+    case xenos::TextureFormat::k_DXN:
+      block_format = VK_FORMAT_BC5_UNORM_BLOCK;
+      break;
+    case xenos::TextureFormat::k_8_8_8_8:
+      block_format = VK_FORMAT_R8G8B8A8_UNORM;
+      break;
+    default:
+      return false;
+  }
+  if (GetHostFormatPair(key).format_unsigned.format != block_format) {
+    return false;
+  }
+  texture_replacement::Lookup lookup;
+  switch (texture_replacement::Find(source, texture.guest_layout(), shared_memory(), lookup)) {
+    case texture_replacement::LookupResult::kNotEligible:
+      return false;
+    case texture_replacement::LookupResult::kNone:
+      UseGuestImage(texture);
+      return false;
+    case texture_replacement::LookupResult::kFound:
+      break;
+  }
+  const texture_replacement::Format& format = *lookup.format;
+  const texture_replacement::Image& image = *lookup.image;
+  if (!lookup.scale_log2 && !texture.skipped_levels()) {
+    UseGuestImage(texture);
+  } else if (texture.replacement_scale_log2() != lookup.scale_log2 ||
+             texture.replacement_levels() != lookup.levels || texture.skipped_levels()) {
+    VkImage replacement_image;
+    VmaAllocation replacement_allocation;
+    uint32_t copy_words = 0;
+    if (CreateTextureImageForKey(key, lookup.scale_log2, lookup.levels, replacement_image,
+                                 replacement_allocation, copy_words) != VK_SUCCESS) {
+      UseGuestImage(texture);
+      return false;
+    }
+    texture.SwapImage(replacement_image, replacement_allocation, 0, lookup.scale_log2,
+                      lookup.levels);
+    OnTextureImageSwitched(texture);
+  }
+
+  // The levels in order, tightly packed, as the file stores them.
+  size_t size = 0;
+  for (uint32_t level = 0; level < lookup.levels; ++level) {
+    size += texture_replacement::LevelBytes(format, image.width, image.height, level);
+  }
+  VkBufferCreateInfo buffer_create_info = {};
+  buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_create_info.size = size;
+  buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VmaAllocationCreateInfo buffer_allocation_create_info = {};
+  buffer_allocation_create_info.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  buffer_allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO;
+  RetiredReplacementResources upload;
+  VmaAllocationInfo buffer_allocation_info = {};
+  if (vmaCreateBuffer(vma_allocator_, &buffer_create_info, &buffer_allocation_create_info,
+                      &upload.buffer, &upload.buffer_allocation,
+                      &buffer_allocation_info) != VK_SUCCESS ||
+      !buffer_allocation_info.pMappedData) {
+    if (upload.buffer != VK_NULL_HANDLE) {
+      vmaDestroyBuffer(vma_allocator_, upload.buffer, upload.buffer_allocation);
+    }
+    return false;
+  }
+  std::memcpy(buffer_allocation_info.pMappedData, image.data.data(), size);
+  vmaFlushAllocation(vma_allocator_, upload.buffer_allocation, 0, VK_WHOLE_SIZE);
+  const VkBuffer upload_buffer = upload.buffer;
+  // Destroyed once the copy below has run.
+  upload.submission = command_processor_.GetCurrentSubmission();
+  retired_replacement_resources_.push_back(std::move(upload));
+
+  texture.MarkAsUsed();
+  const VulkanTexture::Usage old_usage =
+      texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, dst_stage_mask,
+                       dst_access_mask, new_layout);
+  // Every level is written, so the old contents need not stay.
+  command_processor_.PushImageMemoryBarrier(
+      texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
+      src_access_mask, dst_access_mask, VK_IMAGE_LAYOUT_UNDEFINED, new_layout);
+  command_processor_.SubmitBarriers(true);
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
+      upload_buffer, texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, lookup.levels);
+  VkDeviceSize offset = 0;
+  for (uint32_t level = 0; level < lookup.levels; ++level) {
+    VkBufferImageCopy& copy_region = copy_regions[level];
+    copy_region.bufferOffset = offset;
+    copy_region.bufferRowLength = 0;
+    copy_region.bufferImageHeight = 0;
+    copy_region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    copy_region.imageOffset = {0, 0, 0};
+    copy_region.imageExtent = {std::max(image.width >> level, UINT32_C(1)),
+                               std::max(image.height >> level, UINT32_C(1)), 1};
+    offset += texture_replacement::LevelBytes(format, image.width, image.height, level);
+  }
+  texture_replacement::LogLoaded(lookup);
+  return true;
+}
+
+VkImageView VulkanTextureCache::PrepareDirectResolveWrite(Texture& texture) {
+  VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  if (vulkan_texture.copy_words() != 1) {
+    return VK_NULL_HANDLE;
+  }
+  const VkImageView view = vulkan_texture.GetCopyView2D();
+  if (view == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  vulkan_texture.MarkAsUsed();
+  const VulkanTexture::Usage old_usage =
+      vulkan_texture.SetUsage(VulkanTexture::Usage::kComputeWrite);
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(VulkanTexture::Usage::kComputeWrite, dst_stage_mask, dst_access_mask,
+                       new_layout);
+  // Earlier writes of the same texels (a load) come first.
+  command_processor_.PushImageMemoryBarrier(
+      vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+      src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
+      src_access_mask, dst_access_mask, old_layout, new_layout);
+  return view;
+}
+
+VkImageView VulkanTextureCache::VulkanTexture::GetCopyView() {
+  if (copy_view_ != VK_NULL_HANDLE || !copy_words_) {
+    return copy_view_;
+  }
+  const VulkanTextureCache& vulkan_texture_cache =
+      static_cast<const VulkanTextureCache&>(texture_cache());
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = image_;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+  view_create_info.format = copy_words_ == 1   ? VK_FORMAT_R32_UINT
+                            : copy_words_ == 2 ? VK_FORMAT_R32G32_UINT
+                                               : VK_FORMAT_R32G32B32A32_UINT;
+  view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0,
+                                       VK_REMAINING_ARRAY_LAYERS};
+  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
+                                                   nullptr, &copy_view_) != VK_SUCCESS) {
+    copy_view_ = VK_NULL_HANDLE;
+    copy_words_ = 0;
+  }
+  return copy_view_;
+}
+
+VkImageView VulkanTextureCache::VulkanTexture::GetCopyView2D() {
+  if (copy_view_2d_ != VK_NULL_HANDLE || !copy_words_) {
+    return copy_view_2d_;
+  }
+  const VulkanTextureCache& vulkan_texture_cache =
+      static_cast<const VulkanTextureCache&>(texture_cache());
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      vulkan_texture_cache.command_processor_.GetVulkanDevice();
+  VkImageViewCreateInfo view_create_info = {};
+  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_create_info.image = image_;
+  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_create_info.format = copy_words_ == 1   ? VK_FORMAT_R32_UINT
+                            : copy_words_ == 2 ? VK_FORMAT_R32G32_UINT
+                                               : VK_FORMAT_R32G32B32A32_UINT;
+  view_create_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
+                                                   nullptr, &copy_view_2d_) != VK_SUCCESS) {
+    copy_view_2d_ = VK_NULL_HANDLE;
+  }
+  return copy_view_2d_;
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -1369,6 +2280,15 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   Fh1NativeExecutor* const gpu_profile_executor = command_processor_.GetFh1NativeExecutor();
   const uint32_t load_gpu_timing =
       gpu_profile_executor ? gpu_profile_executor->BeginTextureLoadGpuTiming() : UINT32_MAX;
+  // Resolve-sourced reloads are also timed by texture.
+  uint64_t label_timing = UINT64_MAX;
+  if (gpu_profile_executor && loading_resolve_sourced()) {
+    const TextureKey key = texture.key();
+    label_timing = gpu_profile_executor->BeginLabelGpuTiming(
+        fmt::format("L {:08X} f{} {}x{}", key.base_page << 12, uint32_t(key.format),
+                    key.GetWidth(), key.GetHeight())
+            .c_str());
+  }
   const bool loaded = LoadTextureDataFromResidentMemoryUntimed(texture, load_base, load_mips);
   if (command_processor_.debug_log_draws_frame()) {
     const TextureKey key = texture.key();
@@ -1381,6 +2301,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                 rows_first, std::min(rows_end, key.GetHeight()));
   }
   if (gpu_profile_executor) {
+    gpu_profile_executor->EndLabelGpuTiming(label_timing);
     gpu_profile_executor->EndTextureLoadGpuTiming(load_gpu_timing, loading_resolve_sourced());
   }
   return loaded;
@@ -1402,6 +2323,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                     uint32_t(texture_key.mip_max_level), bool(texture_key.packed_mips),
                     texture_key.base_page << 12, texture_key.mip_page << 12, load_base,
                     load_mips));
+  }
+
+  // Resolve output is the title's own rendering, never a replacement; it
+  // loads into a guest-size image.
+  if (loading_resolve_sourced()) {
+    UseGuestImage(vulkan_texture);
+  } else if (TryLoadTextureReplacement(vulkan_texture)) {
+    return true;
   }
 
   // Get the pipeline.
@@ -1468,19 +2397,71 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
   uint32_t bytes_per_block = guest_format_info->bytes_per_block();
   uint32_t level_first = load_base ? 0 : 1;
   uint32_t level_last = load_mips ? texture_key.mip_max_level : 0;
+  // Levels above the host image (vulkan_texture_max_size) are not loaded.
+  const uint32_t skipped_levels = vulkan_texture.skipped_levels();
+  if (skipped_levels) {
+    if (!load_mips) {
+      return true;
+    }
+    if (skipped_levels > guest_layout.packed_level) {
+      return false;
+    }
+    level_first = std::max(level_first, skipped_levels);
+  }
   assert_true(level_first <= level_last);
   uint32_t level_packed = guest_layout.packed_level;
   uint32_t level_stored_first = std::min(level_first, level_packed);
   uint32_t level_stored_last = std::min(level_last, level_packed);
   uint32_t texture_resolution_scale_x = texture_key.scaled_resolve ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y = texture_key.scaled_resolve ? draw_resolution_scale_y() : 1;
+  // Only the rows GPU writes changed since the last load (texture_band_reloads),
+  // when the compute copy writes the image: the untile starts at the band's
+  // first macro tile row and the copy at its first host row, and the rest of
+  // the image keeps its contents.
+  // Not together with base_rows below, which already narrows the load.
+  uint32_t base_rows_first = 0, base_rows_end = UINT32_MAX;
+  loading_base_rows(base_rows_first, base_rows_end);
+  uint32_t band_first = 0, band_end = 0;
+  if (base_rows_end > height && loading_rows_end() && load_base && !load_mips &&
+      vulkan_texture.copy_words() &&
+      !host_format.block_compressed && guest_layout.packed_level != 0 &&
+      texture_key.mip_max_level == 0 && !is_3d_tiling) {
+    band_first = loading_rows_first();
+    band_end = loading_rows_end();
+  }
+  const bool band = band_end != 0;
+  // Only the array layers GPU writes changed since the last load
+  // (texture_layer_reloads), as runs of consecutive layers; the other
+  // layers keep their contents.
+  const uint32_t layers_mask =
+      array_size > 1 && !is_3d_tiling && !texture_key.scaled_resolve &&
+              load_shader_float_convert == kLoadShaderIndexUnknown
+          ? loading_layers_mask()
+          : 0;
+  std::array<std::pair<uint32_t, uint32_t>, 16> layer_runs;
+  uint32_t layer_run_count = 0;
+  if (layers_mask) {
+    for (uint32_t layer = 0; layer < array_size && layer_run_count < layer_runs.size();) {
+      if (!((layers_mask >> layer) & 1)) {
+        ++layer;
+        continue;
+      }
+      uint32_t layer_end = layer + 1;
+      while (layer_end < array_size && ((layers_mask >> layer_end) & 1)) {
+        ++layer_end;
+      }
+      layer_runs[layer_run_count++] = {layer, layer_end - layer};
+      layer = layer_end;
+    }
+    PERF_counter_inc(kTextureLayerReloads);
+  } else {
+    layer_runs[layer_run_count++] = {0, array_size};
+  }
 
   // After a resolve into part of an up-to-date base level (one screen tile of
   // the frame) only the rows it wrote are loaded. They are contiguous in guest
   // memory (TextureCache::Texture::GetBaseRowsOfRange), so from here on they
   // are a level of their own height at an offset.
-  uint32_t base_rows_first = 0, base_rows_end = UINT32_MAX;
-  loading_base_rows(base_rows_first, base_rows_end);
   if (base_rows_end <= height && level_last == 0 && level_packed != 0 && !is_3d_tiling &&
       array_size == 1 && !host_format.block_compressed &&
       load_shader_float_convert == kLoadShaderIndexUnknown) {
@@ -1547,7 +2528,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       level_guest_z_extent_texels = guest_layout_packed.z_extent;
     } else {
       level_guest_x_extent_texels_unscaled = std::max(width >> level, UINT32_C(1));
-      level_guest_y_extent_texels_unscaled = std::max(height >> level, UINT32_C(1));
+      level_guest_y_extent_texels_unscaled =
+          band && is_base ? band_end - band_first : std::max(height >> level, UINT32_C(1));
       level_guest_z_extent_texels = std::max(depth >> level, UINT32_C(1));
     }
     level_host_layout.x_pitch_blocks =
@@ -1706,6 +2688,13 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
 
   // Submit the copy buffer population commands.
 
+  // Outside any rendering, so the load's label does not straddle one.
+  command_processor_.SubmitBarriers(true);
+  command_processor_.BeginDebugLabel("texture load");
+  struct EndLabel {
+    VulkanCommandProcessor& processor;
+    ~EndLabel() { processor.EndDebugLabel(); }
+  } end_label{command_processor_};
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
   command_processor_.BindExternalComputePipeline(pipeline);
@@ -1746,6 +2735,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         (texture_resolution_scale_x * texture_resolution_scale_y);
     const texture_util::TextureGuestLayout::Level& level_guest_layout =
         is_base ? guest_layout.base : guest_layout.mips[level];
+    if (band && is_base) {
+      // A 32-row macro tile row is contiguous in the tiled layout.
+      load_constants.guest_offset += (band_first / 32) * level_guest_layout.row_pitch_bytes * 32 *
+                                     (texture_resolution_scale_x * texture_resolution_scale_y);
+    }
     uint32_t level_guest_pitch = level_guest_layout.row_pitch_bytes;
     if (texture_key.tiled) {
       // Shaders expect pitch in blocks for tiled textures.
@@ -1767,7 +2761,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
       level_depth = level_guest_layout.z_extent;
     } else {
       level_width = std::max(width >> level, UINT32_C(1));
-      level_height = std::max(height >> level, UINT32_C(1));
+      level_height =
+          band && is_base ? band_end - band_first : std::max(height >> level, UINT32_C(1));
       level_depth = std::max(depth >> level, UINT32_C(1));
     }
     load_constants.size_blocks[0] =
@@ -1797,6 +2792,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
+      if (layers_mask && !((layers_mask >> slice) & 1)) {
+        load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
+        load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
+        continue;
+      }
       if (slice != 0) {
         command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, guest_offset),
@@ -1807,7 +2807,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
       }
-      command_processor_.SubmitBarriers(true, "end_texture_load");
+      command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
       command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kTextureLoadEnd,
                                     texture_key.base_page);
@@ -1909,12 +2909,82 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
                                             sizeof(load_constants_float_convert.host_offset),
                                             &load_constants_float_convert.host_offset);
         }
-        command_processor_.SubmitBarriers(true, "end_texture_load");
+        command_processor_.SubmitBarriers(true);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
         load_constants_float_convert.host_offset += level_array_slice_stride_bytes;
       }
+    }
+  }
+
+  // Large single-level textures: written by compute through their raw-bits
+  // view rather than copied by the copy engine.
+  if (vulkan_texture.copy_words() && level_first == 0 && level_last == 0 && level_packed != 0 &&
+      !host_format.block_compressed && !layers_mask) {
+    const VkImageView copy_view = vulkan_texture.GetCopyView();
+    const VkDescriptorSet copy_image_set =
+        copy_view != VK_NULL_HANDLE
+            ? command_processor_.AllocateSingleTransientDescriptor(
+                  VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)
+            : VK_NULL_HANDLE;
+    if (copy_image_set != VK_NULL_HANDLE) {
+      VkDescriptorImageInfo copy_image_info = {VK_NULL_HANDLE, copy_view, VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet copy_image_write = {};
+      copy_image_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      copy_image_write.dstSet = copy_image_set;
+      copy_image_write.descriptorCount = 1;
+      copy_image_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      copy_image_write.pImageInfo = &copy_image_info;
+      dfn.vkUpdateDescriptorSets(device, 1, &copy_image_write, 0, nullptr);
+      command_processor_.PushBufferMemoryBarrier(
+          scratch_buffer, 0, VK_WHOLE_SIZE,
+          scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_SHADER_READ_BIT),
+          VK_ACCESS_SHADER_READ_BIT);
+      vulkan_texture.MarkAsUsed();
+      const VulkanTexture::Usage copy_old_usage =
+          vulkan_texture.SetUsage(VulkanTexture::Usage::kComputeWrite);
+      {
+        VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+        VkAccessFlags src_access_mask, dst_access_mask;
+        VkImageLayout old_layout, new_layout;
+        GetTextureUsageMasks(copy_old_usage, src_stage_mask, src_access_mask, old_layout);
+        GetTextureUsageMasks(VulkanTexture::Usage::kComputeWrite, dst_stage_mask,
+                             dst_access_mask, new_layout);
+        // Every texel of the level is written, so the old contents need not
+        // stay, unless only a band of rows is.
+        command_processor_.PushImageMemoryBarrier(
+            vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+            src_stage_mask ? src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst_stage_mask,
+            src_access_mask, dst_access_mask, band ? old_layout : VK_IMAGE_LAYOUT_UNDEFINED,
+            new_layout);
+      }
+      command_processor_.SubmitBarriers(true);
+      const uint32_t words = vulkan_texture.copy_words();
+      command_processor_.BindExternalComputePipeline(
+          copy_pipelines_[words == 1 ? 0 : (words == 2 ? 1 : 2)]);
+      const VkDescriptorSet copy_sets[2] = {descriptor_set_dest, copy_image_set};
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, copy_pipeline_layout_,
+                                             0, 2, copy_sets, 0, nullptr);
+      const uint32_t copy_width = width * texture_resolution_scale_x;
+      const uint32_t copy_height =
+          (band ? band_end - band_first : height) * texture_resolution_scale_y;
+      const uint32_t copy_constants[6] = {
+          uint32_t(host_layout_base.offset_bytes / 4),
+          host_layout_base.x_pitch_blocks * host_block_width,
+          copy_width,
+          copy_height,
+          uint32_t(host_layout_base.slice_size_bytes / 4),
+          band_first * texture_resolution_scale_y};
+      if (band) {
+        PERF_counter_inc(kTextureBandReloads);
+      }
+      command_buffer.CmdVkPushConstants(copy_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                        sizeof(copy_constants), copy_constants);
+      command_buffer.CmdVkDispatch((copy_width + 7) / 8, (copy_height + 7) / 8, array_size);
+      return true;
     }
   }
 
@@ -1941,12 +3011,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
         texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
         texture_dst_access_mask, texture_old_layout, texture_new_layout);
   }
-  command_processor_.SubmitBarriers(true, "end_texture_load");
+  command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      level_last - level_first + 1);
+      (level_last - level_first + 1) * layer_run_count);
   for (uint32_t level = level_first; level <= level_last; ++level) {
-    VkBufferImageCopy& copy_region = copy_regions[level - level_first];
+    VkBufferImageCopy& copy_region = copy_regions[(level - level_first) * layer_run_count];
     const HostLayout& level_host_layout =
         level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
     copy_region.bufferOffset = level_host_layout.offset_bytes;
@@ -1971,7 +3041,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
     copy_region.bufferRowLength = level_host_layout.x_pitch_blocks * host_block_width;
     copy_region.bufferImageHeight = level_host_layout.y_pitch_blocks * host_block_height;
     copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.imageSubresource.mipLevel = level;
+    copy_region.imageSubresource.mipLevel = level - skipped_levels;
     copy_region.imageSubresource.baseArrayLayer = 0;
     copy_region.imageSubresource.layerCount = array_size;
     copy_region.imageOffset.x = 0;
@@ -1994,12 +3064,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryUntimed(Texture& textu
           std::min(copy_region.imageExtent.height,
                    std::max(height >> level, UINT32_C(1)) * texture_resolution_scale_y);
     }
+    for (uint32_t run = layer_run_count; run-- > 0;) {
+      VkBufferImageCopy& run_region = copy_regions[(level - level_first) * layer_run_count + run];
+      run_region = copy_region;
+      run_region.bufferOffset += level_host_layout.slice_size_bytes * layer_runs[run].first;
+      run_region.imageSubresource.baseArrayLayer = layer_runs[run].first;
+      run_region.imageSubresource.layerCount = layer_runs[run].second;
+    }
   }
 
   return true;
 }
 
 void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
+  ++bindings_generation_;
   uint32_t bindings_remaining = fetch_constant_mask;
   uint32_t binding_index;
   while (rex::bit_scan_forward(bindings_remaining, &binding_index)) {
@@ -2023,8 +3101,9 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
     if (IsSignedVersionSeparateForFormat(binding->key)) {
       if (binding->texture && uses_unsigned &&
           host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
-        vulkan_binding.image_view_unsigned =
-            static_cast<VulkanTexture*>(binding->texture)->GetView(false, binding->host_swizzle);
+        vulkan_binding.image_view_unsigned = static_cast<VulkanTexture*>(binding->texture)
+                                                 ->GetView(false, binding->host_swizzle, true,
+                                                           binding->host_gamma);
       }
       if (binding->texture_signed && uses_signed &&
           host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
@@ -2035,11 +3114,40 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
       VulkanTexture* texture = static_cast<VulkanTexture*>(binding->texture);
       if (texture) {
         if (uses_unsigned && host_format_pair.format_unsigned.format != VK_FORMAT_UNDEFINED) {
-          vulkan_binding.image_view_unsigned = texture->GetView(false, binding->host_swizzle);
+          vulkan_binding.image_view_unsigned =
+              texture->GetView(false, binding->host_swizzle, true, binding->host_gamma);
         }
         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
           vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
         }
+      }
+    }
+    if (bindless()) {
+      // The views' array by the texture's dimension, as the shader declares
+      // the fetch that uses them.
+      uint32_t array;
+      switch (binding->key.dimension) {
+        case xenos::DataDimension::k3D:
+          array = SpirvShaderTranslator::kBindlessBindingImages3D;
+          break;
+        case xenos::DataDimension::kCube:
+          array = SpirvShaderTranslator::kBindlessBindingImagesCube;
+          break;
+        default:
+          array = SpirvShaderTranslator::kBindlessBindingImages2DArray;
+          break;
+      }
+      const bool separate = IsSignedVersionSeparateForFormat(binding->key);
+      VulkanTexture* texture_unsigned = static_cast<VulkanTexture*>(binding->texture);
+      VulkanTexture* texture_signed =
+          static_cast<VulkanTexture*>(separate ? binding->texture_signed : binding->texture);
+      if (vulkan_binding.image_view_unsigned != VK_NULL_HANDLE && texture_unsigned) {
+        vulkan_binding.bindless_slot_unsigned = texture_unsigned->GetBindlessSlot(
+            false, vulkan_binding.image_view_unsigned, array);
+      }
+      if (vulkan_binding.image_view_signed != VK_NULL_HANDLE && texture_signed) {
+        vulkan_binding.bindless_slot_signed =
+            texture_signed->GetBindlessSlot(true, vulkan_binding.image_view_signed, array);
       }
     }
   }
@@ -2071,36 +3179,62 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
                                     key().base_page << 12, key().GetWidth(), key().GetHeight(),
                                     bool(key().scaled_resolve), uint64_t(image_), views));
   }
+  VulkanTextureCache& mutable_cache = const_cast<VulkanTextureCache&>(vulkan_texture_cache);
   for (const auto& view_pair : views_) {
+    mutable_cache.ReleaseBindlessView(view_pair.second);
     dfn.vkDestroyImageView(device, view_pair.second, nullptr);
   }
+  if (copy_view_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, copy_view_, nullptr);
+  }
+  if (copy_view_2d_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, copy_view_2d_, nullptr);
+  }
   if (image_view_3d_as_2d_unsigned_ != VK_NULL_HANDLE) {
+    mutable_cache.ReleaseBindlessView(image_view_3d_as_2d_unsigned_);
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_unsigned_, nullptr);
   }
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+    mutable_cache.ReleaseBindlessView(image_view_3d_as_2d_signed_);
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
-                                                       bool is_array) {
+                                                       bool is_array, bool srgb) {
   LastView& last_view = last_views_[is_signed];
-  const uint32_t arguments = (host_swizzle << 1) | uint32_t(is_array);
+  const uint32_t arguments = (uint32_t(srgb) << 13) | (host_swizzle << 1) | uint32_t(is_array);
   if (last_view.arguments == arguments) {
     return last_view.view;
   }
-  const VkImageView view = GetViewUncached(is_signed, host_swizzle, is_array);
+  const VkImageView view = GetViewUncached(is_signed, host_swizzle, is_array, srgb);
   if (view != VK_NULL_HANDLE) {
     last_view.arguments = arguments;
     last_view.view = view;
+    last_view.bindless_slot = UINT32_MAX;
   }
   return view;
 }
 
+uint32_t VulkanTextureCache::VulkanTexture::GetBindlessSlot(bool is_signed, VkImageView view,
+                                                            uint32_t array) {
+  LastView& last_view = last_views_[is_signed];
+  if (last_view.view == view && last_view.bindless_slot != UINT32_MAX) {
+    return last_view.bindless_slot;
+  }
+  const uint32_t slot =
+      const_cast<VulkanTextureCache&>(static_cast<const VulkanTextureCache&>(texture_cache()))
+          .BindlessViewSlot(view, array);
+  if (last_view.view == view) {
+    last_view.bindless_slot = slot;
+  }
+  return slot;
+}
+
 VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
                                                                uint32_t host_swizzle,
-                                                               bool is_array) {
+                                                               bool is_array, bool srgb) {
   xenos::DataDimension dimension = key().dimension;
   if (dimension == xenos::DataDimension::k3D || dimension == xenos::DataDimension::kCube) {
     is_array = false;
@@ -2116,6 +3250,10 @@ VkImageView VulkanTextureCache::VulkanTexture::GetViewUncached(bool is_signed,
       (is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned).format;
   if (format == VK_FORMAT_UNDEFINED) {
     return VK_NULL_HANDLE;
+  }
+  if (srgb && !is_signed && GetSrgbHostFormat(format) != VK_FORMAT_UNDEFINED) {
+    format = GetSrgbHostFormat(format);
+    view_key.is_srgb = 1;
   }
   // If not distinguishing between unsigned and signed formats for the same
   // image, don't create two views. As this happens within an image, no need to
@@ -2226,13 +3364,10 @@ VkImageView VulkanTextureCache::VulkanTexture::GetOrCreate3DAs2DImageView(bool i
     image_create_info.pQueueFamilyIndices = nullptr;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    VmaAllocationCreateInfo allocation_create_info = {};
-    allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-
     VkImage image_2d;
     VmaAllocation allocation_2d;
-    if (vmaCreateImage(vulkan_texture_cache.vma_allocator_, &image_create_info,
-                       &allocation_create_info, &image_2d, &allocation_2d, nullptr) != VK_SUCCESS) {
+    if (vulkan_texture_cache.CreateTextureImage(image_create_info, image_2d, allocation_2d) !=
+        VK_SUCCESS) {
       REXGPU_ERROR("VulkanTextureCache: Failed to create 3D-as-2D wrapper image");
       return VK_NULL_HANDLE;
     }
@@ -2674,6 +3809,37 @@ bool VulkanTextureCache::Initialize() {
   if (vma_allocator_ == VK_NULL_HANDLE) {
     return false;
   }
+  if (const int32_t prealloc_mb = REXCVAR_GET(vulkan_texture_memory_prealloc_mb)) {
+    constexpr VkDeviceSize kBlockSize = VkDeviceSize(64) << 20;
+    VkImageCreateInfo probe_create_info = {};
+    probe_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    probe_create_info.imageType = VK_IMAGE_TYPE_2D;
+    probe_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    probe_create_info.extent = {256, 256, 1};
+    probe_create_info.mipLevels = 1;
+    probe_create_info.arrayLayers = 1;
+    probe_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    probe_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    probe_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    probe_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo probe_allocation_info = {};
+    probe_allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaPoolCreateInfo pool_create_info = {};
+    pool_create_info.blockSize = kBlockSize;
+    pool_create_info.minBlockCount =
+        size_t((VkDeviceSize(prealloc_mb) << 20) + kBlockSize - 1) / size_t(kBlockSize);
+    if (vmaFindMemoryTypeIndexForImageInfo(vma_allocator_, &probe_create_info,
+                                           &probe_allocation_info,
+                                           &pool_create_info.memoryTypeIndex) == VK_SUCCESS &&
+        vmaCreatePool(vma_allocator_, &pool_create_info, &texture_pool_) == VK_SUCCESS) {
+      texture_pool_memory_type_ = pool_create_info.memoryTypeIndex;
+      REXGPU_INFO("VulkanTextureCache: {} MB of texture memory allocated at startup (type {})",
+                  pool_create_info.minBlockCount * (kBlockSize >> 20),
+                  texture_pool_memory_type_);
+    } else {
+      REXGPU_WARN("VulkanTextureCache: could not allocate texture memory at startup");
+    }
+  }
 
   if (IsDrawResolutionScaled() && !InitializeScaledResolveBuffer()) {
     return false;
@@ -2804,11 +3970,15 @@ bool VulkanTextureCache::Initialize() {
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
   // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
+  // As a device without BC formats would: to measure the decode fallback's
+  // memory and check its output where BC is available (AP-2.4).
+  const bool force_bc_decode = REXCVAR_GET(vulkan_force_bc_decode);
   HostFormatPair& host_format_dxt1 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
     host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt1.format_unsigned.block_compressed = false;
@@ -2818,7 +3988,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
     host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt2_3.format_unsigned.block_compressed = false;
@@ -2828,7 +3999,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
     host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt4_5.format_unsigned.block_compressed = false;
@@ -2838,7 +4010,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
     host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
     host_format_dxn.format_unsigned.block_compressed = false;
@@ -2847,7 +4020,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (force_bc_decode ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
     host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
     host_format_dxt5a.format_unsigned.block_compressed = false;
@@ -3297,6 +4471,46 @@ bool VulkanTextureCache::Initialize() {
     }
   }
 
+  // Buffer-to-image copy pipelines. Without them textures are not created
+  // storage-capable and loads copy as before.
+  if (REXCVAR_GET(vulkan_texture_load_compute_copy)) {
+    VkDescriptorSetLayout copy_set_layouts[2] = {
+        load_descriptor_set_layout_storage_buffer,
+        command_processor_.GetSingleTransientDescriptorLayout(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageImageCompute)};
+    VkPushConstantRange copy_push_constants = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                               6 * sizeof(uint32_t)};
+    VkPipelineLayoutCreateInfo copy_layout_info = {};
+    copy_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    copy_layout_info.setLayoutCount = 2;
+    copy_layout_info.pSetLayouts = copy_set_layouts;
+    copy_layout_info.pushConstantRangeCount = 1;
+    copy_layout_info.pPushConstantRanges = &copy_push_constants;
+    if (copy_set_layouts[1] != VK_NULL_HANDLE &&
+        dfn.vkCreatePipelineLayout(device, &copy_layout_info, nullptr, &copy_pipeline_layout_) ==
+            VK_SUCCESS) {
+      const std::pair<const uint32_t*, size_t> copy_code[3] = {
+          {shaders::texture_copy_buffer_image_1w_cs,
+           sizeof(shaders::texture_copy_buffer_image_1w_cs)},
+          {shaders::texture_copy_buffer_image_2w_cs,
+           sizeof(shaders::texture_copy_buffer_image_2w_cs)},
+          {shaders::texture_copy_buffer_image_4w_cs,
+           sizeof(shaders::texture_copy_buffer_image_4w_cs)}};
+      for (size_t i = 0; i < 3; ++i) {
+        copy_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
+            vulkan_device, copy_pipeline_layout_, copy_code[i].first, copy_code[i].second);
+        if (copy_pipelines_[i] == VK_NULL_HANDLE) {
+          REXGPU_WARN("VulkanTextureCache: no buffer-to-image copy pipeline; loads copy");
+          dfn.vkDestroyPipelineLayout(device, copy_pipeline_layout_, nullptr);
+          copy_pipeline_layout_ = VK_NULL_HANDLE;
+          break;
+        }
+      }
+    } else {
+      copy_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+  }
+
   // Use true null descriptors when supported; otherwise, keep compatibility
   // fallback null images.
   if (device_properties.nullDescriptor) {
@@ -3509,6 +4723,13 @@ bool VulkanTextureCache::Initialize() {
     max_anisotropy_ = xenos::AnisoFilter::kDisabled;
   }
 
+  if (SpirvShaderTranslator::Features(vulkan_device).bindless_textures && !InitializeBindless()) {
+    // The translator is configured from the same features, so a failure here
+    // leaves shaders expecting the set: fail the cache.
+    ShutdownBindless();
+    return false;
+  }
+
   return true;
 }
 
@@ -3570,6 +4791,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       stage_mask = guest_shader_pipeline_stages_;
       access_mask = VK_ACCESS_SHADER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kComputeWrite:
+      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
+      layout = VK_IMAGE_LAYOUT_GENERAL;
       break;
     case VulkanTexture::Usage::kSwapSampled:
       // The swap texture is likely to be used only for the presentation

@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/filesystem.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -45,7 +46,28 @@
 
 namespace rex::system {
 
-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+namespace {
+
+// The host library of a recompiled guest module. Windows' loader finds
+// "<name>" (adding .dll) beside the executable by itself; dlopen needs the
+// file name, and the folder too where the executable is not the app's code
+// (on Android the process is app_process64 and the libraries live in the
+// package's native library folder, which GetExecutableFolder reports).
+std::filesystem::path ModuleLibraryPath(const std::string& name) {
+#if REX_PLATFORM_WIN32
+  return std::filesystem::path(name);
+#elif REX_PLATFORM_MAC
+  return rex::filesystem::GetExecutableFolder() / ("lib" + name + ".dylib");
+#else
+  return rex::filesystem::GetExecutableFolder() / ("lib" + name + ".so");
+#endif
+}
+
+}  // namespace
+
+
+// 25 ms, as xenia-canary 8d2d80dfde: the 100 ms wait only lengthened boot.
+constexpr uint32_t kDeferredOverlappedDelayMillis = 25;
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -760,9 +782,10 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
-                            rex::platform::SymbolResolution::kImmediate)) {
-      REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
+    const std::filesystem::path library_path = ModuleLibraryPath(recomp->shared_lib_name);
+    if (!library_local.Load(library_path, rex::platform::SymbolResolution::kImmediate)) {
+      REXSYS_ERROR("Failed to load shared library for module '{}': {}", recomp->pe_name,
+                   rex::path_to_utf8(library_path));
     } else {
       auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
           library_local.GetRawSymbol("ReXModule_Register"));

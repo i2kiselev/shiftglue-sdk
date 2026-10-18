@@ -12,6 +12,7 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -20,6 +21,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 
@@ -573,6 +575,83 @@ std::string SerializeToTOML(std::string_view category) {
   return result;
 }
 
+std::string MergeIntoTOML(std::string_view existing) {
+  std::lock_guard lock(GetRegistryMutex());
+  const auto literal = [](const FlagEntry& entry) {
+    return entry.type == FlagType::String ? "\"" + entry.getter() + "\"" : entry.getter();
+  };
+  const std::string newline = existing.find("\r\n") != std::string_view::npos ? "\r\n" : "\n";
+  std::string result;
+  std::unordered_map<std::string, bool> written;
+  bool top_level = true;
+  size_t begin = 0;
+  while (begin < existing.size()) {
+    size_t end = existing.find('\n', begin);
+    const size_t next = end == std::string_view::npos ? existing.size() : end + 1;
+    std::string_view line = existing.substr(begin, next - begin);
+    begin = next;
+    std::string_view content = line;
+    while (!content.empty() && (content.back() == '\n' || content.back() == '\r')) {
+      content.remove_suffix(1);
+    }
+    size_t at = content.find_first_not_of(" \t");
+    if (at != std::string_view::npos && content[at] == '[') {
+      top_level = false;
+    }
+    if (top_level && at != std::string_view::npos) {
+      size_t key_end = at;
+      while (key_end < content.size() &&
+             (std::isalnum(static_cast<unsigned char>(content[key_end])) || content[key_end] == '_')) {
+        ++key_end;
+      }
+      size_t equals = content.find_first_not_of(" \t", key_end);
+      if (key_end > at && equals != std::string_view::npos && content[equals] == '=') {
+        const std::string key(content.substr(at, key_end - at));
+        auto it = GetRegistryIndex().find(key);
+        if (it != GetRegistryIndex().end() && !written[key]) {
+          written[key] = true;
+          result += std::string(content.substr(0, at)) + key + " = " +
+                    literal(GetRegistryStorage()[it->second]) + newline;
+          continue;
+        }
+      }
+    }
+    result += line;
+  }
+  std::string appended;
+  for (const auto& entry : GetRegistryStorage()) {
+    if (!written[entry.name] && entry.getter() != entry.default_value) {
+      appended += entry.name + " = " + literal(entry) + newline;
+    }
+  }
+  if (!appended.empty()) {
+    if (!result.empty() && result.back() != '\n') {
+      result += newline;
+    }
+    // Keys after a table header would belong to that table.
+    if (!top_level) {
+      appended = "# Saved from the settings overlay" + newline + appended;
+      size_t first_table = std::string::npos;
+      for (size_t at = 0; at < result.size();) {
+        size_t line_end = result.find('\n', at);
+        size_t start = result.find_first_not_of(" \t", at);
+        if (start != std::string::npos && start < line_end && result[start] == '[') {
+          first_table = at;
+          break;
+        }
+        if (line_end == std::string::npos) {
+          break;
+        }
+        at = line_end + 1;
+      }
+      result.insert(first_table == std::string::npos ? result.size() : first_table, appended);
+    } else {
+      result += appended;
+    }
+  }
+  return result;
+}
+
 void RegisterChangeCallback(std::string_view name, ChangeCallback callback) {
   std::lock_guard lock(GetRegistryMutex());
   GetCallbackStorage()[std::string(name)].push_back(std::move(callback));
@@ -588,6 +667,32 @@ void UnregisterChangeCallbacks(std::string_view name) {
 //=============================================================================
 
 std::vector<std::string> Init(int argc, char** argv) {
+  // CLI11 rejects an empty "--name=" value with a parse error that drops
+  // every other argument, yet an empty string is a meaningful value (an
+  // empty android_gpu_driver selects the system driver). Apply those here
+  // and hand CLI11 the rest.
+  std::vector<char*> args;
+  for (int i = 0; i < argc; i++) {
+    std::string_view view(argv[i]);
+    if (i > 0 && view.starts_with("--") && view.size() > 3 && view.back() == '=' &&
+        view.find('=') == view.size() - 1) {
+      const std::string name(view.substr(2, view.size() - 3));
+      auto& entries = GetRegistryStorage();
+      auto entry = std::find_if(entries.begin(), entries.end(),
+                                [&](const auto& e) { return e.name == name; });
+      if (entry == entries.end()) {
+        std::lock_guard lock(GetRegistryMutex());
+        GetPendingValuesStorage()[name].cmdline = std::string();
+      } else if (entry->type != FlagType::Boolean) {
+        ApplyFromSource(*entry, "", Source::kCommandLine);
+      }
+      continue;
+    }
+    args.push_back(argv[i]);
+  }
+  argc = int(args.size());
+  argv = args.data();
+
   CLI::App app{"", ""};
   app.allow_extras();
 
@@ -646,16 +751,26 @@ std::vector<std::string> Init(int argc, char** argv) {
 
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
+    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
     return;
   }
 
+  // Read through the path: path::string() is in the ANSI code page on
+  // Windows, which toml++ would read as UTF-8 (or which throws for characters
+  // outside it), so a config under C:\Users\Júnior was silently skipped.
+  const std::string name = rex::path_to_utf8(config_path);
   try {
-    auto config = toml::parse_file(config_path.string());
+    std::ifstream file(config_path, std::ios::binary);
+    if (!file) {
+      REXLOG_ERROR("Failed to open config {}", name);
+      return;
+    }
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    auto config = toml::parse(text, name);
     ApplyTomlTable(config, "");
-    REXLOG_DEBUG("Loaded config from {}", config_path.string());
+    REXLOG_DEBUG("Loaded config from {}", name);
   } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    REXLOG_ERROR("Failed to parse config {}: {}", name, err.what());
   }
 }
 
@@ -699,21 +814,40 @@ bool IsFinalized() {
 }
 
 void SaveConfig(const std::filesystem::path& config_path) {
-  std::string content = SerializeToTOML();
-  if (content.empty()) {
-    REXLOG_DEBUG("SaveConfig: no modified flags to save");
+  // Merge into the file rather than replace it: a host keeps its own keys
+  // (a schema version, settings its launcher wrote) in the same file, and
+  // rewriting it with only the modified flags lost them.
+  std::string existing;
+  {
+    std::ifstream input(config_path, std::ios::binary);
+    if (input) {
+      existing.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+  }
+  if (existing.starts_with("\xEF\xBB\xBF")) {
+    existing.erase(0, 3);
+  }
+  if (existing.empty()) {
+    existing = "# Auto-generated cvar configuration\n";
+  }
+  const std::string content = MergeIntoTOML(existing);
+  if (content == existing) {
+    REXLOG_DEBUG("SaveConfig: nothing changed");
     return;
   }
 
   try {
-    std::ofstream file(config_path);
-    if (!file) {
-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
-      return;
+    std::filesystem::path temporary = config_path;
+    temporary += ".tmp";
+    {
+      std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      if (!file || !file.write(content.data(), std::streamsize(content.size())) || !file.flush()) {
+        REXLOG_ERROR("SaveConfig: failed to write {}", rex::path_to_utf8(temporary));
+        return;
+      }
     }
-    file << "# Auto-generated cvar configuration\n";
-    file << content;
-    REXLOG_INFO("Saved config to {}", config_path.string());
+    std::filesystem::rename(temporary, config_path);
+    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
   } catch (const std::exception& e) {
     REXLOG_ERROR("SaveConfig: {}", e.what());
   }

@@ -104,6 +104,14 @@ class DeferredCommandBuffer {
     args.pipeline = pipeline;
   }
 
+  // Binds the pipeline behind a VulkanPipelineCache handle that a worker may
+  // still be building; the replay waits for it (or skips the draws after it).
+  void CmdBindPendingGraphicsPipeline(void* handle) {
+    auto& args = *reinterpret_cast<ArgsBindPendingGraphicsPipeline*>(WriteCommand(
+        Command::kBindPendingGraphicsPipeline, sizeof(ArgsBindPendingGraphicsPipeline)));
+    args.handle = handle;
+  }
+
   void CmdVkBindVertexBuffers(uint32_t first_binding, uint32_t binding_count,
                               const VkBuffer* buffers, const VkDeviceSize* offsets) {
     size_t arguments_size = rex::align(sizeof(ArgsVkBindVertexBuffers), alignof(VkBuffer));
@@ -228,6 +236,20 @@ class DeferredCommandBuffer {
     std::memcpy(args_ptr + header_size, regions, sizeof(VkImageCopy) * region_count);
   }
 
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
+                      VkImageLayout dst_image_layout, const VkImageCopy& region) {
+    CmdVkCopyImage(src_image, src_image_layout, dst_image, dst_image_layout, 1, &region);
+  }
+
+  void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
+                              VkBuffer dst_buffer, const VkBufferImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(
+        WriteCommand(Command::kVkCopyImageToBuffer, sizeof(ArgsVkCopyImageToBuffer)));
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_buffer = dst_buffer;
+    args.region = region;
+  }
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
                                  VkBuffer dst_buffer, VkDeviceSize dst_offset, VkDeviceSize stride,
                                  VkQueryResultFlags flags) {
@@ -282,6 +304,15 @@ class DeferredCommandBuffer {
   // Dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
+
+  // Debug utils labels for capture tools; `name` must outlive the stream
+  // (a string literal).
+  void CmdVkBeginDebugLabel(const char* name) {
+    auto& args = *reinterpret_cast<ArgsVkBeginDebugLabel*>(
+        WriteCommand(Command::kVkBeginDebugLabel, sizeof(ArgsVkBeginDebugLabel)));
+    args.name = name;
+  }
+  void CmdVkEndDebugLabel() { WriteCommand(Command::kVkEndDebugLabel, 0); }
 
   void CmdVkSetCheckpointNV(uint64_t marker) {
     auto& args = *reinterpret_cast<ArgsVkSetCheckpointNV*>(
@@ -354,6 +385,12 @@ class DeferredCommandBuffer {
     std::memcpy(args.blend_constants, blend_constants, sizeof(float) * 4);
   }
 
+  void CmdVkSetFragmentShadingRateKHR(VkExtent2D fragment_size) {
+    auto& args = *reinterpret_cast<ArgsVkSetFragmentShadingRateKHR*>(WriteCommand(
+        Command::kVkSetFragmentShadingRateKHR, sizeof(ArgsVkSetFragmentShadingRateKHR)));
+    args.fragment_size = fragment_size;
+  }
+
   void CmdVkSetDepthBias(float depth_bias_constant_factor, float depth_bias_clamp,
                          float depth_bias_slope_factor) {
     auto& args = *reinterpret_cast<ArgsVkSetDepthBias*>(
@@ -412,12 +449,14 @@ class DeferredCommandBuffer {
     kVkBindDescriptorSets,
     kVkBindIndexBuffer,
     kVkBindPipeline,
+    kBindPendingGraphicsPipeline,
     kVkBindVertexBuffers,
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
     kVkCopyImage,
+    kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -432,8 +471,11 @@ class DeferredCommandBuffer {
     kVkResetQueryPool,
     kVkWriteTimestamp,
     kVkSetCheckpointNV,
+    kVkBeginDebugLabel,
+    kVkEndDebugLabel,
     kVkSetBlendConstants,
     kVkSetDepthBias,
+    kVkSetFragmentShadingRateKHR,
     kVkSetScissor,
     kVkSetStencilCompareMask,
     kVkSetStencilReference,
@@ -500,6 +542,10 @@ class DeferredCommandBuffer {
     VkPipeline pipeline;
   };
 
+  struct ArgsBindPendingGraphicsPipeline {
+    void* handle;
+  };
+
   struct ArgsVkBindVertexBuffers {
     uint32_t first_binding;
     uint32_t binding_count;
@@ -552,6 +598,12 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
   };
 
+  struct ArgsVkCopyImageToBuffer {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkBuffer dst_buffer;
+    VkBufferImageCopy region;
+  };
   struct ArgsVkCopyQueryPoolResults {
     VkQueryPool query_pool;
     uint32_t first_query;
@@ -598,6 +650,10 @@ class DeferredCommandBuffer {
     uint64_t marker;
   };
 
+  struct ArgsVkBeginDebugLabel {
+    const char* name;
+  };
+
   struct ArgsVkWriteTimestamp {
     VkPipelineStageFlagBits pipeline_stage;
     VkQueryPool query_pool;
@@ -637,6 +693,10 @@ class DeferredCommandBuffer {
 
   struct ArgsVkSetBlendConstants {
     float blend_constants[4];
+  };
+
+  struct ArgsVkSetFragmentShadingRateKHR {
+    VkExtent2D fragment_size;
   };
 
   struct ArgsVkSetDepthBias {

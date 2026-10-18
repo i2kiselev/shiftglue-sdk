@@ -310,6 +310,20 @@ TEST_CASE("cvar source precedence", "[cvar]") {
     CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kRuntime);
   }
 
+  SECTION("An empty command-line value applies and keeps the other arguments") {
+    char argv0[] = "cvar_test";
+    char arg1[] = "--test_int32_flag=333";
+    char arg2[] = "--test_string_flag=";
+    char* argv[] = {argv0, arg1, arg2};
+    rex::cvar::Init(3, argv);
+
+    rex::cvar::LoadConfig(config_path);
+
+    CHECK(REXCVAR_GET(test_string_flag).empty());
+    CHECK(rex::cvar::GetFlagSource("test_string_flag") == rex::cvar::Source::kCommandLine);
+    CHECK(REXCVAR_GET(test_int32_flag) == 333);
+  }
+
   SECTION("Boolean negation from the command line beats the config file") {
     {
       std::ofstream file(config_path);
@@ -501,6 +515,31 @@ TEST_CASE("cvar testing utilities", "[cvar]") {
     rex::cvar::testing::ResetAllForTesting();
     CHECK(REXCVAR_GET(test_int32_flag) == 42);  // Back to default
   }
+}
+
+TEST_CASE("cvar TOML merge keeps the host's own keys", "[cvar]") {
+  rex::cvar::testing::ResetAllForTesting();
+
+  REXCVAR_SET(test_int32_flag, 999);
+  REXCVAR_SET(test_string_flag, "custom");
+
+  const std::string existing =
+      "# Host configuration.\r\n"
+      "host_schema = 27\r\n"
+      "test_int32_flag = 5  # old\r\n"
+      "test_bool_flag = true\r\n"
+      "[section]\r\n"
+      "test_int32_flag = 7\r\n";
+  const auto merged = rex::cvar::MergeIntoTOML(existing);
+
+  CHECK(merged.find("# Host configuration.\r\nhost_schema = 27\r\n") == 0);
+  CHECK(merged.find("test_int32_flag = 999\r\n") != std::string::npos);
+  // A line for a flag back at its default is kept with that value.
+  CHECK(merged.find("test_bool_flag = false\r\n") != std::string::npos);
+  // Only top-level keys are flags; the table is left alone.
+  CHECK(merged.find("[section]\r\ntest_int32_flag = 7\r\n") != std::string::npos);
+  // A modified flag without a line lands before the first table.
+  CHECK(merged.find("test_string_flag = \"custom\"\r\n") < merged.find("[section]"));
 }
 
 TEST_CASE("cvar TOML serialization", "[cvar]") {

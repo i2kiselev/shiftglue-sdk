@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -22,6 +23,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
+#include <rex/platform.h>
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
@@ -39,16 +41,36 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
+#if REX_PLATFORM_ANDROID
+  // 10 ms callbacks (SDL's AAudio default is 20 ms, with twice that
+  // buffered): with the stereo stream below the low latency path keeps the
+  // output close to the game.
+  SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");
+  // Opens the device itself in stereo: SDL otherwise takes the 6 channels
+  // Android reports and expands the stereo fold below back to them.
+  SDL_SetHint(SDL_HINT_AUDIO_CHANNELS, "2");
+#endif
 
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
-    return false;
+    StartSilentOutput();
+    return true;
   }
   sdl_initialized_ = true;
+  if (!OpenDevice()) {
+    if (sdl_stream_) {
+      SDL_DestroyAudioStream(sdl_stream_);
+      sdl_stream_ = nullptr;
+    }
+    StartSilentOutput();
+  }
+  return true;
+}
 
+bool SDLAudioDriver::OpenDevice() {
   SDL_AudioSpec desired_spec = {};
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
@@ -74,8 +96,11 @@ bool SDLAudioDriver::Initialize() {
   }
 
   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
-  // Handing it a 6ch stream instead would use SDL's own downmix.
-  if (obtained_spec.channels <= 2) {
+  // Handing it a 6ch stream instead would use SDL's own downmix. Android
+  // reports 6 channels for a phone's stereo speakers, and a 6-channel stream
+  // misses its low latency mixer (about 130 ms behind on a Snapdragon 8
+  // Elite), so it always gets the stereo fold.
+  if (obtained_spec.channels <= 2 || REX_PLATFORM_ANDROID) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
@@ -110,7 +135,10 @@ bool SDLAudioDriver::Initialize() {
 }
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
-  const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+  SubmitHostFrame(memory_->TranslateVirtual<const uint32_t*>(frame_ptr));
+}
+
+void SDLAudioDriver::SubmitHostFrame(const uint32_t* input_frame) {
   float* output_frame;
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
@@ -126,8 +154,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
 
   static uint32_t sdl_submit_count = 0;
   if (sdl_submit_count < 10) {
-    REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
-                 frames_queued_.size() + 1);
+    REXAPU_DEBUG("SDLAudioDriver::SubmitHostFrame: queued_count={}", frames_queued_.size() + 1);
     sdl_submit_count++;
   }
 
@@ -138,7 +165,41 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 }
 
+void SDLAudioDriver::StartSilentOutput() {
+  REXAPU_WARN("No audio output device could be opened; the game runs without sound");
+  sdl_device_channels_ = 2;
+  silent_running_ = true;
+  silent_thread_ = std::thread(&SDLAudioDriver::SilentOutputThread, this);
+}
+
+void SDLAudioDriver::SilentOutputThread() {
+  // One frame is channel_samples_ samples at frame_frequency_ per channel.
+  const auto period = std::chrono::nanoseconds(uint64_t(channel_samples_) * 1000000000ull /
+                                               frame_frequency_);
+  auto next = std::chrono::steady_clock::now();
+  while (silent_running_.load(std::memory_order_acquire)) {
+    next += period;
+    std::this_thread::sleep_until(next);
+    float* buffer = nullptr;
+    {
+      std::unique_lock<std::mutex> guard(frames_mutex_);
+      if (!frames_queued_.empty()) {
+        buffer = frames_queued_.front();
+        frames_queued_.pop();
+        frames_unused_.push(buffer);
+      }
+    }
+    if (buffer) {
+      semaphore_->Release(1, nullptr);
+    }
+  }
+}
+
 void SDLAudioDriver::Shutdown() {
+  if (silent_thread_.joinable()) {
+    silent_running_ = false;
+    silent_thread_.join();
+  }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;

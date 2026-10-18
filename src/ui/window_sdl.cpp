@@ -36,6 +36,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -218,6 +220,27 @@ void WindowSDL::DestroySDLWindow() {
     sdl_window_ = nullptr;
     sdl_window_id_ = 0;
   }
+}
+
+Window::SafeAreaInsets WindowSDL::GetSafeAreaInsets() const {
+  SafeAreaInsets insets;
+  SDL_Rect safe;
+  int width = 0, height = 0, pixel_width = 0, pixel_height = 0;
+  if (!sdl_window_ || !SDL_GetWindowSafeArea(sdl_window_, &safe) ||
+      !SDL_GetWindowSize(sdl_window_, &width, &height) ||
+      !SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height) || width <= 0 ||
+      height <= 0) {
+    return insets;
+  }
+  // The safe area is in window coordinates; the insets are pixels.
+  const auto scale = [](int value, int pixels, int points) {
+    return uint32_t(std::max(0, value) * int64_t(pixels) / points);
+  };
+  insets.left = scale(safe.x, pixel_width, width);
+  insets.top = scale(safe.y, pixel_height, height);
+  insets.right = scale(width - safe.x - safe.w, pixel_width, width);
+  insets.bottom = scale(height - safe.y - safe.h, pixel_height, height);
+  return insets;
 }
 
 void* WindowSDL::GetNativeWindowHandle() const {
@@ -407,6 +430,15 @@ void WindowSDL::FocusImpl() {
   SDL_RaiseWindow(sdl_window_);
 }
 
+void WindowSDL::HandleAppBackground(bool background) {
+  if (!sdl_window_) {
+    return;
+  }
+  // Disconnect the presenter before the native window goes away; attach to
+  // the new one (CreateSurfaceImpl reads it from SDL) on the way back.
+  OnSurfaceChanged(!background);
+}
+
 std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
   if (!sdl_window_) {
     return nullptr;
@@ -431,6 +463,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
         return std::make_unique<CAMetalLayerSurface>(sdl_window_, metal_view, layer);
       }
       SDL_Metal_DestroyView(metal_view);
+    }
+  }
+#elif REX_PLATFORM_ANDROID
+  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    auto* native_window = static_cast<ANativeWindow*>(
+        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+    if (native_window) {
+      return std::make_unique<AndroidNativeWindowSurface>(native_window);
     }
   }
 #else
@@ -583,6 +624,32 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
   }
 }
 
+void WindowSDL::HandleFingerEvent(SDL_Event& event) {
+  int width = 0, height = 0;
+  if (!SDL_GetWindowSizeInPixels(sdl_window_, &width, &height) || width <= 0 || height <= 0) {
+    return;
+  }
+  TouchEvent::Action action;
+  switch (event.type) {
+    case SDL_EVENT_FINGER_DOWN:
+      action = TouchEvent::Action::kDown;
+      break;
+    case SDL_EVENT_FINGER_UP:
+      action = TouchEvent::Action::kUp;
+      break;
+    case SDL_EVENT_FINGER_CANCELED:
+      action = TouchEvent::Action::kCancel;
+      break;
+    default:
+      action = TouchEvent::Action::kMove;
+      break;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  TouchEvent e(this, uint32_t(event.tfinger.fingerID), action, event.tfinger.x * float(width),
+               event.tfinger.y * float(height));
+  OnTouchEvent(e, destruction_receiver);
+}
+
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = GetPixelDensity();
@@ -596,6 +663,7 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
                    int32_t(event.motion.y * density), 0, 0, event.motion.xrel * density,
                    event.motion.yrel * density);
+      e.set_from_touch(event.motion.which == SDL_TOUCH_MOUSEID);
       OnMouseMove(e, destruction_receiver);
       break;
     }
@@ -603,6 +671,7 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     case SDL_EVENT_MOUSE_BUTTON_UP: {
       MouseEvent e(this, TranslateSDLMouseButton(event.button.button),
                    int32_t(event.button.x * density), int32_t(event.button.y * density));
+      e.set_from_touch(event.button.which == SDL_TOUCH_MOUSEID);
       if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         OnMouseDown(e, destruction_receiver);
       } else {

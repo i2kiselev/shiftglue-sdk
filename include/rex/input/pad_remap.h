@@ -38,7 +38,14 @@ PadRemap ParsePadRemap(std::string_view text);
 // The shortest text that parses back to `remap` (empty for identity).
 std::string FormatPadRemap(const PadRemap& remap);
 
+// The pad_remap cvar parsed (cached until the text changes).
+PadRemap CurrentPadRemap();
+
 // Rewrites `pad` through the pad_remap and pad_invert_right_stick_y cvars.
 void ApplyPadRemap(X_INPUT_GAMEPAD& pad);
+
+// The button bits of a chord such as "LS+RS" (names as in pad_remap; the
+// triggers have no bits and are ignored); 0 when empty or unknown.
+uint16_t PadChordButtons(std::string_view text);
 
 }  // namespace rex::input

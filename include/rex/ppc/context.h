@@ -13,15 +13,18 @@
 
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <cstring>
 
 #include <rex/platform/fpscr.h>
 #include <rex/ppc/func.h>
+#include <rex/runtime_api.h>
 #include <rex/types.h>
 
 #include <simde/x86/avx.h>
+#include <simde/x86/fma.h>
 #include <simde/x86/sse.h>
 #include <simde/x86/sse4.1.h>
 
@@ -144,6 +147,18 @@ constexpr uint32_t kRoundUp = 0x02;
 constexpr uint32_t kRoundDown = 0x03;
 constexpr uint32_t kRoundMask = 0x03;
 
+// Fixed IEEE FP mode (NEAR_NATIVE_RESEARCH NN-1.1, cvar ppc_fixed_fp_mode):
+// guest code never turns on flush-to-zero, so VMX code keeps denormals instead
+// of flushing them as the console does, and the per-site host FP control
+// register writes are skipped. Read on the toggles' rare path only.
+extern REX_RUNTIME_DATA std::atomic<bool> g_fixed_fp_mode;
+
+// What db16cyc, the Xenon spin-wait delay hint, does on the host (#601, cvar
+// ppc_db16cyc_hint): 0 nothing, 1 a CPU pause, 2 yield the thread. Generated
+// code tests the flag inline and calls Db16cycHint only when it is set.
+extern REX_RUNTIME_DATA std::atomic<int> g_db16cyc_hint;
+void Db16cycHint(int mode) noexcept;
+
 struct FPSCRRegister {
   uint32_t csr;
 
@@ -158,7 +173,14 @@ struct FPSCRRegister {
   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
 
   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
-  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }
+  // Every write carries the host's exception policy: a context whose csr was
+  // never seeded (a host thread that runs guest code, such as an interrupt
+  // callback) would otherwise unmask every FP exception on its first rounding
+  // or flush write.
+  inline void setcsr(uint32_t csr) noexcept {
+    Platform::InitHostExceptions(csr);
+    Platform::setcsr(csr);
+  }
 
   // Restoring the whole word would unmask every FP exception when csr is 0.
   inline void restoreGuestBits(uint32_t saved) noexcept {
@@ -177,18 +199,27 @@ struct FPSCRRegister {
     setcsr(csr);
   }
 
+  static bool FixedMode() noexcept { return g_fixed_fp_mode.load(std::memory_order_relaxed); }
+
   inline void enableFlushModeUnconditional() noexcept {
+    if (FixedMode()) return;
     csr |= FlushMask;
     setcsr(csr);
   }
 
+  // In fixed mode nothing sets flush-to-zero, so the cached csr is exact.
   inline void disableFlushModeUnconditional() noexcept {
+    if (FixedMode()) {
+      disableFlushMode();
+      return;
+    }
     csr &= ~FlushMask;
     setcsr(csr);
   }
 
   inline void enableFlushMode() noexcept {
     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+      if (FixedMode()) return;
       csr |= FlushMask;
       setcsr(csr);
     }

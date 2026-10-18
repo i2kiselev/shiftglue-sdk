@@ -149,6 +149,15 @@ bool build_lwax(BuilderContext& ctx) {
 }
 
 bool build_lwz(BuilderContext& ctx) {
+  // host_local_lr (NN-1.3): a reload of the LR save slot reads the local.
+  if (ctx.locals.isHostLrLoad(ctx.base)) {
+    if (ctx.config().abiPoisonChecks)
+      ctx.println("\tREX_LR_SLOT_CHECK(0x{:08X}, 0x{:08X}, REX_{}LOAD_U32({}.u32 + {}));",
+                  ctx.fn.base(), ctx.base, ctx.insn.operands[2] == 1 ? "STACK_" : "",
+                  ctx.r(ctx.insn.operands[2]), static_cast<int32_t>(ctx.insn.operands[1]));
+    ctx.println("\t{}.u64 = rex_saved_lr;", ctx.r(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.emit_load_d_form("REX_LOAD_U32", "u64");
   return true;
 }
@@ -221,7 +230,9 @@ bool build_ldarx(BuilderContext& ctx) {
 
 bool build_lfd(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
+  // r1 is the stack pointer: guest stacks are never in the physical view.
+  ctx.print("\t{}.u64 = {}(", ctx.f(ctx.insn.operands[0]),
+            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U64" : "REX_LOAD_U64");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
@@ -239,7 +250,8 @@ bool build_lfdx(BuilderContext& ctx) {
 
 bool build_lfs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
+  ctx.print("\t{}.u32 = {}(", ctx.temp(),
+            ctx.insn.operands[2] == 1 ? "REX_STACK_LOAD_U32" : "REX_LOAD_U32");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
@@ -361,6 +373,15 @@ bool build_sthux(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_stw(BuilderContext& ctx) {
+  // host_local_lr (NN-1.3): the prologue's LR slot store fills the local.
+  if (ctx.locals.hostLr && ctx.locals.hostLrStore == ctx.base) {
+    ctx.println("\trex_saved_lr = {}.u32;", ctx.r(ctx.insn.operands[0]));
+    if (ctx.config().abiPoisonChecks)
+      ctx.println("\tREX_{}STORE_U32({}.u32 + {}, REX_LR_SLOT_POISON(0x{:08X}));",
+                  ctx.insn.operands[2] == 1 ? "STACK_" : "", ctx.r(ctx.insn.operands[2]),
+                  static_cast<int32_t>(ctx.insn.operands[1]), ctx.fn.base());
+    return true;
+  }
   ctx.emit_store_d_form("REX_STORE_U32", "u32", true);
   return true;
 }
@@ -448,7 +469,9 @@ bool build_stdux(BuilderContext& ctx) {
 
 bool build_stfd(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
+  ctx.print("{}", ctx.mmio_check_d_form()      ? "\tREX_MM_STORE_U64("
+                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U64("
+                                              : "\tREX_STORE_U64(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}, {}.u64);", static_cast<int32_t>(ctx.insn.operands[1]),
@@ -487,7 +510,9 @@ bool build_stfiwx(BuilderContext& ctx) {
 bool build_stfs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
-  ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
+  ctx.print("{}", ctx.mmio_check_d_form()      ? "\tREX_MM_STORE_U32("
+                  : ctx.insn.operands[2] == 1 ? "\tREX_STACK_STORE_U32("
+                                              : "\tREX_STORE_U32(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{}, {}.u32);", static_cast<int32_t>(ctx.insn.operands[1]), ctx.temp());
@@ -645,11 +670,57 @@ bool build_stvrx(BuilderContext& ctx) {
 
 bool build_stvx(BuilderContext& ctx) {
   emitVectorEA(ctx, "0xF");
+  // A reference copy logs the store for the verifier's rollback (NN-5.1).
+  if (ctx.isReferenceCopy()) {
+    ctx.println(
+        "\tREX_REF_STORE_V128({},simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
+        "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
+        ctx.ea(), ctx.v(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*)REX_RAW_ADDR({}), "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
       "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
       ctx.ea(), ctx.v(ctx.insn.operands[0]));
+  return true;
+}
+
+//=============================================================================
+// Forms the test corpus exercises (none are used by FH1)
+//=============================================================================
+
+bool build_ldbrx(BuilderContext& ctx) {
+  // Little-endian doubleword load: the swap of the swapped load is the raw value.
+  ctx.print("\t{}.u64 = __builtin_bswap64({}(", ctx.r(ctx.insn.operands[0]),
+            ctx.mmio_check_x_form() ? "REX_MM_LOAD_U64" : "REX_LOAD_U64");
+  if (ctx.insn.operands[1] != 0)
+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  ctx.println("{}.u32));", ctx.r(ctx.insn.operands[2]));
+  return true;
+}
+
+bool build_stdbrx(BuilderContext& ctx) {
+  ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
+  if (ctx.insn.operands[1] != 0)
+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  ctx.println("{}.u32, __builtin_bswap64({}.u64));", ctx.r(ctx.insn.operands[2]),
+              ctx.r(ctx.insn.operands[0]));
+  return true;
+}
+
+bool build_lmw(BuilderContext& ctx) {
+  // Load multiple word: rD..r31 from EA upward (the mirror of stmw).
+  uint32_t rD = ctx.insn.operands[0];
+  int32_t offset = static_cast<int32_t>(ctx.insn.operands[1]);
+  uint32_t rA = ctx.insn.operands[2];
+  if (rA != 0)
+    ctx.println("\t{} = {}.u32 + {};", ctx.ea(), ctx.r(rA), offset);
+  else
+    ctx.println("\t{} = {};", ctx.ea(), offset);
+  for (uint32_t i = rD; i <= 31; ++i) {
+    ctx.println("\t{}.u64 = REX_LOAD_U32({} + {});", ctx.r(i), ctx.ea(), (i - rD) * 4);
+  }
   return true;
 }
 

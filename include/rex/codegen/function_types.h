@@ -60,6 +60,26 @@ struct EmitContext {
     if (referenced)
       referenced->emplace(name);
   }
+
+  /// Read-only image ranges folded into literals (fold_rodata_loads), by
+  /// address, with the widest access seen at each.
+  std::map<uint32_t, uint32_t>* foldedRanges = nullptr;
+
+  /// Prefix for the emitted function's own name (reference copies are emitted
+  /// as `ref_sub_X` beside `sub_X`); calls inside the body are not prefixed.
+  std::string namePrefix;
+
+  /// Set to true by the emission of an instruction a reference copy cannot
+  /// carry (a store the macros do not cover, an atomic, a call): the writer
+  /// then drops the copy. Null when not emitting a reference.
+  bool* referenceBlocked = nullptr;
+
+  void fold(uint32_t address, uint32_t size) const {
+    if (!foldedRanges)
+      return;
+    auto& width = (*foldedRanges)[address];
+    width = std::max(width, size);
+  }
 };
 
 //=============================================================================
@@ -247,6 +267,7 @@ struct JumpTable {
   uint32_t bctrAddress;           // Address of bctr instruction
   uint32_t tableAddress;          // Address of jump table data
   uint8_t indexRegister;          // Register holding switch index
+  uint8_t entryBytes = 4;         // Bytes per table entry (1, 2 or 4)
   std::vector<uint32_t> targets;  // Resolved case targets (internal labels)
 };
 

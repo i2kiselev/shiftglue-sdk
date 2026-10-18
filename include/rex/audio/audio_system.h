@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -31,6 +32,7 @@ namespace rex::audio {
 constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
 
 class AudioDriver;
+class HostFrameSource;
 class XmaDecoder;
 
 class AudioSystem : public system::IAudioSystem {
@@ -47,13 +49,15 @@ class AudioSystem : public system::IAudioSystem {
   X_STATUS RegisterClient(uint32_t callback, uint32_t callback_arg, size_t* out_index);
   void UnregisterClient(size_t index);
   void SubmitFrame(size_t index, uint32_t samples_ptr);
+  // Submits a frame built on the host (rex/audio/host_frame_source.h).
+  void SubmitHostFrame(size_t index, const uint32_t* frame);
 
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
   bool is_paused() const { return paused_; }
-  void Pause();
-  void Resume();
+  void Pause() override;
+  void Resume() override;
 
  protected:
   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
@@ -76,7 +80,11 @@ class AudioSystem : public system::IAudioSystem {
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
 
-  rex::thread::global_critical_region global_critical_region_;
+  // Guards clients_. The global critical region is never taken while holding
+  // it, so its holders can't delay the pump (xenia-edge 12e3b4223d): before,
+  // every pump took the global lock to read the callback, and a guest thread
+  // holding it for I/O stalled the audio worker (#416).
+  std::mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
@@ -84,6 +92,9 @@ class AudioSystem : public system::IAudioSystem {
     uint32_t callback_arg;
     uint32_t wrapped_callback_arg;
     bool in_use;
+    // Builds the client's frames on the host when it chooses to; set at
+    // registration from the process-wide source (SetHostFrameSource).
+    HostFrameSource* host_source;
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();

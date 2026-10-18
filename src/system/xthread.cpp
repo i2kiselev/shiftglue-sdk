@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
 
 #include <fmt/format.h>
 
@@ -25,6 +27,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/context.h>
+#include <rex/platform.h>
 #include <rex/platform/exceptions.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
@@ -45,9 +48,47 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+// Off on Android too until a device measures it (AP-7.0): on the 8-core
+// emulator the raised priority alone (its cores are alike, so nothing is
+// pinned) stalled or derailed fh1-opening-sync in two runs of two.
 REXCVAR_DEFINE_BOOL(latency_critical_thread_placement, false, "Kernel",
                     "Run the main guest thread and the GPU command and vblank threads at "
                     "above-normal priority, on performance cores of hybrid CPUs");
+
+// ARM64 only by default: x86 cores can take microcode assists on denormal
+// operands, which flush-to-zero avoided.
+#if defined(REX_ARCH_ARM64)
+#define REX_FIXED_FP_MODE_DEFAULT true
+#else
+#define REX_FIXED_FP_MODE_DEFAULT false
+#endif
+REXCVAR_DEFINE_BOOL(ppc_fixed_fp_mode, REX_FIXED_FP_MODE_DEFAULT, "CPU",
+                    "Run guest code in IEEE FP mode only: never enable flush-to-zero for VMX "
+                    "code, which skips the host FP control writes around it (NN-1.1). VMX "
+                    "results keep denormals the console flushes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(ppc_db16cyc_hint, 0, "CPU",
+                     "What the guest's spin-wait delay hint (db16cyc) does: 0 nothing, 1 a CPU "
+                     "pause, 2 yield the thread (#601)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace rex::ppc {
+std::atomic<bool> g_fixed_fp_mode{REX_FIXED_FP_MODE_DEFAULT};
+std::atomic<int> g_db16cyc_hint{0};
+
+void Db16cycHint(int mode) noexcept {
+  if (mode == 2) {
+    std::this_thread::yield();
+    return;
+  }
+#if defined(__x86_64__) || defined(_M_X64)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  __asm__ __volatile__("yield");
+#endif
+}
+}  // namespace rex::ppc
 
 namespace rex::system {
 
@@ -766,6 +807,17 @@ void XThread::Execute() {
   if (args.size() > 7)
     ctx->r10.u64 = args[7];
 
+  static std::once_flag fixed_fp_mode_once;
+  std::call_once(fixed_fp_mode_once, [] {
+    rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
+    rex::cvar::RegisterChangeCallback("ppc_fixed_fp_mode", [](std::string_view, std::string_view) {
+      rex::ppc::g_fixed_fp_mode.store(REXCVAR_GET(ppc_fixed_fp_mode), std::memory_order_relaxed);
+    });
+    rex::ppc::g_db16cyc_hint.store(REXCVAR_GET(ppc_db16cyc_hint), std::memory_order_relaxed);
+    rex::cvar::RegisterChangeCallback("ppc_db16cyc_hint", [](std::string_view, std::string_view) {
+      rex::ppc::g_db16cyc_hint.store(REXCVAR_GET(ppc_db16cyc_hint), std::memory_order_relaxed);
+    });
+  });
   ctx->fpscr.InitHost();
 
   // Convert this host thread to a fiber so SwitchTo works bidirectionally.

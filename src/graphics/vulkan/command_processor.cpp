@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -55,6 +56,87 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 250, "GPU/Vulkan",
+                     "With async_shader_compilation, how long a draw whose pipeline a worker is "
+                     "still building waits for it before it is skipped (0: skipped at once). A "
+                     "skipped draw can leave corruption in textures the title renders once, such "
+                     "as menu backgrounds")
+    .range(0, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
+                     "Diagnostics: log each draw that waits at least this many milliseconds for "
+                     "a pipeline a worker is still building (its shaders, whether it is an "
+                     "object slot variant, and whether the wait ran out); 0 turns it off")
+    .range(0, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
+REXCVAR_DECLARE(int32_t, gpu_trace_bins_vblank);
+// On macOS an in-run A/B on an M4 Pro drive gives about 0.8 ms a frame.
+REXCVAR_DEFINE_BOOL(present_upscaler_object_motion, true, "GPU",
+                    "Give a temporal upscaler the motion of each moving object (UP-1.7), "
+                    "not only the camera's");
+
+REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
+                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's)");
+
+REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+                    "Render FH1's predicated tiling passes once: the first tile draws every "
+                    "tile's objects over the whole surface height and the later tiles only "
+                    "resolve their bands (Vulkan FH1 native executor; 3 ms a frame on the "
+                    "Odin 2 Portal). A change rebuilds the renderer between frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_debug_untile, 0, "GPU",
+                     "fh1_untile_predicated_tiling diagnostics: 1 keeps the first tile's "
+                     "predication, 2 draws the later tiles too")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_untile_early_skip, true, "GPU",
+                    "fh1_untile_predicated_tiling: drop a later tile's draw at the start of "
+                    "IssueDraw instead of after its shaders, primitives, samplers and textures "
+                    "were set up (NN-2.1)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_untile_height, 720, "GPU",
+                     "The screen height in guest pixels the untiled first tile renders "
+                     "(fh1_untile_predicated_tiling)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_stable_alpha_to_coverage, true, "GPU",
+                    "Where FH1's MSAA surfaces have fewer host samples (MSAA OFF or 2X), "
+                    "alpha to coverage uses one threshold instead of the console's per-pixel "
+                    "dither, which shimmers on foliage and sign edges without the samples to "
+                    "average it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_barrier_census, false, "GPU",
+                    "Diagnostics: count pipeline barriers by stages, accesses and kind, logged "
+                    "every 600 frames (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_keep_constant_binds, false, "GPU",
+                    "Diagnostics: do not rebind the constants set when only its offsets change "
+                    "(wrong constants), to bound what the per-draw binds cost (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_tiny_draws, false, "GPU",
+                    "Diagnostics: draw only the first triangle of every draw, keeping all "
+                    "state changes (wrong image), to bound per-draw overhead (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_draw_calls, false, "GPU",
+                    "Diagnostics: record every draw's state but not its draw command (wrong "
+                    "image), to bound what the GPU spends per draw (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_native_gpu_profile_draws, false, "GPU",
+                    "Diagnostics: with fh1_native_gpu_profile, also time every draw by its "
+                    "pixel shader (Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_dump_range, "", "GPU",
+                      "Diagnostics: <draw>:<hex address>:<hex length> - before that draw of "
+                      "every frame, write those guest bytes as the GPU has them to "
+                      "fh1_resolve_dump_dir (frame replays)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_coarse_shading_alpha_test, false, "GPU",
+                    "fh1_coarse_shading also shades alpha-tested and killing draws (foliage) "
+                    "per block; alpha to coverage stays per pixel")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_skip_draws_without_effect, true, "GPU",
+                    "Skip FH1 draws that write no surface, outside occlusion queries and "
+                    "without memory export (FH1 native executor, Vulkan)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_cached_uniform_memory, true, "GPU/Vulkan",
                     "Put the per-draw uniform (constant) upload pages in host-cached memory "
                     "rather than write-combined memory")
@@ -89,6 +171,8 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
 
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 
+// Defined by the backend-independent command processor.
+REXCVAR_DECLARE(bool, gpu_template_stats);
 #if REX_HAS_D3D12
 REXCVAR_DECLARE(double, fh1_hud_squeeze);
 #else
@@ -98,9 +182,27 @@ REXCVAR_DEFINE_DOUBLE(fh1_hud_squeeze, 1.0, "GPU",
     .range(1.0, 4.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 #endif
+REXCVAR_DEFINE_DOUBLE(fh1_hud_scale, 1.0, "GPU",
+                      "Vulkan: scale of FH1's HUD around the screen centre, over a game world "
+                      "(menus without one keep their size)")
+    .range(0.5, 1.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(fh1_hud_safe_zone, 0.0, "GPU",
+                      "Vulkan: margin kept clear of FH1's HUD on each side, as a share of the "
+                      "screen (for TVs that crop the picture)")
+    .range(0.0, 0.2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_hud_scale_suspended, false, "GPU",
+                    "Vulkan: set by the host while the game shows no gameplay view (the pause "
+                    "map, menus, loading), whose screens the HUD scale must not shrink")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_async_submission, true, "GPU/Vulkan",
                     "Replay and submit each ended submission's command stream on a worker "
                     "thread, overlapping the driver's recording with the next submission")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(vulkan_debug_labels, false, "GPU/Vulkan",
+                    "Label GPU work for capture tools (VK_EXT_debug_utils): FH1 draw, transfer "
+                    "and clear renderings, resolves, texture loads and uploads")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(vulkan_async_submission_split_draws, 1024, "GPU/Vulkan",
                      "With vulkan_async_submission, end a submission after this many draws "
@@ -113,10 +215,75 @@ REXCVAR_DEFINE_BOOL(vulkan_fh1_native_executor, true, "GPU/Vulkan",
                     "and resolves over native surfaces) instead of the generic render "
                     "target cache; needs dynamic rendering")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_system_constants_memo, true, "GPU/Vulkan",
+                    "Derive the register-dependent system constants again only when the "
+                    "register state or the draw's inputs changed since the previous draw "
+                    "(RECORDER_REPLAY_BACKLOG RR-2.3)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_system_constants_memo_verify, false, "GPU/Vulkan",
+                    "Derive the system constants in full on memo hits too and count the "
+                    "draws whose constants the memo would have left different")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_sampler_fetch_key, true, "GPU/Vulkan",
+                    "Key the per-slot sampler cache and the sampler parameters memo on the "
+                    "fetch words without the texture addresses (only whether their pages are "
+                    "zero), which sampler parameters do not read (RECORDER_PER_DRAW_BACKLOG "
+                    "PD-3.4)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_sampler_fetch_key_verify, false, "GPU/Vulkan",
+                    "On sampler cache hits, derive the sampler parameters again and count the "
+                    "slots whose cached parameters differ")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs, true, "GPU/Vulkan",
+                    "Skip a draw's sampler, texture and target stages when their inputs are "
+                    "unchanged since the last draw, by O(1) tests (NEXT_LEVEL_RESEARCH NL-3.2)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_draw_unchanged_inputs_verify, false, "GPU/Vulkan",
+                    "With gpu_draw_unchanged_inputs, derive every stage in full anyway and "
+                    "count the draws whose skipped stage would have differed")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_constant_census, false, "GPU/Vulkan",
+                    "Count constant buffer uploads by buffer, their bytes and repeats, logged "
+                    "every 600 frames (RECORDER_REPLAY_BACKLOG RR-2.1); apart from the draw "
+                    "cost model because its copies and compares inflate the uploads step")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_draw_cost_model, false, "GPU/Vulkan",
+                    "Diagnostics (RR-0.1): time one draw in 16 step by step on the recorder, "
+                    "and every draw and register run whole, and log the cost by draw band "
+                    "every 600 frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_cache_memory_budget_limits, true, "GPU/Vulkan",
+                    "Lower the texture cache limits to what the device's memory budget "
+                    "(VK_EXT_memory_budget) leaves, for small cards and shared memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(vulkan_memory_budget_log_seconds, 30, "GPU/Vulkan",
+                     "Log each memory heap's usage against its budget, the texture cache and "
+                     "the resident size, with their peaks, this often (0: never)")
+    .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+namespace {
+// gpu_trace_bins_vblank: one line of the registers that place a draw or a
+// resolve in predicated tiling.
+void TraceTiling(const char* what, const rex::graphics::RegisterFile& regs, uint64_t bin_select,
+                 uint64_t bin_mask, uint32_t vblank) {
+  using namespace rex::graphics;
+  REXGPU_INFO(
+      "TILETRACE vb {} {} woff {:08X} wsc {:08X}-{:08X} ssc {:08X}-{:08X} surf {:08X} c0 {:08X} "
+      "d {:08X} mode {:08X} sel {:X} mask {:X} copy {:08X} dst {:08X} dpitch {:08X} dinfo {:08X}",
+      vblank, what, regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+      regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+      regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+      regs.values[XE_GPU_REG_RB_SURFACE_INFO], regs.values[XE_GPU_REG_RB_COLOR_INFO],
+      regs.values[XE_GPU_REG_RB_DEPTH_INFO], regs.values[XE_GPU_REG_RB_MODECONTROL], bin_select,
+      bin_mask, regs.values[XE_GPU_REG_RB_COPY_CONTROL], regs.values[XE_GPU_REG_RB_COPY_DEST_BASE],
+      regs.values[XE_GPU_REG_RB_COPY_DEST_PITCH], regs.values[XE_GPU_REG_RB_COPY_DEST_INFO]);
+}
+}  // namespace
 
 namespace rex::graphics::vulkan {
 
@@ -610,6 +777,8 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/apply_gamma_table_ps.h"
 #include "../shaders/vulkan_spirv/fullscreen_cw_vs.h"
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
+// glslangValidator -V, from ../shaders/hdr_hud_mask.cs.glsl.
+#include "../shaders/vulkan_spirv/hdr_hud_mask_cs.h"
 }  // namespace shaders
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
@@ -622,6 +791,8 @@ const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuf
 
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * kLinkedTypeDescriptorPoolSetCount};
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeStorageImage = {
+    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kLinkedTypeDescriptorPoolSetCount};
 
 // 2x descriptors for texture images because of unsigned and signed bindings.
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeTextures[2] = {
@@ -645,6 +816,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeStorageImage, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -659,6 +834,343 @@ void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
   InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
+}
+
+void VulkanCommandProcessor::DrawCostFrame() {
+  DrawCostModel& m = draw_cost_;
+  const uint64_t batch_ns = record_batch_ns_ - m.batch_ns_at_frame;
+  m.batch_ns_at_frame = record_batch_ns_;
+  const uint64_t draw_records_ns = record_draws_ns_ - m.draws_ns_at_frame;
+  const uint64_t ones_ns = record_ones_ns_ - m.ones_ns_at_frame;
+  const uint64_t calls_ns = record_calls_ns_ - m.calls_ns_at_frame;
+  m.draws_ns_at_frame = record_draws_ns_;
+  m.ones_ns_at_frame = record_ones_ns_;
+  m.calls_ns_at_frame = record_calls_ns_;
+  const uint64_t batch_ticks = record_batch_ticks_ - m.batch_ticks_at_frame;
+  const uint64_t entries = record_entries_ - m.entries_at_frame;
+  m.batch_ticks_at_frame = record_batch_ticks_;
+  m.entries_at_frame = record_entries_;
+  record_cost_enabled_ = REXCVAR_GET(gpu_draw_cost_model);
+  constant_census_enabled_ = REXCVAR_GET(gpu_constant_census);
+  if (system_constants_memo_frames_ + 1 >= 600 && !barrier_census_.empty()) {
+    std::vector<std::pair<uint64_t, std::string>> top;
+    for (const auto& [key, count] : barrier_census_) top.emplace_back(count, key);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    for (size_t i = 0; i < top.size() && i < 24; ++i) {
+      REXGPU_INFO("Barrier census: {:.1f} a frame: {}", double(top[i].first) / 600.0,
+                  top[i].second);
+    }
+    barrier_census_.clear();
+  }
+  if (++system_constants_memo_frames_ >= 600) {
+    if (system_constants_memo_calls_ &&
+        (REXCVAR_GET(gpu_system_constants_memo_verify) || REXCVAR_GET(gpu_draw_cost_model))) {
+      REXGPU_INFO("System constants memo (RR-2.3) over 600 frames: {} of {} draws hit ({:.1f} %), "
+                  "{} verified different",
+                  system_constants_memo_hits_, system_constants_memo_calls_,
+                  100.0 * double(system_constants_memo_hits_) /
+                      double(system_constants_memo_calls_),
+                  system_constants_memo_mismatches_);
+    }
+    if (REXCVAR_GET(gpu_system_constants_memo_verify)) {
+      std::string words;
+      for (uint32_t i = 0; i < 25; ++i) {
+        words += fmt::format(" {}={}", i, system_constants_memo_miss_words_[i]);
+        system_constants_memo_miss_words_[i] = 0;
+      }
+      REXGPU_INFO("System constants memo misses by key word (24 is the epoch):{}", words);
+    }
+    if (constant_census_.draws) {
+      const ConstantCensus& c = constant_census_;
+      static const char* const kNames[] = {"system", "float_vertex", "float_pixel", "bool_loop",
+                                           "fetch"};
+      std::string parts;
+      for (uint32_t i = 0; i < 5; ++i) {
+        parts += fmt::format(" {}: {:.2f} a draw, {:.0f} bytes, {:.1f} % repeats;", kNames[i],
+                             double(c.uploads[i]) / double(c.draws),
+                             c.uploads[i] ? double(c.bytes[i]) / double(c.uploads[i]) : 0.0,
+                             c.uploads[i] ? 100.0 * double(c.repeats[i]) / double(c.uploads[i])
+                                          : 0.0);
+      }
+      REXGPU_INFO("Constant census (RR-2.1) over 600 frames, {} draws:{}", c.draws, parts);
+      constant_census_ = {};
+    }
+    if (record_census_ && record_census_->draws) {
+      RecordCensus& e = *record_census_;
+      const double d = double(std::max<uint64_t>(e.draws, 1));
+      std::vector<std::pair<uint64_t, uint32_t>> top;
+      uint64_t ones = e.ones_other;
+      for (uint32_t r = 0; r < RegisterFile::kRegisterCount; ++r) {
+        if (e.ones[r]) {
+          ones += e.ones[r];
+          top.emplace_back(e.ones[r], r);
+        }
+      }
+      std::sort(top.begin(), top.end(), std::greater<>());
+      std::string top_text;
+      for (size_t t = 0; t < std::min<size_t>(top.size(), 8); ++t) {
+        top_text += fmt::format(" {:04X}={:.2f}", top[t].second, double(top[t].first) / d);
+      }
+      static const char* const kRunNames[] = {"render_state", "float", "fetch", "bool_loop",
+                                              "other"};
+      std::string runs_text;
+      for (uint32_t k = 0; k < 5; ++k) {
+        runs_text += fmt::format(" {} {:.2f} ({:.1f} registers);", kRunNames[k],
+                                 double(e.runs[k]) / d,
+                                 e.runs[k] ? double(e.run_registers[k]) / double(e.runs[k])
+                                           : 0.0);
+      }
+      const uint64_t loads = decode_shader_loads_.exchange(0, std::memory_order_relaxed);
+      const uint64_t loads_skipped =
+          decode_shader_loads_skipped_.exchange(0, std::memory_order_relaxed);
+      const uint64_t scratch_writes = decode_scratch_writes_.exchange(0, std::memory_order_relaxed);
+      const uint64_t scratch_recorded =
+          decode_scratch_recorded_.exchange(0, std::memory_order_relaxed);
+      REXGPU_INFO("Decoder (PD-1.2, PD-1.6) a draw: shader loads {:.2f}, {:.2f} skipped as "
+                  "repeats; scratch writes {:.2f}, {:.2f} recorded",
+                  double(loads) / d, double(loads_skipped) / d, double(scratch_writes) / d,
+                  double(scratch_recorded) / d);
+      const uint64_t source = decode_source_runs_.exchange(0, std::memory_order_relaxed);
+      const uint64_t sub = decode_sub_runs_.exchange(0, std::memory_order_relaxed);
+      REXGPU_INFO("Entry census (PD-0.2) a draw: single registers {:.2f} (top:{}); runs{} "
+                  "calls {:.2f}; batches {:.1f} a frame; elision split {:.2f} sub-runs "
+                  "a source run; scratch writes repeating {:.2f}, written back {:.2f}",
+                  double(ones) / d, top_text, runs_text, double(e.calls) / d,
+                  double(e.batches) / 600.0, source ? double(sub) / double(source) : 0.0,
+                  double(e.scratch_same) / d, double(e.scratch_writeback) / d);
+      record_census_ = std::make_unique<RecordCensus>();
+    }
+    if (fh1_native_executor_ && draw_cost_.enabled) {
+      const uint64_t calls = fh1_native_executor_->prepare_calls() - prepare_calls_at_window_;
+      const uint64_t hits = fh1_native_executor_->prepare_memo_hits() - prepare_hits_at_window_;
+      prepare_calls_at_window_ = fh1_native_executor_->prepare_calls();
+      prepare_hits_at_window_ = fh1_native_executor_->prepare_memo_hits();
+      REXGPU_INFO("Target preparation (PD-3.5) over 600 frames: {} preparations, memo hits "
+                  "{:.1f} %",
+                  calls, calls ? 100.0 * double(hits) / double(calls) : 0.0);
+    }
+    if (draw_cost_.enabled && unchanged_census_.draws && texture_cache_) {
+      UnchangedCensus& u = unchanged_census_;
+      const uint64_t texture_hits = texture_cache_->unchanged_request_hits();
+      const double draws = double(u.draws);
+      const uint64_t texture_mismatches = texture_cache_->unchanged_request_mismatches();
+      REXGPU_INFO("Unchanged inputs (NL-3.2) over 600 frames: {} draws, samplers kept {:.1f} %, "
+                  "texture requests skipped {:.1f} %, texture descriptors kept {:.1f} %; "
+                  "verified different: {} samplers or descriptors, {} texture requests",
+                  u.draws, 100.0 * double(u.samplers) / draws,
+                  100.0 * double(texture_hits - u.textures) / draws,
+                  100.0 * double(u.texture_sections) / draws, u.mismatches,
+                  texture_mismatches - u.texture_mismatches);
+      u.draws = u.samplers = u.texture_sections = u.mismatches = 0;
+      u.texture_mismatches = texture_mismatches;
+      u.textures = texture_hits;
+    }
+    if (bindless_indices_draws_) {
+      REXGPU_INFO("Bindless indices (PD-4) over 600 frames: computed for {:.1f} % of {} draws",
+                  100.0 * double(bindless_indices_computed_) / double(bindless_indices_draws_),
+                  bindless_indices_draws_);
+      bindless_indices_computed_ = bindless_indices_draws_ = 0;
+    }
+    if (constants_set_last_ + constants_set_table_ + constants_set_new_) {
+      REXGPU_INFO("Constants set (PD-3.3) over 600 frames: {} same as the last draw, {} from "
+                  "the frame table, {} new",
+                  constants_set_last_, constants_set_table_, constants_set_new_);
+      constants_set_last_ = constants_set_table_ = constants_set_new_ = 0;
+    }
+    if (sampler_census_.slots || sampler_census_.verified_different) {
+      const SamplerCensus& sc = sampler_census_;
+      const double slots = double(std::max<uint64_t>(sc.slots, 1));
+      REXGPU_INFO("Sampler census (PD-3.4) over 600 frames: {} slots, slot cache hits {:.1f} %, "
+                  "memo hits {:.1f} %, UseSampler {:.1f} %; {} verified different",
+                  sc.slots, 100.0 * double(sc.slot_hits) / slots,
+                  100.0 * double(sc.memo_hits) / slots, 100.0 * double(sc.use_sampler) / slots,
+                  sc.verified_different);
+      sampler_census_ = {};
+    }
+    system_constants_memo_frames_ = 0;
+    system_constants_memo_hits_ = system_constants_memo_calls_ = 0;
+    system_constants_memo_mismatches_ = 0;
+  }
+  if (!m.enabled) {
+    return;
+  }
+  if (m.frame_draws) {
+    // The bands of summarize-low-spec.py: heavy, gameplay, light.
+    DrawCostModel::Band& band =
+        m.bands[m.frame_draws >= 5000 ? 0 : m.frame_draws >= 2000 ? 1 : 2];
+    ++band.frames;
+    band.draws += m.frame_draws;
+    band.sampled += m.frame_sampled;
+    band.issue_ns += m.frame_issue_ns;
+    band.register_ns += m.frame_register_ns;
+    band.batch_ns += batch_ns;
+    band.draw_records_ns += draw_records_ns;
+    band.ones_ns += ones_ns;
+    band.calls_ns += calls_ns;
+    band.batch_ticks += batch_ticks;
+    band.entries += entries;
+    for (uint32_t step = 0; step < kCostStepCount; ++step) band.steps[step] += m.frame_steps[step];
+  }
+  m.frame_draws = m.frame_sampled = m.frame_issue_ns = m.frame_register_ns = 0;
+  std::fill(std::begin(m.frame_steps), std::end(m.frame_steps), 0);
+  if (!m.window_ticks) {
+    m.window_ticks = CostTicks();
+    m.window_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+  }
+  if (++m.frames < 600) {
+    return;
+  }
+  m.frames = 0;
+  // Nanoseconds a tick over the window (1 off x86, where ticks are ns).
+  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  const uint64_t now_ticks = CostTicks();
+  const double ns_per_tick =
+      now_ticks > m.window_ticks ? double(now_ns - m.window_ns) / double(now_ticks - m.window_ticks)
+                                 : 1.0;
+  m.window_ticks = now_ticks;
+  m.window_ns = now_ns;
+  static constexpr const char* kStepNames[kCostStepCount] = {
+      "analysis", "primitives", "translation", "samplers", "textures", "targets",
+      "pipeline", "dynamic", "system_constants", "constant_uploads", "image_infos", "texture_bindings",
+      "constants_set", "texture_sets", "descriptor_update", "binds", "vertex", "memexport",
+      "begin_rendering", "draw"};
+  static constexpr const char* kBandNames[3] = {"heavy", "gameplay", "light"};
+  for (uint32_t b = 0; b < 3; ++b) {
+    DrawCostModel::Band& band = m.bands[b];
+    if (!band.frames || !band.sampled || !band.draws) continue;
+    uint64_t sampled_total = 0;
+    std::string steps;
+    for (uint32_t step = 0; step < kCostStepCount; ++step) {
+      sampled_total += band.steps[step];
+      steps += fmt::format(" {}={:.0f}", kStepNames[step],
+                           ns_per_tick * double(band.steps[step]) / double(band.sampled));
+    }
+    const double issue_per_draw = ns_per_tick * double(band.issue_ns) / double(band.draws);
+    const double t = ns_per_tick / double(band.frames) / 1e6;  // ticks a frame to ms
+    REXGPU_INFO(
+        "Draw cost (RR-0.1) {} band, {} frames, {:.0f} draws a frame: ns a draw{}; steps {:.0f} "
+        "of IssueDraw {:.0f} ns a draw ({:.1f} %); a frame: IssueDraw {:.2f} ms, register runs "
+        "{:.2f} ms, record batches {:.2f} ms (IssueDraw and registers {:.1f} % of it); by entry: "
+        "draw records {:.2f} ms, single registers {:.2f} ms, calls {:.2f} ms (entries {:.1f} % "
+        "of batches, {:.0f} entries a frame, timed batch loop {:.2f} ms)",
+        kBandNames[b], band.frames, double(band.draws) / double(band.frames), steps,
+        ns_per_tick * double(sampled_total) / double(band.sampled), issue_per_draw,
+        100.0 * ns_per_tick * double(sampled_total) / double(band.sampled) / issue_per_draw,
+        double(band.issue_ns) * t, double(band.register_ns) * t,
+        double(band.batch_ns) / double(band.frames) / 1e6,
+        band.batch_ns ? 100.0 * ns_per_tick * double(band.issue_ns + band.register_ns) /
+                            double(band.batch_ns)
+                      : 0.0,
+        double(band.draw_records_ns) * t, double(band.ones_ns) * t, double(band.calls_ns) * t,
+        band.batch_ticks ? 100.0 * double(band.draw_records_ns + band.register_ns + band.ones_ns +
+                                          band.calls_ns) /
+                               double(band.batch_ticks)
+                         : 0.0,
+        double(band.entries) / double(band.frames), double(band.batch_ticks) * t);
+    band = DrawCostModel::Band();
+  }
+}
+
+void VulkanCommandProcessor::LogMemoryBudget() {
+  // Sampled once a second into the perf capture's memory columns (LS-0.4);
+  // logged, with peaks, every vulkan_memory_budget_log_seconds.
+  const auto now = std::chrono::steady_clock::now();
+  if (now - memory_sampled_ < std::chrono::seconds(1)) {
+    return;
+  }
+  memory_sampled_ = now;
+  const int32_t interval = REXCVAR_GET(vulkan_memory_budget_log_seconds);
+  const bool log = interval > 0 && now - memory_budget_logged_ >= std::chrono::seconds(interval);
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanInstance* const vulkan_instance = vulkan_device->vulkan_instance();
+  std::string heaps;
+  uint64_t device_usage = 0;
+  uint64_t device_budget = 0;
+  if (vulkan_device->extensions().ext_EXT_memory_budget &&
+      vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &budget;
+    vulkan_instance->functions().vkGetPhysicalDeviceMemoryProperties2(
+        vulkan_device->physical_device(), &properties);
+    const uint32_t heap_count = properties.memoryProperties.memoryHeapCount;
+    memory_heap_peak_.resize(heap_count);
+    for (uint32_t i = 0; i < heap_count; ++i) {
+      memory_heap_peak_[i] = std::max(memory_heap_peak_[i], uint64_t(budget.heapUsage[i]));
+      const bool device_local =
+          properties.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+      // The largest device-local heap (a discrete card's VRAM; on shared
+      // memory the one heap).
+      if (device_local && budget.heapBudget[i] > device_budget) {
+        device_budget = budget.heapBudget[i];
+        device_usage = budget.heapUsage[i];
+      }
+      heaps += fmt::format("{}heap {}{}: {} of {} MB (peak {})", heaps.empty() ? "" : "; ", i,
+                           device_local ? " device" : "", budget.heapUsage[i] >> 20,
+                           budget.heapBudget[i] >> 20, memory_heap_peak_[i] >> 20);
+    }
+    // Over budget, the OS demotes allocations to system memory, which shows
+    // as stutter (LS-4.6): note each time usage crosses it.
+    const bool over = device_budget && device_usage > device_budget;
+    if (over && !memory_over_budget_) {
+      REXGPU_WARN("Memory: device-local usage {} MB is over its {} MB budget",
+                  device_usage >> 20, device_budget >> 20);
+    }
+    memory_over_budget_ = over;
+  } else {
+    heaps = "no VK_EXT_memory_budget";
+  }
+  const uint64_t resident = perf::ProcessResidentBytes();
+  memory_resident_peak_ = std::max(memory_resident_peak_, resident);
+  const uint64_t textures = texture_cache_ ? texture_cache_->total_host_memory_usage() : 0;
+  const uint64_t surface_count = fh1_native_executor_ ? fh1_native_executor_->surface_count() : 0;
+  const uint64_t surfaces = fh1_native_executor_ ? fh1_native_executor_->surface_bytes() : 0;
+  if (texture_cache_) {
+    // LS-4.2: textures may take what the budget leaves after everything else
+    // (surfaces, buffers, other processes' share is already out of the
+    // budget), with a tenth kept free, and never less than 256 MB.
+    uint32_t limit_mb = 0;
+    if (REXCVAR_GET(texture_cache_memory_budget_limits) && device_budget) {
+      const uint64_t others = device_usage > textures ? device_usage - textures : 0;
+      const uint64_t usable = device_budget - device_budget / 10;
+      limit_mb = uint32_t(std::max<uint64_t>(usable > others ? (usable - others) >> 20 : 0, 256));
+    }
+    texture_cache_->SetMemoryBudgetLimitMb(limit_mb);
+  }
+  PERF_counter_set(kMemoryDeviceUsageMb, int64_t(device_usage >> 20));
+  PERF_counter_set(kMemoryDeviceBudgetMb, int64_t(device_budget >> 20));
+  PERF_counter_set(kFh1SurfaceCount, int64_t(surface_count));
+  PERF_counter_set(kFh1SurfaceMb, int64_t(surfaces >> 20));
+  PERF_counter_set(kTextureCacheMb, int64_t(textures >> 20));
+  PERF_counter_set(kProcessResidentMb, int64_t(resident >> 20));
+  if (!log) {
+    return;
+  }
+  memory_budget_logged_ = now;
+  REXGPU_INFO(
+      "Memory: {}; native surfaces {} ({} MB); textures {} MB; resident {} MB (peak {})", heaps,
+      surface_count, surfaces >> 20, textures >> 20, resident >> 20, memory_resident_peak_ >> 20);
+}
+
+void VulkanCommandProcessor::OnReduceMemory() {
+  if (!texture_cache_) {
+    return;
+  }
+  // Paused between guest commands: reclaim what the GPU has finished
+  // (without waiting; textures still in flight stay), then trim down to the
+  // reduction floor.
+  CheckSubmissionFenceAndDeviceLoss(0);
+  const uint64_t before = texture_cache_->total_host_memory_usage();
+  texture_cache_->CompletedSubmissionUpdated(GetCompletedSubmission());
+  REXGPU_INFO("Low memory while paused: texture cache {} MB, now {} MB", before >> 20,
+              texture_cache_->total_host_memory_usage() >> 20);
 }
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
@@ -790,6 +1302,7 @@ bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     return true;
   }
 
+  if (fh1_native_executor_) fh1_native_executor_->CountEvent("occlusion_query_end");
   if (!EndGuestOcclusionQuery(sample_count_addr)) {
     return write_fallback_result();
   }
@@ -869,8 +1382,14 @@ bool VulkanCommandProcessor::SetupContext() {
   // fullDrawIndexUint32 is not supported.
   guest_shader_pipeline_stages_ =
       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-  push_pixel_texture_descriptors_ = REXCVAR_GET(vulkan_push_texture_descriptors) &&
-                                   vulkan_device->extensions().ext_KHR_push_descriptor;
+  // The Adreno driver leaves pushed textures unreadable in some FH1 draws
+  // (the shadow mask samples its shadow map as a null texture, so the sky
+  // turns white and the paint and foliage lose their shading) while the
+  // same descriptors written into a set work: sets there.
+  push_pixel_texture_descriptors_ =
+      REXCVAR_GET(vulkan_push_texture_descriptors) &&
+      vulkan_device->extensions().ext_KHR_push_descriptor &&
+      device_properties.vendorID != uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm);
   guest_shader_vertex_stages_ = VK_SHADER_STAGE_VERTEX_BIT;
   if (device_properties.tessellationShader) {
     guest_shader_pipeline_stages_ |= VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
@@ -976,6 +1495,19 @@ bool VulkanCommandProcessor::SetupContext() {
         "buffers bound to the compute shader");
     return false;
   }
+  // Transient: storage image for compute shaders.
+  descriptor_set_layout_binding_transient.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_create_info.bindingCount = 1;
+  descriptor_set_layout_create_info.pBindings = &descriptor_set_layout_binding_transient;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::kStorageImageCompute)]) != VK_SUCCESS) {
+    REXGPU_ERROR(
+        "Failed to create a Vulkan descriptor set layout for a storage image "
+        "bound to the compute shader");
+    return false;
+  }
 
   shared_memory_ =
       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
@@ -1055,7 +1587,25 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
+  const bool shared_memory_texel_buffer =
+      SpirvShaderTranslator::Features(GetVulkanDevice()).shared_memory_texel_buffer;
+  if (shared_memory_texel_buffer) {
+    VkBufferViewCreateInfo buffer_view_create_info;
+    buffer_view_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+    buffer_view_create_info.pNext = nullptr;
+    buffer_view_create_info.flags = 0;
+    buffer_view_create_info.buffer = shared_memory_->buffer();
+    buffer_view_create_info.format = VK_FORMAT_R32_UINT;
+    buffer_view_create_info.offset = 0;
+    buffer_view_create_info.range = VK_WHOLE_SIZE;
+    if (dfn.vkCreateBufferView(device, &buffer_view_create_info, nullptr,
+                               &shared_memory_texel_buffer_view_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to create the Vulkan texel buffer view of the shared memory");
+      return false;
+    }
+    REXGPU_INFO("Shared memory reads use one texel buffer");
+  }
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[4];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1083,6 +1633,29 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  if (shared_memory_texel_buffer) {
+    VkDescriptorSetLayoutBinding& texel_buffer_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    texel_buffer_binding.binding = SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
+    texel_buffer_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    texel_buffer_binding.descriptorCount = 1;
+    texel_buffer_binding.stageFlags = guest_shader_stages;
+    texel_buffer_binding.pImmutableSamplers = nullptr;
+  }
+  // UP-1.7: the object slot image, written by scene pixel shaders with host
+  // render targets.
+  object_slot_set_binding_ = !edram_fragment_shader_interlock;
+  if (object_slot_set_binding_) {
+    VkDescriptorSetLayoutBinding& object_slot_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+    object_slot_binding.binding = SpirvShaderTranslator::kObjectSlotImageBinding;
+    object_slot_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    object_slot_binding.descriptorCount = 1;
+    object_slot_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    object_slot_binding.pImmutableSamplers = nullptr;
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1093,16 +1666,26 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[1];
+  VkDescriptorPoolSize descriptor_pool_sizes[3];
+  uint32_t descriptor_pool_size_count = 1;
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  if (shared_memory_texel_buffer) {
+    descriptor_pool_sizes[descriptor_pool_size_count].type =
+        VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+  }
+  if (object_slot_set_binding_) {
+    descriptor_pool_sizes[descriptor_pool_size_count].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    descriptor_pool_sizes[descriptor_pool_size_count++].descriptorCount = 1;
+  }
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
   descriptor_pool_create_info.flags = 0;
   descriptor_pool_create_info.maxSets = 1;
-  descriptor_pool_create_info.poolSizeCount = 1;
+  descriptor_pool_create_info.poolSizeCount = descriptor_pool_size_count;
   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
                                  &shared_memory_and_edram_descriptor_pool_) != VK_SUCCESS) {
@@ -1122,6 +1705,10 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to allocate the Vulkan descriptor set for shared memory and "
         "EDRAM");
+    return false;
+  }
+  // A placeholder until the swap knows the guest output size.
+  if (!CreateObjectSlotImage(1, 1)) {
     return false;
   }
   WriteSharedMemoryAndEdramDescriptorSet();
@@ -1933,6 +2520,7 @@ bool VulkanCommandProcessor::SetupContext() {
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  system_constants_memo_valid_ = false;
 
   StartSubmissionWorker();
 
@@ -1974,6 +2562,8 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
 
   if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    debug_labels_ = REXCVAR_GET(vulkan_debug_labels) &&
+                    GetVulkanDevice()->vulkan_instance()->functions().vkCmdBeginDebugUtilsLabelEXT;
     fh1_native_executor_ = std::make_unique<Fh1NativeExecutor>(*this, *register_file_, *memory_);
     Fh1VulkanExecutorConfig native_config;
     native_config.msaa_2x_supported = render_target_cache_->msaa_2x_attachments_supported();
@@ -1983,6 +2573,8 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     native_config.memory = shared_memory_.get();
     native_config.textures = texture_cache_.get();
     native_config.render_targets = render_target_cache_.get();
+    native_config.untile_height =
+        REXCVAR_GET(fh1_untile_predicated_tiling) ? uint32_t(REXCVAR_GET(fh1_untile_height)) : 0;
     if (!fh1_native_executor_->Initialize(native_config)) {
       REXGPU_WARN("FH1 native executor unavailable; using the render target cache");
       fh1_native_executor_.reset();
@@ -1990,6 +2582,8 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
       // The executor draws and resolves; the cache only answers format queries.
       render_target_cache_->ReleaseEdramBuffer();
     }
+    untile_tiling_ = fh1_native_executor_ && native_config.untile_height;
+    untile_select_all_ = untile_tiling_ && !(REXCVAR_GET(fh1_debug_untile) & 1);
   }
 
   // Frame dumps record and compare the 1x guest-memory mirror. One made
@@ -2024,7 +2618,8 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[2];
+  VkWriteDescriptorSet write_descriptor_sets[4];
+  uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   write_descriptor_set_shared_memory.pNext = nullptr;
@@ -2041,7 +2636,8 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     edram_descriptor_buffer_info.buffer = render_target_cache_->edram_buffer();
     edram_descriptor_buffer_info.offset = 0;
     edram_descriptor_buffer_info.range = VK_WHOLE_SIZE;
-    VkWriteDescriptorSet& write_descriptor_set_edram = write_descriptor_sets[1];
+    VkWriteDescriptorSet& write_descriptor_set_edram =
+        write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_edram.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     write_descriptor_set_edram.pNext = nullptr;
     write_descriptor_set_edram.dstSet = shared_memory_and_edram_descriptor_set_;
@@ -2053,9 +2649,36 @@ void VulkanCommandProcessor::WriteSharedMemoryAndEdramDescriptorSet() {
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
   }
+  if (shared_memory_texel_buffer_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_descriptor_set_texel_buffer =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_descriptor_set_texel_buffer.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_texel_buffer.pNext = nullptr;
+    write_descriptor_set_texel_buffer.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_texel_buffer.dstBinding =
+        SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
+    write_descriptor_set_texel_buffer.dstArrayElement = 0;
+    write_descriptor_set_texel_buffer.descriptorCount = 1;
+    write_descriptor_set_texel_buffer.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    write_descriptor_set_texel_buffer.pImageInfo = nullptr;
+    write_descriptor_set_texel_buffer.pBufferInfo = nullptr;
+    write_descriptor_set_texel_buffer.pTexelBufferView = &shared_memory_texel_buffer_view_;
+  }
+  VkDescriptorImageInfo object_slot_image_info = {VK_NULL_HANDLE, object_slot_image_view_,
+                                                  VK_IMAGE_LAYOUT_GENERAL};
+  if (object_slot_set_binding_ && object_slot_image_view_ != VK_NULL_HANDLE) {
+    VkWriteDescriptorSet& write_descriptor_set_object_slots =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_descriptor_set_object_slots = {};
+    write_descriptor_set_object_slots.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_descriptor_set_object_slots.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_descriptor_set_object_slots.dstBinding = SpirvShaderTranslator::kObjectSlotImageBinding;
+    write_descriptor_set_object_slots.descriptorCount = 1;
+    write_descriptor_set_object_slots.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write_descriptor_set_object_slots.pImageInfo = &object_slot_image_info;
+  }
   vulkan_device->functions().vkUpdateDescriptorSets(
-      vulkan_device->device(), 1 + uint32_t(edram_fragment_shader_interlock),
-      write_descriptor_sets, 0, nullptr);
+      vulkan_device->device(), write_descriptor_set_count, write_descriptor_sets, 0, nullptr);
 }
 
 void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
@@ -2066,9 +2689,12 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   TextureCache::GetConfigDrawResolutionScale(scale_x, scale_y);
   const uint32_t previous_scale_x = texture_cache_->draw_resolution_scale_x();
   const uint32_t previous_scale_y = texture_cache_->draw_resolution_scale_y();
-  // The executor's MSAA setting also applies through a rebuild, at the same
-  // scale.
-  if (scale_x == previous_scale_x && scale_y == previous_scale_y &&
+  // fh1_untile_predicated_tiling sizes the FH1 executor's surfaces, so a
+  // change rebuilds the same components as a scale switch, at the same scale;
+  // so does the executor's MSAA setting.
+  const bool untile_changed =
+      fh1_native_executor_ && REXCVAR_GET(fh1_untile_predicated_tiling) != untile_tiling_;
+  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !untile_changed &&
       !(fh1_native_executor_ && fh1_native_executor_->IsSingleSampleMsaaOutdated())) {
     declined_draw_resolution_scale_ = 0;
     return;
@@ -2129,6 +2755,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
   const auto destroy = [this]() {
     fh1_native_executor_.reset();
     texture_cache_.reset();
+    D3dShaderCacheReset();  // its shaders go with the pipeline cache
     pipeline_cache_.reset();
     render_target_cache_.reset();
   };
@@ -2253,6 +2880,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
   // The system constants hold the scale and the texture cache's swizzles and
   // signs; every constant buffer is uploaded again.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
+  system_constants_memo_valid_ = false;
   current_constant_buffers_up_to_date_ = 0;
   std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
   std::memset(current_float_constant_map_pixel_, 0, sizeof(current_float_constant_map_pixel_));
@@ -2331,6 +2959,39 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_fxaa_extreme_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_hud_mask_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_hud_mask_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_hud_mask_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_hudless_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_camera_pipeline_);
+  DestroyObjectSlotImage();
+  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           swap_object_table_buffers_[i]);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           swap_object_table_memories_[i]);
+    swap_object_table_mappings_[i] = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_camera_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_camera_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_camera_set_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_hud_mask_set_layout_);
+  // Into the destroy queues, emptied below.
+  DestroySceneLut();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_scene_post_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         swap_scene_post_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                         swap_scene_post_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         swap_scene_post_set_layout_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -2392,6 +3053,8 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                                          shared_memory_and_edram_descriptor_pool_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
+                                         shared_memory_texel_buffer_view_);
 
   frame_dump_.reset();
   fh1_native_executor_.reset();
@@ -2485,6 +3148,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   }
   current_submission_wait_semaphores_.clear();
   submission_completed_ = 0;
+  submission_worker_submitted_.store(0, std::memory_order_release);
   submission_open_ = false;
 
   for (VkSemaphore semaphore : semaphores_free_) {
@@ -2639,6 +3303,116 @@ void VulkanCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
 }
 
+// WriteRegistersFromMem for host byte order values (the recorder's runs).
+void VulkanCommandProcessor::WriteRegistersHost(uint32_t start_index, const uint32_t* base,
+                                                uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  struct RegisterCost {
+    DrawCostModel& model;
+    const uint64_t start;
+    explicit RegisterCost(DrawCostModel& m) : model(m), start(m.enabled ? DrawCostNow() : 0) {}
+    ~RegisterCost() {
+      if (model.enabled) model.frame_register_ns += DrawCostNow() - start;
+    }
+  };
+  uint32_t end_index = start_index + num_registers - 1;
+
+  static constexpr uint32_t kHostClassBoundaries[] = {
+      XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0,
+      XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 + 1, XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031,
+      XE_GPU_REG_SHADER_CONSTANT_LOOP_31 + 1};
+  for (uint32_t boundary : kHostClassBoundaries) {
+    if (start_index < boundary && end_index >= boundary) {
+      const uint32_t head = boundary - start_index;
+      WriteRegistersHost(start_index, base, head);
+      WriteRegistersHost(boundary, base + head, num_registers - head);
+      return;
+    }
+  }
+  // After the split, so a run crossing a class is timed once (PD-0.2).
+  RegisterCost register_cost(draw_cost_);
+
+  auto range_has_any_constant_usage = [](const uint64_t* usage_map, uint32_t first_constant,
+                                         uint32_t last_constant) -> bool {
+    if (first_constant > last_constant) {
+      return false;
+    }
+    uint32_t first_word = first_constant >> 6;
+    uint32_t last_word = last_constant >> 6;
+    uint32_t first_bit = first_constant & 63;
+    uint32_t last_bit = last_constant & 63;
+    if (first_word == last_word) {
+      uint32_t bit_count = last_bit - first_bit + 1;
+      uint64_t mask = bit_count == 64 ? UINT64_MAX : ((UINT64_C(1) << bit_count) - 1) << first_bit;
+      return (usage_map[first_word] & mask) != 0;
+    }
+    if (usage_map[first_word] & (UINT64_MAX << first_bit)) {
+      return true;
+    }
+    for (uint32_t word = first_word + 1; word < last_word; ++word) {
+      if (usage_map[word]) {
+        return true;
+      }
+    }
+    uint64_t last_mask = last_bit == 63 ? UINT64_MAX : ((UINT64_C(1) << (last_bit + 1)) - 1);
+    return (usage_map[last_word] & last_mask) != 0;
+  };
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    if (frame_open_) {
+      uint32_t first_float_constant = (start_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      uint32_t last_float_constant = (end_index - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      if (first_float_constant < 256) {
+        uint32_t last_vertex_constant = std::min(last_float_constant, 255u);
+        if (range_has_any_constant_usage(current_float_constant_map_vertex_, first_float_constant,
+                                         last_vertex_constant)) {
+          current_constant_buffers_up_to_date_ &=
+              ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+        }
+      }
+      if (last_float_constant >= 256) {
+        uint32_t first_pixel_constant =
+            first_float_constant >= 256 ? first_float_constant - 256 : 0;
+        uint32_t last_pixel_constant = last_float_constant - 256;
+        if (range_has_any_constant_usage(current_float_constant_map_pixel_, first_pixel_constant,
+                                         last_pixel_constant)) {
+          current_constant_buffers_up_to_date_ &=
+              ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel);
+        }
+      }
+    }
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop);
+    return;
+  }
+
+  if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+      end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
+    std::memcpy(register_file_->values + start_index, base, sizeof(uint32_t) * num_registers);
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    if (texture_cache_) {
+      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    }
+    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+    return;
+  }
+
+  WriteRegistersHostBase(start_index, base, num_registers);
+}
+
 void VulkanCommandProcessor::SparseBindBuffer(VkBuffer buffer, uint32_t bind_count,
                                               const VkSparseMemoryBind* binds,
                                               VkPipelineStageFlags wait_stage_mask) {
@@ -2662,10 +3436,320 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+bool VulkanCommandProcessor::EnsureSwapHudMask() {
+  if (swap_hud_mask_pipeline_ != VK_NULL_HANDLE) return true;
+  if (swap_hud_mask_failed_) return false;
+  swap_hud_mask_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 3;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &swap_hud_mask_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask descriptor set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 2};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &swap_hud_mask_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &swap_hud_mask_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask pipeline layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_hud_mask_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HDR HUD mask descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
+  set_layouts.fill(swap_hud_mask_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = swap_hud_mask_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_hud_mask_descriptor_sets_.data()) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to allocate the HDR HUD mask descriptor sets");
+    return false;
+  }
+  swap_hud_mask_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, swap_hud_mask_pipeline_layout_, shaders::hdr_hud_mask_cs,
+      sizeof(shaders::hdr_hud_mask_cs));
+  if (swap_hud_mask_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("Failed to create the HDR HUD mask pipeline");
+    return false;
+  }
+  swap_hud_mask_failed_ = false;
+  return true;
+}
+
+bool VulkanCommandProcessor::EnsureSwapHudless() {
+  if (swap_hudless_descriptor_pool_ != VK_NULL_HANDLE) return true;
+  if (swap_hudless_failed_ || !EnsureSwapHudMask()) return false;
+  swap_hudless_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  // The gamma pass's source and destination, and the mask pass (two sampled
+  // images and a storage image).
+  VkDescriptorPoolSize pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = 3 * kMaxFramesInFlight;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_hudless_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the HUD-less guest output descriptor pool");
+    return false;
+  }
+  const auto allocate = [&](VkDescriptorSetLayout layout,
+                            std::array<VkDescriptorSet, kMaxFramesInFlight>& sets) {
+    std::array<VkDescriptorSetLayout, kMaxFramesInFlight> layouts;
+    layouts.fill(layout);
+    VkDescriptorSetAllocateInfo set_info = {};
+    set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_info.descriptorPool = swap_hudless_descriptor_pool_;
+    set_info.descriptorSetCount = kMaxFramesInFlight;
+    set_info.pSetLayouts = layouts.data();
+    return dfn.vkAllocateDescriptorSets(device, &set_info, sets.data()) == VK_SUCCESS;
+  };
+  if (!allocate(swap_descriptor_set_layout_sampled_image_, swap_hudless_source_sets_) ||
+      !allocate(swap_descriptor_set_layout_storage_image_, swap_hudless_destination_sets_) ||
+      !allocate(swap_hud_mask_set_layout_, swap_hudless_mask_sets_)) {
+    REXGPU_WARN("Failed to allocate the HUD-less guest output descriptor sets");
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                           swap_hudless_descriptor_pool_);
+    return false;
+  }
+  swap_hudless_failed_ = false;
+  return true;
+}
+
+namespace {
+
+// UP-1.4: each pixel's place in the previous frame, from its depth and the
+// reprojection of the current clip space into the previous one. Motion is in
+// UV units (previous minus current), what the upscalers take with a motion
+// vector scale of the render size.
+const char* const kSwapCameraSource = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform SwapCameraConstants {
+  layout(row_major) mat4 reprojection;
+  uvec2 size;
+  vec2 size_inv;
+  // UP-1.7: the slots in the table (0: camera motion only), and the object
+  // slot depth (host) to the source depth's scale.
+  uint object_count;
+  float object_depth_scale;
+} c;
+layout(set = 0, binding = 0) uniform texture2D source_depth;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
+layout(set = 0, binding = 2, rg16f) writeonly uniform image2D motion;
+layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
+layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
+  layout(row_major) mat4 object_reprojections[];
+};
+void main() {
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(pixel), c.size))) {
+    return;
+  }
+  // FH1 draws the scene turned 180 degrees in clip space (the post pass
+  // turns it back), so the scene depth of a screen pixel is at the opposite
+  // one, and its clip x and y are the screen's negated.
+  // Its depth is reversed (1 near) by the viewport, not the matrix: the
+  // matrix's clip z is the usual D3D depth, 1 minus the stored one, which is
+  // also what the providers take.
+  ivec2 scene_pixel = ivec2(c.size) - 1 - pixel;
+  float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
+  float z = 1.0 - stored_z;
+  // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
+  // depth holds (not something drawn over it without a slot), moves with
+  // its own reprojection.
+  mat4 reprojection = c.reprojection;
+  uint object_count = c.object_count & 0xFFFFu;
+  if (((c.object_count >> 16u) & 1u) != 0u) {
+    uint key = all(lessThan(scene_pixel, imageSize(object_slots)))
+                   ? imageLoad(object_slots, scene_pixel).r : 0u;
+    bool match = abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
+                 (1.0 / 65536.0);
+    imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+    imageStore(motion, pixel,
+               vec4(key != 0u ? vec2(float(key & 0xFFu) / 255.0 * 0.2, match ? 0.1 : -0.1)
+                              : vec2(0.0), 0.0, 0.0));
+    return;
+  }
+  if (object_count != 0u &&
+      all(lessThan(scene_pixel, imageSize(object_slots)))) {
+    uint key = imageLoad(object_slots, scene_pixel).r;
+    uint slot = key & 0xFFu;
+    if (slot != 0u && slot < object_count &&
+        abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
+            (1.0 / 65536.0)) {
+      reprojection = object_reprojections[slot];
+    }
+  }
+  vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
+  vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  vec4 previous = reprojection * vec4(-ndc, z, 1.0);
+  vec2 motion_uv = vec2(0.0);
+  if (previous.w > 1.0e-6) {
+    vec2 previous_ndc = -previous.xy / previous.w;
+    motion_uv = vec2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5) - uv;
+  }
+  imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+  imageStore(motion, pixel, vec4(motion_uv, 0.0, 0.0));
+}
+)";
+
+}  // namespace
+
+bool VulkanCommandProcessor::EnsureSwapCamera() {
+  if (swap_camera_pipeline_ != VK_NULL_HANDLE) return true;
+  if (swap_camera_failed_) return false;
+  swap_camera_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[5] = {};
+  for (uint32_t i = 0; i < 5; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                 : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                        : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 5;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &swap_camera_set_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera descriptor set layout");
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(float) * 16 + sizeof(uint32_t) * 6};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &swap_camera_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &swap_camera_pipeline_layout_) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera pipeline layout");
+    return false;
+  }
+  VkDescriptorPoolSize pool_sizes[3] = {
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxFramesInFlight},
+  };
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kMaxFramesInFlight;
+  pool_info.poolSizeCount = 3;
+  pool_info.pPoolSizes = pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &swap_camera_descriptor_pool_) !=
+      VK_SUCCESS) {
+    REXGPU_WARN("Failed to create the swap camera descriptor pool");
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kMaxFramesInFlight> set_layouts;
+  set_layouts.fill(swap_camera_set_layout_);
+  VkDescriptorSetAllocateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  set_info.descriptorPool = swap_camera_descriptor_pool_;
+  set_info.descriptorSetCount = kMaxFramesInFlight;
+  set_info.pSetLayouts = set_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &set_info, swap_camera_sets_.data()) != VK_SUCCESS) {
+    REXGPU_WARN("Failed to allocate the swap camera descriptor sets");
+    return false;
+  }
+  for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device,
+            VkDeviceSize(sizeof(float) * 16 * Fh1NativeExecutor::kMaxObjectSlots),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kUpload,
+            swap_object_table_buffers_[i], swap_object_table_memories_[i],
+            &swap_object_table_memory_types_[i]) ||
+        dfn.vkMapMemory(device, swap_object_table_memories_[i], 0, VK_WHOLE_SIZE, 0,
+                        &swap_object_table_mappings_[i]) != VK_SUCCESS) {
+      REXGPU_WARN("Failed to create the swap camera object reprojection buffers");
+      return false;
+    }
+  }
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSwapCameraSource, spirv, compile_error)) {
+    REXGPU_WARN("Failed to compile the swap camera shader: {}", compile_error);
+    return false;
+  }
+  swap_camera_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+      vulkan_device, swap_camera_pipeline_layout_, spirv.data(), spirv.size() * sizeof(uint32_t));
+  if (swap_camera_pipeline_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("Failed to create the swap camera pipeline");
+    return false;
+  }
+  swap_camera_failed_ = false;
+  return true;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  DrawCostFrame();
   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   // Settings that rebuild host objects apply between frames.
+  if (object_slot_wanted_width_ &&
+      (object_slot_wanted_width_ != object_slot_image_width_ ||
+       object_slot_wanted_height_ != object_slot_image_height_) &&
+      !device_lost_) {
+    // The shared memory set refers to the image, so nothing may be using it.
+    if (AwaitAllQueueOperationsCompletion()) {
+      AwaitSubmissionWorker();
+      DestroyObjectSlotImage();
+      if (CreateObjectSlotImage(object_slot_wanted_width_, object_slot_wanted_height_)) {
+        WriteSharedMemoryAndEdramDescriptorSet();
+        ResetCachedDrawState();
+        REXGPU_INFO("Object slot image: {}x{}", object_slot_image_width_,
+                    object_slot_image_height_);
+      }
+    }
+  }
   SwitchDrawResolutionScaleIfRequested();
   RecreateSamplersIfSettingsChanged();
 }
@@ -2682,6 +3766,10 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   }
   if (fh1_native_executor_) {
     fh1_native_executor_->OnSwap(frame_current_);
+    // The frame's GPU profile ends before the swap's own work: commands
+    // recorded after the presenter has ended the submission are never
+    // submitted, so the frame's last timestamps never became available.
+    fh1_native_executor_->GpuFrameSwapped();
   }
   if (frame_current_ % 600 == 0) {
     REXGPU_INFO("GPU memory MB: textures {} scaled_resolve {} shared_memory {}",
@@ -2690,8 +3778,11 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 shared_memory_->host_gpu_memory_sparse_used_bytes() >> 20);
   }
 
-  if (!graphics_system_)
+  if (!graphics_system_) {
+    // Frame replays: still a frame, for the frames in flight.
+    EndSubmission(true);
     return;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
@@ -2703,6 +3794,17 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
+  struct SwapGpuTiming {
+    Fh1NativeExecutor* executor;
+    uint64_t token;
+    void End() {
+      if (executor) executor->EndLabelGpuTiming(token);
+      executor = nullptr;
+    }
+    ~SwapGpuTiming() { End(); }
+  } swap_gpu_timing{fh1_native_executor_.get(),
+                    fh1_native_executor_ ? fh1_native_executor_->BeginLabelGpuTiming("swap")
+                                         : UINT64_MAX};
 
   if (async_submission_ && REXCVAR_GET(vulkan_present_on_submission_worker) &&
       present_deferred_presenter_ != presenter) {
@@ -2720,6 +3822,14 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     AwaitSubmissionWorker();
   }
 
+  if (pending_pipeline_binds_) {
+    if (REXCVAR_GET(vulkan_log_pipeline_waits_ms) > 0) {
+      REXGPU_INFO("Frame recorded {} draws with pipelines still being built",
+                  pending_pipeline_binds_);
+    }
+    pending_pipeline_binds_ = 0;
+  }
+
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
@@ -2731,6 +3841,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           "Skipping Vulkan frame presentation due to async placeholder draw "
           "usage in this frame");
     }
+    swap_gpu_timing.End();
     EndSubmission(true);
     return;
   }
@@ -2839,11 +3950,52 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  // present_hdr and the scene-only post: the scene before the HUD, for the
+  // HUD's coverage. Without one (menus), the guest output stays opaque, all
+  // of it HUD, and the scene-only post does not run.
+  VkImageView hud_snapshot_view = VK_NULL_HANDLE;
+  bool hdr_active = false;
+  // UP-1.2: a temporal upscaler reads the guest output without the HUD.
+  const bool hudless_wanted = presenter->WantsHudlessGuestOutput();
+  // UP-1.3: and the depth and camera motion.
+  const bool camera_wanted = presenter->WantsGuestOutputCamera();
+  VkImageView camera_depth_view = VK_NULL_HANDLE;
+  Fh1NativeExecutor::Camera camera = {};
+  const bool scene_fxaa =
+      swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
+  const bool scene_lut =
+      !REXCVAR_GET(scene_lut_path).empty() && REXCVAR_GET(scene_lut_strength) > 0;
+  if (fh1_native_executor_) {
+    hdr_active = ui::vulkan::GetHdrOutputState().active;
+    fh1_native_executor_->SetHudSnapshotEnabled(hdr_active || scene_fxaa || scene_lut ||
+                                                hudless_wanted);
+    hud_snapshot_view =
+        fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    // UP-1.7: once the object slot image is the guest output's size (made
+    // between frames, IssueSwap) and initialised by a camera pass.
+    const bool object_motion_wanted =
+        camera_wanted && object_slot_set_binding_ && REXCVAR_GET(present_upscaler_object_motion);
+    object_slot_wanted_width_ = object_motion_wanted ? guest_output_width : 0;
+    object_slot_wanted_height_ = object_motion_wanted ? guest_output_height : 0;
+    fh1_native_executor_->SetObjectMotionEnabled(
+        object_motion_wanted && object_slot_image_initialized_ &&
+        object_slot_image_width_ == guest_output_width &&
+        object_slot_image_height_ == guest_output_height);
+    fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
+                                                        : 0u);
+    if (camera_wanted) {
+      camera_depth_view =
+          fh1_native_executor_->TakeCameraFrame(guest_output_width, guest_output_height, camera);
+    }
+  }
+
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
-       frontbuffer_format, swap_texture_view, swap_post_effect,
-       swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
+       hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
+       camera](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -2860,6 +4012,21 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         uint32_t swap_frame_index = uint32_t(frame_current_ % kMaxFramesInFlight);
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
+        const bool fxaa_requested = use_fxaa;
+        // The scene-only post (scene_post.cpp) takes the FXAA route through
+        // the FXAA source image and replaces the FXAA pass.
+        bool scene_post = false;
+        bool scene_lut_ready = false;
+        if (hud_snapshot_view != VK_NULL_HANDLE && (scene_fxaa || scene_lut) &&
+            EnsureSwapScenePost()) {
+          scene_lut_ready = UpdateSceneLut() && scene_lut;
+          scene_post = scene_lut_view_ != VK_NULL_HANDLE && (scene_fxaa || scene_lut_ready);
+        }
+        if (scene_fxaa && !scene_post) {
+          // No scene in this frame: nothing to antialias but the HUD.
+          use_fxaa = false;
+        }
+        if (scene_post) use_fxaa = true;
 
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
@@ -3125,62 +4292,396 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             swap_fxaa_source_image_submission_ = GetCurrentSubmission();
 
-            VkDescriptorSet swap_descriptor_fxaa_source =
-                swap_descriptors_fxaa_source_[swap_frame_index];
-            VkDescriptorImageInfo swap_descriptor_fxaa_source_image_info;
-            swap_descriptor_fxaa_source_image_info.sampler = swap_sampler_linear_clamp_;
-            swap_descriptor_fxaa_source_image_info.imageView = swap_fxaa_source_image_view_;
-            swap_descriptor_fxaa_source_image_info.imageLayout =
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            VkWriteDescriptorSet swap_descriptor_fxaa_source_write;
-            swap_descriptor_fxaa_source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            swap_descriptor_fxaa_source_write.pNext = nullptr;
-            swap_descriptor_fxaa_source_write.dstSet = swap_descriptor_fxaa_source;
-            swap_descriptor_fxaa_source_write.dstBinding = 0;
-            swap_descriptor_fxaa_source_write.dstArrayElement = 0;
-            swap_descriptor_fxaa_source_write.descriptorCount = 1;
-            swap_descriptor_fxaa_source_write.descriptorType =
-                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            swap_descriptor_fxaa_source_write.pImageInfo = &swap_descriptor_fxaa_source_image_info;
-            swap_descriptor_fxaa_source_write.pBufferInfo = nullptr;
-            swap_descriptor_fxaa_source_write.pTexelBufferView = nullptr;
-            dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_source_write, 0, nullptr);
+            if (scene_post) {
+              VkDescriptorSet set = swap_scene_post_descriptor_sets_[swap_frame_index];
+              VkDescriptorImageInfo infos[5] = {
+                  {swap_sampler_linear_clamp_, swap_fxaa_source_image_view_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {swap_sampler_linear_clamp_, scene_lut_view_,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                  {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
+              };
+              const VkDescriptorType types[5] = {
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                  VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+              VkWriteDescriptorSet writes[5] = {};
+              for (uint32_t i = 0; i < 5; ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = set;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = types[i];
+                writes[i].pImageInfo = &infos[i];
+              }
+              dfn.vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+              deferred_command_buffer_.CmdVkBindDescriptorSets(
+                  VK_PIPELINE_BIND_POINT_COMPUTE, swap_scene_post_pipeline_layout_, 0, 1, &set, 0,
+                  nullptr);
+              struct {
+                uint32_t size[2];
+                float size_inv[2];
+                uint32_t flags;
+                float lut_strength;
+                float lut_scale;
+                float lut_offset;
+              } constants = {
+                  {guest_output_width, guest_output_height},
+                  {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)},
+                  0,
+                  float(REXCVAR_GET(scene_lut_strength)) / 100.0f,
+                  float(scene_lut_size_ - 1) / float(scene_lut_size_),
+                  0.5f / float(scene_lut_size_)};
+              if (fxaa_requested) {
+                constants.flags |= 1u;
+                if (swap_post_effect == SwapPostEffect::kFxaaExtreme) constants.flags |= 2u;
+                if (!scene_fxaa) constants.flags |= 8u;
+              }
+              if (scene_lut_ready) constants.flags |= 4u;
+              deferred_command_buffer_.CmdVkPushConstants(swap_scene_post_pipeline_layout_,
+                                                          VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                          sizeof(constants), &constants);
+              BindExternalComputePipeline(swap_scene_post_pipeline_);
+              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            } else {
+              VkDescriptorSet swap_descriptor_fxaa_source =
+                  swap_descriptors_fxaa_source_[swap_frame_index];
+              VkDescriptorImageInfo swap_descriptor_fxaa_source_image_info;
+              swap_descriptor_fxaa_source_image_info.sampler = swap_sampler_linear_clamp_;
+              swap_descriptor_fxaa_source_image_info.imageView = swap_fxaa_source_image_view_;
+              swap_descriptor_fxaa_source_image_info.imageLayout =
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              VkWriteDescriptorSet swap_descriptor_fxaa_source_write;
+              swap_descriptor_fxaa_source_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              swap_descriptor_fxaa_source_write.pNext = nullptr;
+              swap_descriptor_fxaa_source_write.dstSet = swap_descriptor_fxaa_source;
+              swap_descriptor_fxaa_source_write.dstBinding = 0;
+              swap_descriptor_fxaa_source_write.dstArrayElement = 0;
+              swap_descriptor_fxaa_source_write.descriptorCount = 1;
+              swap_descriptor_fxaa_source_write.descriptorType =
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+              swap_descriptor_fxaa_source_write.pImageInfo = &swap_descriptor_fxaa_source_image_info;
+              swap_descriptor_fxaa_source_write.pBufferInfo = nullptr;
+              swap_descriptor_fxaa_source_write.pTexelBufferView = nullptr;
+              dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_source_write, 0, nullptr);
 
-            VkDescriptorSet swap_descriptor_fxaa_destination_storage =
-                swap_descriptors_fxaa_destination_storage_[swap_frame_index];
-            VkDescriptorImageInfo swap_descriptor_fxaa_destination_storage_image_info;
-            swap_descriptor_fxaa_destination_storage_image_info.sampler = VK_NULL_HANDLE;
-            swap_descriptor_fxaa_destination_storage_image_info.imageView =
-                vulkan_context.image_view();
-            swap_descriptor_fxaa_destination_storage_image_info.imageLayout =
-                VK_IMAGE_LAYOUT_GENERAL;
-            VkWriteDescriptorSet swap_descriptor_fxaa_destination_storage_write =
-                swap_descriptor_destination_storage_write;
-            swap_descriptor_fxaa_destination_storage_write.dstSet =
-                swap_descriptor_fxaa_destination_storage;
-            swap_descriptor_fxaa_destination_storage_write.pImageInfo =
-                &swap_descriptor_fxaa_destination_storage_image_info;
-            dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_destination_storage_write,
-                                       0, nullptr);
+              VkDescriptorSet swap_descriptor_fxaa_destination_storage =
+                  swap_descriptors_fxaa_destination_storage_[swap_frame_index];
+              VkDescriptorImageInfo swap_descriptor_fxaa_destination_storage_image_info;
+              swap_descriptor_fxaa_destination_storage_image_info.sampler = VK_NULL_HANDLE;
+              swap_descriptor_fxaa_destination_storage_image_info.imageView =
+                  vulkan_context.image_view();
+              swap_descriptor_fxaa_destination_storage_image_info.imageLayout =
+                  VK_IMAGE_LAYOUT_GENERAL;
+              VkWriteDescriptorSet swap_descriptor_fxaa_destination_storage_write =
+                  swap_descriptor_destination_storage_write;
+              swap_descriptor_fxaa_destination_storage_write.dstSet =
+                  swap_descriptor_fxaa_destination_storage;
+              swap_descriptor_fxaa_destination_storage_write.pImageInfo =
+                  &swap_descriptor_fxaa_destination_storage_image_info;
+              dfn.vkUpdateDescriptorSets(device, 1, &swap_descriptor_fxaa_destination_storage_write,
+                                         0, nullptr);
 
-            std::array<VkDescriptorSet, kSwapFxaaDescriptorSetCount> swap_fxaa_descriptor_sets{};
-            swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetSource] = swap_descriptor_fxaa_source;
-            swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetDestination] =
-                swap_descriptor_fxaa_destination_storage;
+              std::array<VkDescriptorSet, kSwapFxaaDescriptorSetCount> swap_fxaa_descriptor_sets{};
+              swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetSource] = swap_descriptor_fxaa_source;
+              swap_fxaa_descriptor_sets[kSwapFxaaDescriptorSetDestination] =
+                  swap_descriptor_fxaa_destination_storage;
+              deferred_command_buffer_.CmdVkBindDescriptorSets(
+                  VK_PIPELINE_BIND_POINT_COMPUTE, swap_fxaa_pipeline_layout_, 0,
+                  uint32_t(swap_fxaa_descriptor_sets.size()), swap_fxaa_descriptor_sets.data(), 0,
+                  nullptr);
+              SwapFxaaConstants swap_fxaa_constants = {
+                  {guest_output_width, guest_output_height},
+                  {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
+              deferred_command_buffer_.CmdVkPushConstants(
+                  swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                  sizeof(swap_fxaa_constants), &swap_fxaa_constants);
+              BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
+                                              ? swap_fxaa_extreme_pipeline_
+                                              : swap_fxaa_pipeline_);
+              deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            }
+          }
+
+          if (hdr_active && hud_snapshot_view != VK_NULL_HANDLE && EnsureSwapHudMask()) {
+            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            VkDescriptorSet hud_mask_set = swap_hud_mask_descriptor_sets_[swap_frame_index];
+            VkDescriptorImageInfo hud_mask_image_infos[3] = {
+                {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL},
+            };
+            VkWriteDescriptorSet hud_mask_writes[3] = {};
+            for (uint32_t i = 0; i < 3; ++i) {
+              hud_mask_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              hud_mask_writes[i].dstSet = hud_mask_set;
+              hud_mask_writes[i].dstBinding = i;
+              hud_mask_writes[i].descriptorCount = 1;
+              hud_mask_writes[i].descriptorType =
+                  i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              hud_mask_writes[i].pImageInfo = &hud_mask_image_infos[i];
+            }
+            dfn.vkUpdateDescriptorSets(device, 3, hud_mask_writes, 0, nullptr);
             deferred_command_buffer_.CmdVkBindDescriptorSets(
-                VK_PIPELINE_BIND_POINT_COMPUTE, swap_fxaa_pipeline_layout_, 0,
-                uint32_t(swap_fxaa_descriptor_sets.size()), swap_fxaa_descriptor_sets.data(), 0,
-                nullptr);
-            SwapFxaaConstants swap_fxaa_constants = {
-                {guest_output_width, guest_output_height},
-                {1.0f / float(guest_output_width), 1.0f / float(guest_output_height)}};
-            deferred_command_buffer_.CmdVkPushConstants(
-                swap_fxaa_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                sizeof(swap_fxaa_constants), &swap_fxaa_constants);
-            BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
-                                            ? swap_fxaa_extreme_pipeline_
-                                            : swap_fxaa_pipeline_);
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                &hud_mask_set, 0, nullptr);
+            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
+            deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(hud_mask_size), hud_mask_size);
+            BindExternalComputePipeline(swap_hud_mask_pipeline_);
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          }
+
+          // UP-1.2: the guest output without the HUD, for a temporal
+          // upscaler: the scene before the HUD through the same gamma ramp,
+          // then the HUD's coverage into its alpha. Not where a frame has no
+          // snapshot (menus), whose guest output is all HUD.
+          VkPipeline hudless_gamma_pipeline = use_pwl_gamma_ramp
+                                                  ? swap_apply_gamma_compute_pwl_pipeline_
+                                                  : swap_apply_gamma_compute_256_entry_table_pipeline_;
+          if (hudless_wanted && hud_snapshot_view != VK_NULL_HANDLE &&
+              hudless_gamma_pipeline != VK_NULL_HANDLE && EnsureSwapHudless() &&
+              vulkan_context.EnsureHudlessImage()) {
+            const VkImage hudless_image = vulkan_context.hudless_image();
+            const VkImageView hudless_view = vulkan_context.hudless_image_view();
+            const bool hudless_written_before = vulkan_context.hudless_ever_written_previously();
+            PushImageMemoryBarrier(
+                hudless_image, guest_output_subresource_range,
+                hudless_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                                       : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                hudless_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
+                                       : 0,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            VkDescriptorSet hudless_source_set = swap_hudless_source_sets_[swap_frame_index];
+            VkDescriptorSet hudless_destination_set =
+                swap_hudless_destination_sets_[swap_frame_index];
+            VkDescriptorSet hudless_mask_set = swap_hudless_mask_sets_[swap_frame_index];
+            VkDescriptorImageInfo hudless_infos[5] = {
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hudless_view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, swap_texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hud_snapshot_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, hudless_view, VK_IMAGE_LAYOUT_GENERAL},
+            };
+            const VkDescriptorSet hudless_write_sets[5] = {
+                hudless_source_set, hudless_destination_set, hudless_mask_set, hudless_mask_set,
+                hudless_mask_set};
+            const uint32_t hudless_write_bindings[5] = {0, 0, 0, 1, 2};
+            VkWriteDescriptorSet hudless_writes[5] = {};
+            for (uint32_t i = 0; i < 5; ++i) {
+              hudless_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              hudless_writes[i].dstSet = hudless_write_sets[i];
+              hudless_writes[i].dstBinding = hudless_write_bindings[i];
+              hudless_writes[i].descriptorCount = 1;
+              hudless_writes[i].descriptorType = (i == 1 || i == 4)
+                                                     ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              hudless_writes[i].pImageInfo = &hudless_infos[i];
+            }
+            dfn.vkUpdateDescriptorSets(device, 5, hudless_writes, 0, nullptr);
+
+            std::array<VkDescriptorSet, kSwapApplyGammaComputeDescriptorSetCount>
+                hudless_gamma_sets{};
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetRamp] =
+                swap_descriptors_gamma_ramp_[2 * gamma_ramp_frame_index_ref +
+                                             uint32_t(use_pwl_gamma_ramp)];
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetSource] = hudless_source_set;
+            hudless_gamma_sets[kSwapApplyGammaComputeDescriptorSetDestination] =
+                hudless_destination_set;
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_apply_gamma_compute_pipeline_layout_, 0,
+                uint32_t(hudless_gamma_sets.size()), hudless_gamma_sets.data(), 0, nullptr);
+            SwapApplyGammaConstants hudless_gamma_constants = {
+                {guest_output_width, guest_output_height}};
+            deferred_command_buffer_.CmdVkPushConstants(
+                swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                sizeof(hudless_gamma_constants), &hudless_gamma_constants);
+            BindExternalComputePipeline(hudless_gamma_pipeline);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+            SubmitBarriers(true);
+            deferred_command_buffer_.CmdVkBindDescriptorSets(
+                VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                &hudless_mask_set, 0, nullptr);
+            const uint32_t hudless_mask_size[2] = {guest_output_width, guest_output_height};
+            deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(hudless_mask_size),
+                                                        hudless_mask_size);
+            BindExternalComputePipeline(swap_hud_mask_pipeline_);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_IMAGE_LAYOUT_GENERAL,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            vulkan_context.SetHudlessWritten();
+          }
+
+          // UP-1.3 and UP-1.4: the depth and camera motion beside it.
+          if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
+              vulkan_context.EnsureCameraImages()) {
+            const bool camera_written_before = vulkan_context.camera_ever_written_previously();
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+              PushImageMemoryBarrier(
+                  image, guest_output_subresource_range,
+                  camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                                        : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  camera_written_before ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask
+                                        : 0,
+                  VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            }
+            SubmitBarriers(true);
+            VkDescriptorSet camera_set = swap_camera_sets_[swap_frame_index];
+            // UP-1.7: the object slots the scene's draws wrote, made
+            // readable (or, the first time, initialised: no objects).
+            const VkImageSubresourceRange object_slot_range =
+                ui::vulkan::util::InitializeSubresourceRange();
+            const bool object_slots_readable = object_slot_image_initialized_;
+            if (object_slots_readable) {
+              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                     VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED, false);
+            } else {
+              PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                     VK_IMAGE_LAYOUT_GENERAL);
+            }
+            SubmitBarriers(true);
+            const std::vector<std::array<float, 16>>& object_table =
+                fh1_native_executor_->object_reprojections_ready();
+            const uint32_t object_count =
+                object_slots_readable
+                    ? uint32_t(std::min<size_t>(object_table.size(),
+                                                Fh1NativeExecutor::kMaxObjectSlots))
+                    : 0;
+            if (object_count) {
+              std::memcpy(swap_object_table_mappings_[swap_frame_index], object_table.data(),
+                          sizeof(float) * 16 * object_count);
+              ui::vulkan::util::FlushMappedMemoryRange(
+                  GetVulkanDevice(), swap_object_table_memories_[swap_frame_index],
+                  swap_object_table_memory_types_[swap_frame_index]);
+            }
+            VkDescriptorImageInfo camera_infos[4] = {
+                {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, object_slot_image_view_, VK_IMAGE_LAYOUT_GENERAL},
+            };
+            const VkDescriptorBufferInfo object_table_info = {
+                swap_object_table_buffers_[swap_frame_index], 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet camera_writes[5] = {};
+            for (uint32_t i = 0; i < 5; ++i) {
+              camera_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              camera_writes[i].dstSet = camera_set;
+              camera_writes[i].dstBinding = i;
+              camera_writes[i].descriptorCount = 1;
+              camera_writes[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              if (i == 4) {
+                camera_writes[i].pBufferInfo = &object_table_info;
+              } else {
+                camera_writes[i].pImageInfo = &camera_infos[i];
+              }
+            }
+            dfn.vkUpdateDescriptorSets(device, 5, camera_writes, 0, nullptr);
+            deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                             swap_camera_pipeline_layout_, 0, 1,
+                                                             &camera_set, 0, nullptr);
+            struct {
+              float reprojection[16];
+              uint32_t size[2];
+              float size_inv[2];
+              uint32_t object_count;
+              float object_depth_scale;
+            } camera_constants;
+            std::memcpy(camera_constants.reprojection, camera.reprojection,
+                        sizeof(camera_constants.reprojection));
+            camera_constants.size[0] = guest_output_width;
+            camera_constants.size[1] = guest_output_height;
+            camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
+            camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
+            camera_constants.object_count =
+                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug)) << 16;
+            if ((frame_current_ % 600) == 0) {
+              REXGPU_INFO("Object motion: {} slots, {} slot draws, {} without the variant",
+                          object_count, object_slot_draws_, object_slot_fallback_draws_);
+            }
+            camera_constants.object_depth_scale = fh1_native_executor_->camera_depth_scale();
+            object_slot_draws_ = 0;
+            object_slot_fallback_draws_ = 0;
+            deferred_command_buffer_.CmdVkPushConstants(swap_camera_pipeline_layout_,
+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                        sizeof(camera_constants),
+                                                        &camera_constants);
+            BindExternalComputePipeline(swap_camera_pipeline_);
+            deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
+                                                   (guest_output_height + 7) / 8, 1);
+            // Cleared for the next frame's scene.
+            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                                   VK_QUEUE_FAMILY_IGNORED, false);
+            SubmitBarriers(true);
+            const VkClearColorValue object_slot_clear = {};
+            deferred_command_buffer_.CmdVkClearColorImage(
+                object_slot_image_, VK_IMAGE_LAYOUT_GENERAL, &object_slot_clear, 1,
+                &object_slot_range);
+            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+            object_slot_image_initialized_ = true;
+            for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
+              PushImageMemoryBarrier(image, guest_output_subresource_range,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                     VK_ACCESS_SHADER_WRITE_BIT,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                     VK_IMAGE_LAYOUT_GENERAL,
+                                     ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            }
+            ui::UpscalerCamera upscaler_camera;
+            upscaler_camera.near_plane = camera.near_plane;
+            upscaler_camera.far_plane = camera.far_plane;
+            upscaler_camera.fov_y = camera.fov_y;
+            upscaler_camera.cut = camera.cut;
+            upscaler_camera.jitter_x = camera.jitter_x;
+            upscaler_camera.jitter_y = camera.jitter_y;
+            vulkan_context.SetCameraWritten(upscaler_camera);
           }
 
           // Insert the release barrier.
@@ -3386,6 +4887,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
+  swap_gpu_timing.End();
   EndSubmission(true);
 }
 
@@ -3511,21 +5013,47 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
   return true;
 }
 
-bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass, const char* cause) {
+bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass,
+                                            std::source_location caller) {
   assert_true(submission_open_);
   SplitPendingBarrier();
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
-      EndRenderPass(cause);
+      EndRenderPass(caller);
     }
     return false;
   }
-  if (!cause) {
-    cause = pending_barriers_image_memory_barriers_.empty() ? "end_buffer_barrier"
-                                                            : "end_image_barrier";
-  }
-  EndRenderPass(cause);
+  EndRenderPass(caller);
   barrier_batch_count_ += pending_barriers_.size();
+  if (REXCVAR_GET(gpu_barrier_census)) {
+    for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+      auto it_next = std::next(it);
+      const bool last = it_next == pending_barriers_.cend();
+      const size_t buffer_end =
+          last ? pending_barriers_buffer_memory_barriers_.size() : it_next->buffer_memory_barriers_offset;
+      const size_t image_end =
+          last ? pending_barriers_image_memory_barriers_.size() : it_next->image_memory_barriers_offset;
+      uint32_t src_access = 0, dst_access = 0;
+      for (size_t i = it->buffer_memory_barriers_offset; i < buffer_end; ++i) {
+        src_access |= pending_barriers_buffer_memory_barriers_[i].srcAccessMask;
+        dst_access |= pending_barriers_buffer_memory_barriers_[i].dstAccessMask;
+      }
+      for (size_t i = it->image_memory_barriers_offset; i < image_end; ++i) {
+        src_access |= pending_barriers_image_memory_barriers_[i].srcAccessMask;
+        dst_access |= pending_barriers_image_memory_barriers_[i].dstAccessMask;
+      }
+      std::string caller_name = caller.function_name();
+      const size_t paren = caller_name.find('(');
+      if (paren != std::string::npos) caller_name.resize(paren);
+      const size_t space = caller_name.rfind(' ');
+      if (space != std::string::npos) caller_name.erase(0, space + 1);
+      ++barrier_census_[fmt::format("{} stages {:X}>{:X} access {:X}>{:X} buffers {} images {}",
+                                    caller_name, uint32_t(it->src_stage_mask),
+                                    uint32_t(it->dst_stage_mask), src_access, dst_access,
+                                    buffer_end - it->buffer_memory_barriers_offset,
+                                    image_end - it->image_memory_barriers_offset)];
+    }
+  }
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
     auto it_next = std::next(it);
     bool is_last = it_next == pending_barriers_.cend();
@@ -3579,6 +5107,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     }
     in_render_pass_ = false;
   }
+  PERF_counter_inc(kGpuRenderings);
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
@@ -3653,6 +5182,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     }
     in_render_pass_ = false;
   }
+  PERF_counter_inc(kGpuRenderings);
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
@@ -3720,13 +5250,35 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
 void VulkanCommandProcessor::SubmitBarriersAndBeginFh1Rendering(
     const VkRenderingInfo& rendering_info, uint64_t id) {
+  const bool was_rendering = in_render_pass_;
+  const bool same_surfaces = was_rendering && current_fh1_rendering_id_ == id;
+  SplitPendingBarrier();
+  const bool barriers = !pending_barriers_.empty();
   SubmitBarriers(false);
   if (in_render_pass_ && current_fh1_rendering_id_ == id) {
+    next_rendering_label_ = nullptr;
     return;
   }
-  EndRenderPass("end_next_rendering");
+  EndRenderPass();
   deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+  PERF_counter_inc(kGpuRenderings);
+  const char* const next_rendering_label = next_rendering_label_;
+  next_rendering_label_ = nullptr;
+  if (debug_labels_) {
+    deferred_command_buffer_.CmdVkBeginDebugLabel(next_rendering_label ? next_rendering_label
+                                                  : (id >> 62) == 3        ? "fh1 resolve fill"
+                                                  : (id >> 63) != 0 ? "fh1 transfer or clear"
+                                                                    : "fh1 draws");
+    rendering_label_open_ = true;
+  }
   ++rendering_begin_count_;
+  if (!was_rendering) {
+    ++fh1_rendering_enders_[last_rendering_ender_];
+  }
+  ++fh1_rendering_causes_[!was_rendering ? kFh1RenderingEndedElsewhere
+                          : barriers     ? (same_surfaces ? kFh1RenderingBarriersSameSurfaces
+                                                          : kFh1RenderingBarriersNewSurfaces)
+                                         : kFh1RenderingNewSurfaces];
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   current_fh1_rendering_id_ = id;
@@ -3802,7 +5354,7 @@ void VulkanCommandProcessor::FlushCpuVisibleResults() {
   }
 }
 
-void VulkanCommandProcessor::EndRenderPass(const char* cause) {
+void VulkanCommandProcessor::EndRenderPass(std::source_location caller) {
   assert_true(submission_open_);
   // Draw scopes have bit 63 clear; transfer and clear scopes set it.
   const bool draw_rendering = int64_t(current_fh1_rendering_id_) > 0;
@@ -3810,8 +5362,10 @@ void VulkanCommandProcessor::EndRenderPass(const char* cause) {
   if (!in_render_pass_) {
     return;
   }
-  if (draw_rendering && fh1_native_executor_) {
-    fh1_native_executor_->CountRenderingEnd(cause ? cause : "end_other");
+  last_rendering_ender_ = caller.function_name();
+  if (rendering_label_open_) {
+    deferred_command_buffer_.CmdVkEndDebugLabel();
+    rendering_label_open_ = false;
   }
   if (current_render_pass_ == VK_NULL_HANDLE) {
     deferred_command_buffer_.CmdVkEndRendering();
@@ -3821,6 +5375,7 @@ void VulkanCommandProcessor::EndRenderPass(const char* cause) {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+  if (fh1_native_executor_) fh1_native_executor_->GpuRenderingEnded(last_rendering_ender_);
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -3839,12 +5394,16 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     bool is_storage_buffer =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferCompute ||
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute;
+    const bool is_storage_image =
+        transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageImageCompute;
     ui::vulkan::LinkedTypeDescriptorSetAllocator& transient_descriptor_allocator =
-        is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                          : transient_descriptor_allocator_uniform_buffer_;
+        is_storage_image    ? transient_descriptor_allocator_storage_image_
+        : is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
+                            : transient_descriptor_allocator_uniform_buffer_;
     VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type =
-        is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    descriptor_count.type = is_storage_image    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                            : is_storage_buffer ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     descriptor_count.descriptorCount =
         transient_descriptor_layout == SingleTransientDescriptorLayout::kStorageBufferPairCompute
             ? 2
@@ -3926,6 +5485,12 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
 const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPipelineLayout(
     size_t texture_count_pixel, size_t sampler_count_pixel, size_t texture_count_vertex,
     size_t sampler_count_vertex) {
+  // PD-4: with bindless textures one layout serves every shader, the bindless
+  // set in place of the vertex texture set and an empty pixel texture set.
+  const bool bindless = texture_cache_ && texture_cache_->bindless();
+  if (bindless) {
+    texture_count_pixel = sampler_count_pixel = texture_count_vertex = sampler_count_vertex = 0;
+  }
   PipelineLayoutKey pipeline_layout_key;
   pipeline_layout_key.texture_count_pixel = uint16_t(texture_count_pixel);
   pipeline_layout_key.sampler_count_pixel = uint16_t(sampler_count_pixel);
@@ -3939,7 +5504,8 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   }
 
   VkDescriptorSetLayout descriptor_set_layout_textures_vertex =
-      GetTextureDescriptorSetLayout(true, texture_count_vertex, sampler_count_vertex);
+      bindless ? texture_cache_->bindless_descriptor_set_layout()
+               : GetTextureDescriptorSetLayout(true, texture_count_vertex, sampler_count_vertex);
   if (descriptor_set_layout_textures_vertex == VK_NULL_HANDLE) {
     REXGPU_ERROR(
         "Failed to obtain a Vulkan descriptor set layout for {} sampled images "
@@ -4087,6 +5653,8 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
     dynamic_stencil_reference_front_update_needed_ = true;
     dynamic_stencil_reference_back_update_needed_ = true;
   }
+  // External pipelines have a static shading rate.
+  dynamic_fragment_shading_rate_update_needed_ = true;
   if (current_external_graphics_pipeline_ == pipeline) {
     return;
   }
@@ -4163,8 +5731,30 @@ Shader* VulkanCommandProcessor::LoadShaderHashed(xenos::ShaderType shader_type,
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
+  static const auto dump_range = [] {
+    uint32_t draw = UINT32_MAX, address = 0, length = 0;
+    const std::string value = REXCVAR_GET(fh1_debug_dump_range);
+    if (value.empty() || std::sscanf(value.c_str(), "%u:%x:%x", &draw, &address, &length) != 3) {
+      draw = UINT32_MAX;
+    }
+    return std::make_tuple(draw, address, length);
+  }();
+  if (std::get<0>(dump_range) != UINT32_MAX && fh1_native_executor_ &&
+      debug_frame_draw_index_ == std::get<0>(dump_range) + 1) {
+    fh1_native_executor_->DumpResolveOutput(std::get<1>(dump_range), std::get<2>(dump_range));
+    texture_cache_->DebugDumpTextures(
+        std::get<1>(dump_range),
+        fmt::format("{}/texture-{:08X}", REXCVAR_GET(fh1_resolve_dump_dir), std::get<1>(dump_range)));
+  }
+  draw_cost_.enabled = REXCVAR_GET(gpu_draw_cost_model);
+  const uint64_t issue_start = draw_cost_.enabled ? DrawCostNow() : 0;
   const bool issued =
       IssueDrawImpl(prim_type, index_count, index_buffer_info, major_mode_explicit);
+  if (draw_cost_.enabled) {
+    draw_cost_.frame_issue_ns += DrawCostNow() - issue_start;
+    ++draw_cost_.frame_draws;
+    draw_cost_.sampling = false;
+  }
   // Hand the worker a part of the frame now and then, when ending the
   // submission neither ends a guest occlusion query nor waits for pipelines.
   if (async_submission_ && submission_split_draws_ && submission_open_ &&
@@ -4193,6 +5783,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const RegisterFile& regs = *register_file_;
   const uint64_t memo_state = StateMemoKey();
   (void)index_buffer_info;
+  const bool unchanged_inputs = REXCVAR_GET(gpu_draw_unchanged_inputs);
+  const bool unchanged_verify = unchanged_inputs && REXCVAR_GET(gpu_draw_unchanged_inputs_verify);
+  ++unchanged_census_.draws;
+  if (draw_cost_.enabled && (++draw_cost_.counter & 15) == 0) {
+    draw_cost_.sampling = true;
+    std::fill(std::begin(draw_cost_.pending), std::end(draw_cost_.pending), 0);
+    draw_cost_.last = DrawCostNow();
+  }
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
@@ -4211,6 +5809,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     return IssueCopy();
+  }
+
+  // A later tile's draw under fh1_untile_predicated_tiling is dropped further
+  // down anyway (the first tile drew its objects over the whole height); the
+  // setup between here and there only fed the skipped draw.
+  if (untile_tiling_ && REXCVAR_GET(fh1_untile_early_skip) &&
+      regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset && TilingPassOfSelect() != 0 &&
+      !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+    fh1_native_executor_->CountEvent("untile_skipped_draw");
+    PERF_counter_inc(kFh1UntileSkippedDraws);
+    ++untile_skipped_draws_;
+    return true;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -4267,6 +5877,74 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+  // LS-3.3: what the draw's host work did, for TemplateStatsDrawHost below.
+  const bool template_stats = REXCVAR_GET(gpu_template_stats);
+  const uint64_t template_transfers_before =
+      template_stats && fh1_native_executor_ ? fh1_native_executor_->transfer_count() : 0;
+  const uint64_t template_uploads_before =
+      template_stats ? shared_memory_->upload_request_count() : 0;
+  if (template_stats) {
+    // What a compiled replay would key on: everything the draw's derivation
+    // reads except the float, bool and loop constants it uploads. Five parts,
+    // so the statistics can tell which one varies.
+    auto mix = [](uint64_t& hash, uint64_t value) {
+      hash = (hash ^ value) * UINT64_C(0xBF58476D1CE4E5B9);
+      hash ^= hash >> 31;
+    };
+    uint64_t parts[6] = {state_hash_, 0, 0, 0, 0, 0};
+    mix(parts[1], uint64_t(uintptr_t(vertex_shader)));
+    mix(parts[1], uint64_t(uintptr_t(pixel_shader)));
+    mix(parts[1], uint64_t(prim_type) << 32 | index_count);
+    mix(parts[1], uint64_t(edram_mode) << 1 | uint64_t(major_mode_explicit));
+    if (index_buffer_info) {
+      mix(parts[2], uint64_t(index_buffer_info->guest_base) << 32 | index_buffer_info->count);
+      mix(parts[2], uint64_t(index_buffer_info->format) << 8 |
+                        uint64_t(index_buffer_info->endianness));
+    }
+    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+      if (!shader) continue;
+      for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+        const uint32_t* words =
+            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + binding.fetch_constant * 6];
+        for (uint32_t i = 0; i < 6; i += 2) {
+          mix(parts[3], uint64_t(words[i]) << 32 | words[i + 1]);
+        }
+      }
+    }
+    const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < 3; ++i) {
+      uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
+      uint32_t bit;
+      while (rex::bit_scan_forward(bits, &bit)) {
+        bits &= ~(UINT32_C(1) << bit);
+        const uint32_t* words =
+            &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + (i * 32 + bit) * 2];
+        mix(parts[4], uint64_t(words[0]) << 32 | words[1]);
+      }
+    }
+    // Part 5: the float, bool and loop constants the shaders read.
+    for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
+      if (!shader) continue;
+      const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+      const uint32_t* base = &regs.values[shader == vertex_shader
+                                              ? XE_GPU_REG_SHADER_CONSTANT_000_X
+                                              : XE_GPU_REG_SHADER_CONSTANT_256_X];
+      for (uint32_t word = 0; word < 4; ++word) {
+        uint64_t bits = map.float_bitmap[word];
+        while (bits) {
+          const uint32_t bit = uint32_t(std::countr_zero(bits));
+          bits &= bits - 1;
+          const uint32_t* c = base + (word * 64 + bit) * 4;
+          mix(parts[5], uint64_t(c[0]) << 32 | c[1]);
+          mix(parts[5], uint64_t(c[2]) << 32 | c[3]);
+        }
+      }
+    }
+    for (uint32_t i = 0; i < 8 + 32; ++i) {
+      mix(parts[5], regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + i]);
+    }
+    TemplateStatsDraw(parts);
+  }
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
       REXGPU_ERROR(
@@ -4286,6 +5964,28 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                                              ps_param_gen_pos))
                    : 0;
 
+  // The memo tables (about 1 MB together) miss the cache on most draws:
+  // fetch the entries this draw will read while primitives and samplers are
+  // processed. A wrong guess (the pipeline's render pass key is the last
+  // draw's) only costs the prefetch.
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                   : 0;
+  auto prefetch = [](const void* entry, size_t size) {
+    const char* bytes = static_cast<const char*>(entry);
+    for (size_t offset = 0; offset < size; offset += 64) {
+      __builtin_prefetch(bytes + offset);
+    }
+  };
+  prefetch(&translation_memos_[StateMemoSlot(
+               memo_state, uint64_t(uintptr_t(vertex_shader)),
+               uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)],
+           sizeof(TranslationMemo));
+  prefetch(&viewport_memos_[StateMemoSlot(
+               memo_state, uint64_t(uintptr_t(pixel_shader)),
+               uint64_t(normalized_depth_control.value) << 32 | normalized_color_mask)],
+           sizeof(ViewportMemo));
+
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
   SpirvShaderTranslator::Modification pixel_shader_modification;
@@ -4293,12 +5993,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
 
+  DrawCostMark(kCostAnalysis);
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
   // in case of a sampler count overflow, and if that happens, all subsystem
   // updates done previously must be performed again because the updates done
   // before the awaiting may be referencing objects destroyed by
   // CompletedSubmissionUpdated.
+  bool sampler_verify_pending = false;
   for (uint32_t i = 0; i < 2; ++i) {
     if (!BeginSubmission(true)) {
       return draw_fail("begin_submission");
@@ -4315,6 +6017,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
     }
+    DrawCostMark(kCostPrimitives);
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
       return true;
@@ -4344,6 +6047,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // Shader modifications, and the translations, which with the same
     // register state and shaders are the last draw's.
     const uint32_t guest_prim_type = uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type);
+    // UP-1.7: scene draws write their object slot.
+    const bool object_slot = pixel_shader && fh1_native_executor_ &&
+                             fh1_native_executor_->IsSceneObjectDraw(*vertex_shader);
+    object_slot_draws_ += uint32_t(object_slot && !i);
     TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
         memo_state, uint64_t(uintptr_t(vertex_shader)),
         uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
@@ -4355,7 +6062,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             uint32_t(primitive_processing_result.host_vertex_shader_type) &&
         translation_memo.interpolator_mask == interpolator_mask &&
         translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
-        translation_memo.depth_control == normalized_depth_control.value) {
+        translation_memo.depth_control == normalized_depth_control.value &&
+        translation_memo.object_slot == object_slot) {
       vertex_shader_modification = translation_memo.vertex_modification;
       pixel_shader_modification = translation_memo.pixel_modification;
       vertex_shader_translation = translation_memo.vertex_translation;
@@ -4369,6 +6077,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                              *pixel_shader, interpolator_mask, ps_param_gen_pos,
                              normalized_depth_control)
                        : SpirvShaderTranslator::Modification(0);
+      if (object_slot) {
+        pixel_shader_modification.pixel.object_slot_output = 1;
+      }
 
       // Translate the shaders now to obtain the sampler bindings.
       vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -4377,12 +6088,34 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
                              pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
                        : nullptr;
-      if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
-                                                    pixel_shader_translation)) {
+      VulkanPipelineCache::TranslationRequest translation_request =
+          pipeline_cache_->RequestShadersTranslated(vertex_shader_translation,
+                                                    pixel_shader_translation);
+      bool memo_translation = true;
+      if (object_slot &&
+          translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+        // The slot-writing variant is translated for the first time: drawn
+        // without the slot (camera motion) until it is ready.
+        pixel_shader_modification.pixel.object_slot_output = 0;
+        pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
+            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value));
+        translation_request = pipeline_cache_->RequestShadersTranslated(
+            vertex_shader_translation, pixel_shader_translation);
+        memo_translation = false;
+        ++object_slot_fallback_draws_;
+      }
+      if (translation_request != VulkanPipelineCache::TranslationRequest::kReady) {
         translation_memo.state_epoch = 0;
+        if (translation_request == VulkanPipelineCache::TranslationRequest::kPending) {
+          // A worker is translating a shader seen for the first time: skipped
+          // like a draw whose pipeline is still being built.
+          frame_used_async_placeholder_pipeline_ = true;
+          return true;
+        }
         return draw_fail("shader_translation");
       }
-      translation_memo.state_epoch = memo_state;
+      translation_memo.state_epoch = memo_translation ? memo_state : 0;
+      translation_memo.object_slot = object_slot;
       translation_memo.vertex_shader = vertex_shader;
       translation_memo.pixel_shader = pixel_shader;
       translation_memo.host_vertex_shader_type =
@@ -4396,6 +6129,14 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       translation_memo.vertex_translation = vertex_shader_translation;
       translation_memo.pixel_translation = pixel_shader_translation;
     }
+    if (!i) {
+      prefetch(&pipeline_memos_[StateMemoSlot(
+                   memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
+                   uint64_t(uintptr_t(pixel_shader_translation)) ^
+                       uint64_t(last_pipeline_render_pass_key_) << 3 ^
+                       uint64_t(normalized_color_mask) << 35)],
+               sizeof(PipelineMemo));
+    }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
@@ -4404,7 +6145,46 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // vertex shader types), the bindings will stay the same.
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
+    DrawCostMark(kCostTranslation);
+    // #528: the player's anisotropy and LOD bias are for the scene's
+    // textures. Depth-only passes (the sun's shadow maps, the depth
+    // pre-pass) and the HUD keep the title's filtering; post passes
+    // read render targets without mips, which never get either.
+    const bool scene_filtering =
+        !fh1_native_executor_ || (normalized_color_mask && !fh1_native_executor_->IsHudTarget());
+    const int32_t anisotropic_override = scene_filtering ? REXCVAR_GET(anisotropic_override)
+                                                         : VulkanTextureCache::kNoSceneFiltering;
+    const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
+    const bool fetch_key = REXCVAR_GET(gpu_sampler_fetch_key);
+    const bool fetch_key_verify = fetch_key && REXCVAR_GET(gpu_sampler_fetch_key_verify);
+    if (!i) {
+      SamplerStageInputs& inputs = sampler_stage_inputs_;
+      if (unchanged_inputs && inputs.valid && inputs.vertex_shader == vertex_shader &&
+          inputs.pixel_shader == pixel_shader && inputs.submission == GetCurrentSubmission() &&
+          inputs.anisotropic_override == anisotropic_override &&
+          inputs.force_trilinear == force_trilinear && inputs.fetch_key == fetch_key &&
+          inputs.scene_filtering == scene_filtering && !fetch_key_verify &&
+          !(inputs.fetch_mask & ~texture_cache_->texture_bindings_in_sync())) {
+        // current_samplers_* still hold this draw's samplers.
+        ++unchanged_census_.samplers;
+        if (!unchanged_verify) {
+          if (!scene_filtering && pixel_shader &&
+              !pixel_shader->GetSamplerBindingsAfterTranslation().empty()) {
+            fh1_native_executor_->CountEvent(normalized_color_mask ? "title_filtering_hud_draws"
+                                                                   : "title_filtering_depth_draws");
+          }
+          break;
+        }
+        verify_samplers_[0] = current_samplers_vertex_;
+        verify_samplers_[1] = current_samplers_pixel_;
+        sampler_verify_pending = true;
+      }
+      inputs.valid = false;
+    }
+    // A verified stage found its inputs unchanged too.
+    texture_inputs_generation_ += !sampler_verify_pending;
     uint32_t samplers_overflowed_count = 0;
+    uint32_t sampler_fetch_mask = 0;
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
@@ -4424,14 +6204,24 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       if (!i) {
         shader_samplers.reserve(shader_sampler_bindings.size());
-        const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
-        const bool force_trilinear = REXCVAR_GET(force_trilinear_filtering);
+        if (!scene_filtering && j && !shader_sampler_bindings.empty()) {
+          fh1_native_executor_->CountEvent(normalized_color_mask ? "title_filtering_hud_draws"
+                                                                 : "title_filtering_depth_draws");
+        }
         for (size_t k = 0; k < shader_sampler_bindings.size(); ++k) {
           const VulkanShader::SamplerBinding& shader_sampler_binding = shader_sampler_bindings[k];
           SamplerCacheEntry& cached = sampler_cache[k];
-          const uint32_t* fetch =
+          const uint32_t* fetch_words =
               &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
                            shader_sampler_binding.fetch_constant * uint32_t(cached.fetch.size())];
+          uint32_t fetch_key_words[6];
+          const uint32_t* fetch = fetch_words;
+          if (fetch_key) {
+            SamplerFetchKey(fetch_words, fetch_key_words);
+            fetch = fetch_key_words;
+          }
+          if (draw_cost_.enabled) ++sampler_census_.slots;
+          sampler_fetch_mask |= UINT32_C(1) << (shader_sampler_binding.fetch_constant & 31);
           const uint32_t binding = shader_sampler_binding.fetch_constant |
                                    (uint32_t(shader_sampler_binding.mag_filter) << 8) |
                                    (uint32_t(shader_sampler_binding.min_filter) << 12) |
@@ -4441,6 +6231,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
               std::memcmp(cached.fetch.data(), fetch, sizeof(cached.fetch)) ||
               cached.anisotropic_override != anisotropic_override ||
               cached.force_trilinear != force_trilinear) {
+            const uint32_t previous_parameters = cached.parameters.value;
             std::memcpy(cached.fetch.data(), fetch, sizeof(cached.fetch));
             cached.binding = binding;
             cached.anisotropic_override = anisotropic_override;
@@ -4456,15 +6247,32 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                 memo.anisotropic_override == anisotropic_override &&
                 memo.force_trilinear == force_trilinear) {
               cached.parameters = memo.parameters;
+              if (draw_cost_.enabled) ++sampler_census_.memo_hits;
+              if (fetch_key_verify &&
+                  texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override).value !=
+                      cached.parameters.value) {
+                ++sampler_census_.verified_different;
+              }
             } else {
-              cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding);
+              cached.parameters = texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override);
               memo.fetch = cached.fetch;
               memo.binding = binding;
               memo.anisotropic_override = anisotropic_override;
               memo.force_trilinear = force_trilinear;
               memo.parameters = cached.parameters;
             }
-            cached.sampler = VK_NULL_HANDLE;
+            // The VkSampler depends only on the parameters: a slot whose new
+            // fetch gives the same parameters keeps it (PD-3.4).
+            if (cached.parameters.value != previous_parameters) {
+              cached.sampler = VK_NULL_HANDLE;
+            }
+          } else {
+            if (draw_cost_.enabled) ++sampler_census_.slot_hits;
+            if (fetch_key_verify &&
+                texture_cache_->GetSamplerParameters(shader_sampler_binding, anisotropic_override).value !=
+                    cached.parameters.value) {
+              ++sampler_census_.verified_different;
+            }
           }
           shader_samplers.emplace_back(cached.parameters, VK_NULL_HANDLE);
         }
@@ -4484,7 +6292,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           shader_sampler = cached.sampler;
         } else {
           shader_sampler = texture_cache_->UseSampler(shader_sampler_pair.first, sampler_overflowed);
+          if (draw_cost_.enabled) ++sampler_census_.use_sampler;
           cached.sampler = shader_sampler;
+          const uint32_t bindless_slot =
+              texture_cache_->bindless() ? texture_cache_->GetSamplerBindlessIndex(shader_sampler)
+                                         : 0;
+          bindless_sampler_generation_ += cached.bindless_slot != bindless_slot;
+          cached.bindless_slot = bindless_slot;
           cached.submission = GetCurrentSubmission();
         }
         shader_sampler_pair.second = shader_sampler;
@@ -4503,6 +6317,29 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
     }
     if (!samplers_overflowed_count) {
+      if (sampler_verify_pending) {
+        auto same = [](const auto& a, const auto& b) {
+          if (a.size() != b.size()) return false;
+          for (size_t k = 0; k < a.size(); ++k) {
+            if (a[k].first.value != b[k].first.value || a[k].second != b[k].second) return false;
+          }
+          return true;
+        };
+        unchanged_census_.mismatches += !same(verify_samplers_[0], current_samplers_vertex_) ||
+                                        !same(verify_samplers_[1], current_samplers_pixel_);
+      }
+      if (!i) {
+        SamplerStageInputs& inputs = sampler_stage_inputs_;
+        inputs.vertex_shader = vertex_shader;
+        inputs.pixel_shader = pixel_shader;
+        inputs.submission = GetCurrentSubmission();
+        inputs.fetch_mask = sampler_fetch_mask;
+        inputs.anisotropic_override = anisotropic_override;
+        inputs.force_trilinear = force_trilinear;
+        inputs.fetch_key = fetch_key;
+        inputs.scene_filtering = scene_filtering;
+        inputs.valid = true;
+      }
       break;
     }
     assert_zero(i);
@@ -4518,17 +6355,19 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
   }
 
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
-
+  DrawCostMark(kCostSamplers);
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
   // submissions must be split) - may perform dispatches and copying.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  texture_cache_->set_skip_unchanged_requests(unchanged_inputs, unchanged_verify);
+  const uint64_t texture_hits_before = texture_cache_->unchanged_request_hits();
   texture_cache_->RequestTextures(used_texture_mask);
+  texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
+  texture_section_skip_allowed_ = unchanged_inputs;
+  texture_section_verify_ = unchanged_verify;
   if (frame_dump_ && frame_dump_->recording()) {
     // Frame dumps: the guest ranges the draw reads.
     const bool guest_dma_indices = primitive_processing_result.index_buffer_type ==
@@ -4544,19 +6383,42 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             : 0);
   }
 
+  DrawCostMark(kCostTextures);
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
   Fh1DrawInfo fh1_draw;
   VulkanRenderTargetCache::RenderPassKey fh1_render_pass_key;
   if (fh1_native_executor_) {
+    {
+      const int32_t trace_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
+      if (trace_vblank >= 0 && trace_swaps_ == uint32_t(trace_vblank)) {
+        TraceTiling("draw", regs, bin_select(), bin_mask(), trace_swaps_);
+      }
+      const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      if (untile_tiling_) {
+        if (window_offset.window_y_offset && TilingPassOfSelect() != 0 &&
+            !(REXCVAR_GET(fh1_debug_untile) & 2)) {
+          // The first tile drew these objects over the whole height.
+          fh1_native_executor_->CountEvent("untile_skipped_draw");
+          PERF_counter_inc(kFh1UntileSkippedDraws);
+          ++untile_skipped_draws_;
+          return true;
+        }
+        if (!window_offset.window_x_offset && !window_offset.window_y_offset) {
+          fh1_native_executor_->EndUntiledTiling();
+        }
+      }
+    }
     fh1_draw.memexport = memexport_writes_possible;
+    fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
     fh1_draw.rasterization_done = is_rasterization_done;
     fh1_draw.normalized_depth_control = normalized_depth_control;
     fh1_draw.normalized_color_mask = normalized_color_mask;
     fh1_draw.vertex_shader = vertex_shader;
     fh1_draw.pixel_shader = pixel_shader;
-    fh1_draw.state_epoch = state_epoch_;
-    fh1_draw.occlusion_query_active = active_occlusion_query_.valid;
+    fh1_draw.state_epoch = unchanged_inputs ? memo_state : state_epoch_;
+    fh1_draw.state_is_hash = unchanged_inputs;
+    fh1_native_executor_->MaybeSnapshotBeforeHud(fh1_draw);
     fh1_native_executor_->PrepareTargets(fh1_draw);
     if (!fh1_native_executor_->BindTargets(fh1_render_pass_key)) {
       return draw_fail("fh1_bind_targets");
@@ -4565,11 +6427,21 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       fh1_native_executor_->NativeDrawIssued(fh1_draw);
       return true;
     }
+    // No surface written, no samples counted, no memory exported: the draw
+    // has no effect (FH1 issues about 140 such a frame).
+    if (!fh1_draw.memexport && !fh1_draw.occlusion_query_active &&
+        fh1_native_executor_->BoundNothing() &&
+        REXCVAR_GET(fh1_skip_draws_without_effect)) {
+      fh1_native_executor_->CountDrawSkippedWithoutEffect();
+      fh1_native_executor_->NativeDrawIssued(fh1_draw);
+      return true;
+    }
   } else if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                            normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
 
+  DrawCostMark(kCostTargets);
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
@@ -4578,6 +6450,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   const VulkanRenderTargetCache::RenderPassKey pipeline_render_pass_key =
       fh1_native_executor_ ? fh1_render_pass_key
                            : render_target_cache_->last_update_render_pass_key();
+  last_pipeline_render_pass_key_ = pipeline_render_pass_key.key;
   PipelineMemo& memo = pipeline_memos_[StateMemoSlot(
       memo_state, uint64_t(uintptr_t(vertex_shader_translation)),
       uint64_t(uintptr_t(pixel_shader_translation)) ^
@@ -4624,14 +6497,88 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
-    frame_used_async_placeholder_pipeline_ = true;
-    return true;
+  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder &&
+      pixel_shader_modification.pixel.object_slot_output) {
+    // UP-1.7: the slot-writing variant's pipeline is new even when the base
+    // one is cached, so waiting for it stalled the frame (up to the wait per
+    // draw, over a second a frame driving into new areas). Draw with the base
+    // pipeline (camera motion) until the variant is built.
+    SpirvShaderTranslator::Modification base_modification = pixel_shader_modification;
+    base_modification.pixel.object_slot_output = 0;
+    auto* base_translation = static_cast<VulkanShader::VulkanTranslation*>(
+        pixel_shader->GetOrCreateTranslation(base_modification.value));
+    VkPipeline base_pipeline;
+    const VulkanPipelineCache::PipelineLayoutProvider* base_layout_provider = nullptr;
+    void* base_handle = nullptr;
+    bool base_is_placeholder = true;
+    if (pipeline_cache_->RequestShadersTranslated(vertex_shader_translation, base_translation) ==
+            VulkanPipelineCache::TranslationRequest::kReady &&
+        pipeline_cache_->ConfigurePipeline(vertex_shader_translation, base_translation,
+                                           primitive_processing_result, normalized_depth_control,
+                                           normalized_color_mask, pipeline_render_pass_key,
+                                           base_pipeline, base_layout_provider, &base_handle)) {
+      pipeline_cache_->GetPipelineAndLayoutByHandle(base_handle, base_pipeline,
+                                                    base_layout_provider, &base_is_placeholder);
+    }
+    if (!base_is_placeholder) {
+      pipeline = base_pipeline;
+      pipeline_layout_provider = base_layout_provider;
+      pipeline_is_placeholder = false;
+      ++object_slot_fallback_draws_;
+    }
   }
-  if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+  // vulkan_async_pipeline_bind_on_replay: recorded with the pipeline bound
+  // when the submission replays, so the recorder moves on and asks for the
+  // next draw's pipeline while the workers build this one.
+  const bool bind_pending_pipeline = REXCVAR_GET(async_shader_compilation) &&
+                                     pipeline_is_placeholder &&
+                                     pipeline_cache_->binds_on_replay() &&
+                                     pipeline_layout_provider != nullptr;
+  if (bind_pending_pipeline) {
+    ++pending_pipeline_binds_;
+  } else if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+    // A skipped draw is missing from its render targets, and a resolve of
+    // them keeps the gap in a texture until the title draws that texture
+    // again: menu and event backgrounds stayed corrupted (issue #328). Give
+    // the worker building the pipeline a moment first; the submission waits
+    // for the workers at its end anyway.
+    const int32_t wait_ms = REXCVAR_GET(vulkan_async_pipeline_wait_ms);
+    if (wait_ms > 0) {
+      const auto wait_start = std::chrono::steady_clock::now();
+      const auto deadline = wait_start + std::chrono::milliseconds(wait_ms);
+      while (pipeline_is_placeholder && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
+                                                      pipeline_layout_provider,
+                                                      &pipeline_is_placeholder);
+      }
+      const auto waited = std::chrono::steady_clock::now() - wait_start;
+      if (const int32_t log_ms = REXCVAR_GET(vulkan_log_pipeline_waits_ms);
+          log_ms > 0 && waited >= std::chrono::milliseconds(log_ms)) {
+        REXGPU_WARN("Draw waited {:.1f} ms for pipeline VS {:016X} PS {:016X} (slot variant {}, "
+                    "{})",
+                    std::chrono::duration<double, std::milli>(waited).count(),
+                    vertex_shader->ucode_data_hash(),
+                    pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                    uint32_t(pixel_shader_modification.pixel.object_slot_output),
+                    pipeline_is_placeholder ? "skipped" : "built");
+      }
+    }
+    if (pipeline_is_placeholder) {
+      frame_used_async_placeholder_pipeline_ = true;
+      return true;
+    }
+  }
+  if (pipeline_layout_provider == nullptr ||
+      (pipeline == VK_NULL_HANDLE && !bind_pending_pipeline)) {
     return draw_fail("pipeline_lookup");
   }
-  if (current_guest_graphics_pipeline_ != pipeline) {
+  if (bind_pending_pipeline) {
+    deferred_command_buffer_.CmdBindPendingGraphicsPipeline(pipeline_handle);
+    // Unknown until the replay: the next draw binds again.
+    current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+    current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  } else if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
@@ -4667,6 +6614,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
 
+  DrawCostMark(kCostPipeline);
   bool host_render_targets_used =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
   uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
@@ -4691,6 +6639,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   // interlocks case completely - apply the viewport and the scissor offset
   // directly to pixel address and to things like ps_param_gen.
   const double hud_squeeze = REXCVAR_GET(fh1_hud_squeeze);
+  // The HUD scale and safe zone shrink or grow the HUD around the centre,
+  // only for HUD draws over this frame's scene (fh1_native_executor).
+  const double hud_scale =
+      fh1_native_executor_ && fh1_native_executor_->IsHudDraw() &&
+              !REXCVAR_GET(fh1_hud_scale_suspended)
+          ? REXCVAR_GET(fh1_hud_scale) * (1.0 - 2.0 * REXCVAR_GET(fh1_hud_safe_zone))
+          : 1.0;
   const uint32_t viewport_resolution_scale = draw_resolution_scale_x | draw_resolution_scale_y << 16;
   ViewportMemo& viewport_memo = viewport_memos_[StateMemoSlot(
       memo_state, uint64_t(uintptr_t(pixel_shader)),
@@ -4699,7 +6654,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       viewport_memo.depth_control == normalized_depth_control.value &&
       viewport_memo.color_mask == normalized_color_mask &&
       viewport_memo.resolution_scale == viewport_resolution_scale &&
-      viewport_memo.hud_squeeze == hud_squeeze) {
+      viewport_memo.hud_squeeze == hud_squeeze && viewport_memo.hud_scale == hud_scale) {
     viewport_info = viewport_memo.info;
   } else {
     draw_util::GetHostViewportInfo(
@@ -4716,14 +6671,42 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       viewport_info.ndc_scale[0] = float(viewport_info.ndc_scale[0] / hud_squeeze);
       viewport_info.ndc_offset[0] = float(viewport_info.ndc_offset[0] / hud_squeeze);
     }
+    if (hud_scale != 1.0) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        viewport_info.ndc_scale[i] = float(viewport_info.ndc_scale[i] * hud_scale);
+        viewport_info.ndc_offset[i] = float(viewport_info.ndc_offset[i] * hud_scale);
+      }
+    }
     viewport_memo.state_epoch = memo_state;
     viewport_memo.pixel_shader = pixel_shader;
     viewport_memo.depth_control = normalized_depth_control.value;
     viewport_memo.color_mask = normalized_color_mask;
     viewport_memo.resolution_scale = viewport_resolution_scale;
     viewport_memo.hud_squeeze = hud_squeeze;
+    viewport_memo.hud_scale = hud_scale;
     viewport_memo.info = viewport_info;
   }
+  // UP-1.5: a temporal upscaler's sub-pixel jitter, on the scene's draws
+  // only (a host pixel is 2 / extent in NDC).
+  float jitter_x, jitter_y;
+  if (fh1_native_executor_ && fh1_native_executor_->GetSceneJitter(jitter_x, jitter_y) &&
+      viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    viewport_info.ndc_offset[0] += 2.0f * jitter_x / float(viewport_info.xy_extent[0]);
+    viewport_info.ndc_offset[1] += 2.0f * jitter_y / float(viewport_info.xy_extent[1]);
+  }
+
+  // fh1_coarse_shading leaves draws whose coverage the shader decides at full
+  // rate: shaded per block, Turnip turns alpha-tested foliage into dithered
+  // ghosts.
+  // With fh1_coarse_shading_alpha_test, only alpha to coverage stays at full
+  // rate: alpha-tested and killing draws are shaded per block too, their
+  // edges in steps of the block.
+  draw_coverage_from_shader_ =
+      pixel_shader &&
+      (REXCVAR_GET(fh1_coarse_shading_alpha_test)
+           ? bool(regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable)
+           : (pixel_shader->kills_pixels() ||
+              draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>())));
 
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
@@ -4759,10 +6742,12 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
 
+  DrawCostMark(kCostDynamicState);
   // Update system constants before uploading them.
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
+  DrawCostMark(kCostSystemConstants);
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -4807,6 +6792,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      SharedMemory::UploadKindScope upload_kind(*shared_memory_, SharedMemory::UploadKind::kVertex);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
@@ -4819,7 +6805,21 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
+  if (template_stats) {
+    // The image views and samplers bound (both stages, in binding order).
+    uint64_t views = 0;
+    for (const VkDescriptorImageInfo& info : descriptor_write_image_info_) {
+      views = (views ^ uint64_t(uintptr_t(info.imageView))) * UINT64_C(0xBF58476D1CE4E5B9);
+      views = (views ^ uint64_t(uintptr_t(info.sampler))) * UINT64_C(0xBF58476D1CE4E5B9);
+      views ^= views >> 31;
+    }
+    TemplateStatsDrawHost(
+        views,
+        fh1_native_executor_ && fh1_native_executor_->transfer_count() != template_transfers_before,
+        shared_memory_->upload_request_count() != template_uploads_before);
+  }
 
+  DrawCostMark(kCostVertexBuffers);
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
@@ -4865,7 +6865,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
 
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
-      SubmitBarriers(true, "end_index_copy");
+      SubmitBarriers(true);
 
       VkBufferCopy guest_dma_index_copy_region = {};
       guest_dma_index_copy_region.srcOffset = primitive_processing_result.guest_index_base;
@@ -4901,6 +6901,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  DrawCostMark(kCostMemexport);
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
@@ -4912,12 +6913,22 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         render_target_cache_->last_update_framebuffer());
   }
 
+  DrawCostMark(kCostBeginRendering);
+  uint64_t draw_gpu_timing = UINT64_MAX;
+  if (fh1_native_executor_ && REXCVAR_GET(fh1_native_gpu_profile_draws)) {
+    draw_gpu_timing = fh1_native_executor_->BeginLabelGpuTiming(
+        fmt::format("P {:016X}", pixel_shader ? pixel_shader->ucode_data_hash() : 0).c_str());
+  }
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDraw(
+        REXCVAR_GET(fh1_debug_tiny_draws)
+            ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
+            : primitive_processing_result.host_draw_vertex_count,
+        1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
     switch (primitive_processing_result.index_buffer_type) {
@@ -4949,11 +6960,16 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             ? VK_INDEX_TYPE_UINT16
             : VK_INDEX_TYPE_UINT32);
     ++pending_draw_calls_;
-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+    if (!REXCVAR_GET(fh1_debug_skip_draw_calls)) deferred_command_buffer_.CmdVkDrawIndexed(
+        REXCVAR_GET(fh1_debug_tiny_draws)
+            ? std::min(primitive_processing_result.host_draw_vertex_count, uint32_t(3))
+            : primitive_processing_result.host_draw_vertex_count,
+        1,
                                               0, 0, 0);
   }
   Checkpoint(CheckpointKind::kDrawEnd);
   if (fh1_native_executor_) {
+    fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
   }
 
@@ -4987,6 +7003,15 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     }
   }
 
+  DrawCostMark(kCostDraw);
+  if (draw_cost_.sampling) {
+    // Only draws that completed count; one that returned early is dropped.
+    for (uint32_t step = 0; step < kCostStepCount; ++step) {
+      draw_cost_.frame_steps[step] += draw_cost_.pending[step];
+    }
+    ++draw_cost_.frame_sampled;
+    draw_cost_.sampling = false;
+  }
   return true;
 }
 
@@ -5202,6 +7227,10 @@ bool VulkanCommandProcessor::IssueCopy() {
     frame_dump_->RecordCopyInputs();
   }
   if (fh1_native_executor_) {
+    const int32_t trace_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
+    if (trace_vblank >= 0 && trace_swaps_ == uint32_t(trace_vblank)) {
+      TraceTiling("resolve", *register_file_, bin_select(), bin_mask(), trace_swaps_);
+    }
     uint32_t written_address, written_length;
     return fh1_native_executor_->NativeResolve(written_address, written_length);
   }
@@ -5638,6 +7667,7 @@ void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   if (active_occlusion_query_.valid && !active_occlusion_query_.host_ended &&
       occlusion_query_pool_ != VK_NULL_HANDLE) {
     if (BeginSubmission(true)) {
+      EndRenderPass();
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       EndSubmission(false);
@@ -5663,7 +7693,7 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(uint32_t sample_count_addr
     return false;
   }
 
-  EndRenderPass("end_query");
+  EndRenderPass();
 
   DeferredCommandBuffer& command_buffer = deferred_command_buffer();
   if (active_occlusion_query_.valid && !active_occlusion_query_.host_ended) {
@@ -5696,7 +7726,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
 
   CollectOcclusionQueryResults();
   if (!ended.host_ended) {
-    EndRenderPass("end_query");
+    EndRenderPass();
 
     DeferredCommandBuffer& command_buffer = deferred_command_buffer();
     command_buffer.CmdVkEndQuery(occlusion_query_pool_, ended.host_index);
@@ -5796,8 +7826,20 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   const VkDevice device = vulkan_device->device();
 
   size_t fences_total = submissions_in_flight_fences_.size();
+  if (async_submission_) {
+    // Fences the worker has not submitted yet are not checked.
+    const uint64_t submitted = submission_worker_submitted_.load(std::memory_order_acquire);
+    fences_total = std::min(
+        fences_total, size_t(submitted > submission_completed_ ? submitted - submission_completed_
+                                                               : 0));
+  }
   size_t fences_awaited = 0;
   if (await_submission > submission_completed_) {
+    if (async_submission_) {
+      AwaitSubmissionWorkerSubmitted(await_submission);
+      fences_total = size_t(submission_worker_submitted_.load(std::memory_order_acquire) -
+                            submission_completed_);
+    }
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
@@ -5805,8 +7847,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // order."
     const auto wait_start = std::chrono::steady_clock::now();
     VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+        vulkan_device->WaitForFences(uint32_t(await_submission - submission_completed_),
+                                     submissions_in_flight_fences_.data(), VK_TRUE);
     const int64_t wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start)
                                 .count();
@@ -5815,7 +7857,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
-      REXGPU_ERROR("Failed to await submission completion Vulkan fences");
+      REXGPU_ERROR("Failed to await submission completion Vulkan fences: VkResult {}",
+                   int32_t(wait_result));
       if (wait_result == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;
         LogCheckpoints();
@@ -5989,6 +8032,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     dynamic_stencil_write_mask_back_update_needed_ = true;
     dynamic_stencil_reference_front_update_needed_ = true;
     dynamic_stencil_reference_back_update_needed_ = true;
+    dynamic_fragment_shading_rate_update_needed_ = true;
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
@@ -6007,6 +8051,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // Completed frames' timestamps first, so their slots are free for reuse.
     ReadFrameGpuTiming();
     BeginFrameGpuTiming();
+    if (fh1_native_executor_) fh1_native_executor_->GpuFrameOpened();
 
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
@@ -6152,9 +8197,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
+    EndRenderPass();
+
+    // The query began outside a rendering instance, so it ends outside one
+    // too (VUID-vkCmdEndQuery-None-07007). A host query cannot span command
+    // buffers; the guest's goes on.
     if (active_occlusion_query_.valid && !active_occlusion_query_.host_ended &&
         occlusion_query_pool_ != VK_NULL_HANDLE) {
-      // A host query cannot span command buffers; the guest's goes on.
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
       active_occlusion_query_.host_ended = true;
@@ -6164,8 +8213,6 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                     "queries report their previous count");
       }
     }
-
-    EndRenderPass();
 
     if (is_closing_frame) {
       EndFrameGpuTiming();
@@ -6256,9 +8303,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       tape->Swap(deferred_command_buffer_);
       {
         std::lock_guard<std::mutex> lock(submission_worker_mutex_);
-        submission_jobs_.push_back(SubmissionJob{std::move(tape), command_buffer,
-                                                 current_submission_wait_semaphores_,
-                                                 current_submission_wait_stage_masks_, fence});
+        SubmissionJob job{std::move(tape), command_buffer, current_submission_wait_semaphores_,
+                          current_submission_wait_stage_masks_, fence};
+        job.submission = GetCurrentSubmission();
+        submission_jobs_.push_back(std::move(job));
       }
       submission_worker_wake_.notify_one();
     } else if (!ExecuteSubmission(deferred_command_buffer_, command_buffer,
@@ -6335,6 +8383,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
+    LogMemoryBudget();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
@@ -6594,6 +8643,8 @@ void VulkanCommandProcessor::SubmissionWorkerMain() {
     lock.lock();
     if (job.tape) {
       submission_free_tapes_.push_back(std::move(job.tape));
+      submission_worker_submitted_.store(job.submission, std::memory_order_release);
+      submission_worker_progress_.notify_all();
     }
     submission_worker_busy_ = false;
     if (submission_jobs_.empty()) {
@@ -6619,6 +8670,33 @@ void VulkanCommandProcessor::DeferPresentStep(std::function<void()> step) {
     submission_jobs_.push_back(std::move(job));
   }
   submission_worker_wake_.notify_one();
+}
+
+void VulkanCommandProcessor::AwaitSubmissionWorkerSubmitted(uint64_t submission) {
+  if (submission_worker_submitted_.load(std::memory_order_acquire) >= submission) {
+    return;
+  }
+  const auto wait_start = std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> lock(submission_worker_mutex_);
+  submission_worker_progress_.wait(lock, [this, submission]() {
+    return submission_worker_submitted_.load(std::memory_order_relaxed) >= submission;
+  });
+  PERF_counter_add(kGpuThreadFenceWaitNs,
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - wait_start)
+                       .count());
+}
+
+VkPipeline VulkanCommandProcessor::AwaitPendingGraphicsPipeline(void* handle) const {
+  double waited_ms = 0.0;
+  VkPipeline pipeline = pipeline_cache_->AwaitPipeline(
+      handle, REXCVAR_GET(vulkan_async_pipeline_wait_ms), &waited_ms);
+  if (const int32_t log_ms = REXCVAR_GET(vulkan_log_pipeline_waits_ms);
+      log_ms > 0 && waited_ms >= double(log_ms)) {
+    REXGPU_WARN("Replay waited {:.1f} ms for a pipeline ({})", waited_ms,
+                pipeline != VK_NULL_HANDLE ? "built" : "skipped");
+  }
+  return pipeline;
 }
 
 void VulkanCommandProcessor::AwaitSubmissionWorker() {
@@ -6710,9 +8788,10 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   }
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
+  transient_descriptor_allocator_storage_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
   transient_descriptor_allocator_uniform_buffer_dynamic_.Reset();
-  constants_descriptor_sets_frame_.clear();
+  constants_descriptor_sets_frame_.Clear();
   last_constants_descriptor_set_ = VK_NULL_HANDLE;
 }
 
@@ -6848,6 +8927,58 @@ bool VulkanCommandProcessor::EnsureSwapFxaaSourceImage(uint32_t width, uint32_t 
   return true;
 }
 
+bool VulkanCommandProcessor::CreateObjectSlotImage(uint32_t width, uint32_t height) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkImageCreateInfo image_create_info = {};
+  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_create_info.imageType = VK_IMAGE_TYPE_2D;
+  image_create_info.format = VK_FORMAT_R32_UINT;
+  image_create_info.extent = {width, height, 1};
+  image_create_info.mipLevels = 1;
+  image_create_info.arrayLayers = 1;
+  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_create_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+          vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+          object_slot_image_, object_slot_image_memory_)) {
+    REXGPU_ERROR("Failed to create the object slot image");
+    return false;
+  }
+  VkImageViewCreateInfo image_view_create_info = {};
+  image_view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  image_view_create_info.image = object_slot_image_;
+  image_view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  image_view_create_info.format = image_create_info.format;
+  image_view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+  if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr, &object_slot_image_view_) !=
+      VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create the object slot image view");
+    DestroyObjectSlotImage();
+    return false;
+  }
+  object_slot_image_width_ = width;
+  object_slot_image_height_ = height;
+  object_slot_image_initialized_ = false;
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyObjectSlotImage() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, object_slot_image_view_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, object_slot_image_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, object_slot_image_memory_);
+  object_slot_image_width_ = 0;
+  object_slot_image_height_ = 0;
+  object_slot_image_initialized_ = false;
+}
+
 void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -6899,6 +9030,17 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   }
   viewport.minDepth = viewport_info.z_min;
   viewport.maxDepth = viewport_info.z_max;
+  // Untiled tiling: a draw still made in a later tile's pass renders where
+  // its window offset puts it on screen, the untiled surface's rows; the
+  // first tile's draws cover the whole screen height.
+  int32_t untile_rows = 0;
+  bool untile_first_tile = false;
+  if (untile_tiling_) {
+    untile_rows = -pa_sc_window_offset.window_y_offset;
+    untile_first_tile = untile_select_all_ && TilingPassOfSelect() == 0;
+    viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
+    viewport.y += float(untile_rows * int32_t(draw_resolution_scale_y));
+  }
   SetViewport(viewport);
 
   // Scissor.
@@ -6908,6 +9050,19 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
   scissor.offset[1] *= draw_resolution_scale_y;
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
+  if (untile_tiling_) {
+    scissor.offset[0] = uint32_t(int32_t(scissor.offset[0]) -
+                                 pa_sc_window_offset.window_x_offset *
+                                     int32_t(draw_resolution_scale_x));
+    scissor.offset[1] =
+        uint32_t(int32_t(scissor.offset[1]) + untile_rows * int32_t(draw_resolution_scale_y));
+    if (untile_first_tile) {
+      const uint32_t bottom = uint32_t(REXCVAR_GET(fh1_untile_height)) * draw_resolution_scale_y;
+      if (bottom > scissor.offset[1] + scissor.extent[1]) {
+        scissor.extent[1] = bottom - scissor.offset[1];
+      }
+    }
+  }
   VkRect2D scissor_rect;
   scissor_rect.offset.x = int32_t(scissor.offset[0]);
   scissor_rect.offset.y = int32_t(scissor.offset[1]);
@@ -7067,6 +9222,21 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     }
   }
 
+  // Fragment shading rate (fh1_coarse_shading).
+  if (GetVulkanDevice()->properties().pipelineFragmentShadingRate) {
+    const VkExtent2D rate = fh1_native_executor_ && !draw_coverage_from_shader_
+                                ? fh1_native_executor_->draw_shading_rate()
+                                : VkExtent2D{1, 1};
+    dynamic_fragment_shading_rate_update_needed_ |=
+        dynamic_fragment_shading_rate_.width != rate.width ||
+        dynamic_fragment_shading_rate_.height != rate.height;
+    if (dynamic_fragment_shading_rate_update_needed_) {
+      dynamic_fragment_shading_rate_ = rate;
+      deferred_command_buffer_.CmdVkSetFragmentShadingRateKHR(rate);
+      dynamic_fragment_shading_rate_update_needed_ = false;
+    }
+  }
+
   // TODO(Triang3l): VK_EXT_extended_dynamic_state and
   // VK_EXT_extended_dynamic_state2.
 }
@@ -7081,7 +9251,128 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  bool dirty = false;
+  // Texture signedness / gamma.
+  uint32_t textures_resolution_scaled = 0;
+  {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
+      uint32_t texture_signs_shift = 8 * (texture_index & 3);
+      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
+      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
+      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
+      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
+      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
+      textures_resolution_scaled |=
+          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
+    }
+  }
+  dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
+  system_constants_.textures_resolution_scaled = textures_resolution_scaled;
+
+  // UP-1.7: the draw's object slot, per draw like the textures above.
+  if (fh1_native_executor_) {
+    const uint32_t object_slot = fh1_native_executor_->current_object_slot();
+    const int32_t object_row_offset = fh1_native_executor_->ObjectRowOffset();
+    dirty |= system_constants_.object_slot != object_slot ||
+             system_constants_.object_row_offset != object_row_offset;
+    system_constants_.object_slot = object_slot;
+    system_constants_.object_row_offset = object_row_offset;
+  }
+
+  // Texture host swizzle in the shader.
+  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t texture_index;
+    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+      textures_remaining &= ~(UINT32_C(1) << texture_index);
+      uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
+      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
+      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
+      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
+      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
+      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
+      texture_swizzles_uint =
+          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
+    }
+  }
+
   const RegisterFile& regs = *register_file_;
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
+
+  // Everything below derives from render state block registers (covered by
+  // the render state epoch), the two per-draw registers read here and the
+  // draw's own inputs.
+  SystemConstantsMemoKey memo_key;
+  memo_key.state_epoch = render_state_epoch_;
+  {
+    uint32_t* w = memo_key.words;
+    // Only the fields read below: the index counts change every draw.
+    const auto memo_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+    const auto memo_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+    w[0] = uint32_t(memo_dma_size.swap_mode);
+    w[1] = uint32_t(memo_draw_initiator.prim_type) | uint32_t(memo_draw_initiator.index_size) << 8;
+    w[2] = uint32_t(primitive_polygonal) | uint32_t(shader_32bit_index_dma) << 1 |
+           uint32_t(primitive_processing_result.host_primitive_reset_enabled) << 2 |
+           uint32_t(primitive_processing_result.index_buffer_type) << 8 |
+           uint32_t(primitive_processing_result.host_vertex_shader_type) << 16 |
+           uint32_t(primitive_processing_result.tessellation_mode) << 24;
+    // The index address (per draw) is refreshed apart, below.
+    w[3] = 0;
+    w[4] = uint32_t(primitive_processing_result.host_shader_index_endian);
+    w[5] = primitive_processing_result.line_loop_closing_index;
+    w[6] = compute_memexport_vertex_count;
+    w[7] = normalized_depth_control.value;
+    w[8] = normalized_color_mask;
+    w[9] = viewport_info.xy_extent[0];
+    w[10] = viewport_info.xy_extent[1];
+    std::memcpy(&w[11], viewport_info.ndc_scale, 3 * sizeof(float));
+    std::memcpy(&w[14], viewport_info.ndc_offset, 3 * sizeof(float));
+    w[17] = draw_resolution_scale_x;
+    w[18] = draw_resolution_scale_y;
+    w[19] = uint32_t(render_target_cache_->GetPath());
+    w[20] = w[21] = w[22] = w[23] = 0;
+  }
+  ++system_constants_memo_calls_;
+  const bool memo_hit = REXCVAR_GET(gpu_system_constants_memo) && system_constants_memo_valid_ &&
+                        memo_key == system_constants_memo_key_;
+  SpirvShaderTranslator::SystemConstants memo_expected;
+  const bool memo_verify = memo_hit && REXCVAR_GET(gpu_system_constants_memo_verify);
+  if (memo_hit) {
+    ++system_constants_memo_hits_;
+    // The flags are the memo's; only the index address they may load
+    // changes between draws.
+    if (system_constants_.flags & (SpirvShaderTranslator::kSysFlag_VertexIndexLoad |
+                                   SpirvShaderTranslator::kSysFlag_ComputeOrPrimitiveVertexIndexLoad)) {
+      dirty |= system_constants_.vertex_index_load_address !=
+               primitive_processing_result.guest_index_base;
+      system_constants_.vertex_index_load_address = primitive_processing_result.guest_index_base;
+    }
+    if (!memo_verify) {
+      if (dirty) {
+        current_constant_buffers_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
+      }
+      return;
+    }
+    std::memcpy(&memo_expected, &system_constants_, sizeof(memo_expected));
+  }
+  if (!memo_hit && system_constants_memo_valid_ &&
+      REXCVAR_GET(gpu_system_constants_memo_verify)) {
+    for (uint32_t i = 0; i < 24; ++i) {
+      system_constants_memo_miss_words_[i] +=
+          memo_key.words[i] != system_constants_memo_key_.words[i];
+    }
+    system_constants_memo_miss_words_[24] +=
+        memo_key.state_epoch != system_constants_memo_key_.state_epoch;
+  }
+  system_constants_memo_key_ = memo_key;
+  system_constants_memo_valid_ = true;
+
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -7099,8 +9390,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
   // Get the color info register values for each render target. Also, for FSI,
   // exclude components that don't exist in the format from the write mask.
@@ -7136,8 +9425,6 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       }
     }
   }
-
-  bool dirty = false;
 
   // Flags.
   uint32_t flags = 0;
@@ -7210,12 +9497,13 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   if (draw_util::IsPrimitiveLine(regs)) {
     flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
   }
-  // MSAA sample count, the host's: the shader picks alpha to coverage and memexport samples by
-  // it, and the native executor may keep guest MSAA surfaces single-sampled.
-  flags |= uint32_t(fh1_native_executor_ && fh1_native_executor_->single_sample_msaa()
-                        ? xenos::MsaaSamples::k1X
-                        : rb_surface_info.msaa_samples)
-           << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
+  // MSAA sample count: the host's, where the FH1 executor stores the guest's
+  // surfaces with fewer samples (alpha to coverage and per-sample shading
+  // address host samples).
+  const xenos::MsaaSamples host_msaa_samples =
+      fh1_native_executor_ ? fh1_native_executor_->HostMsaaSamples(rb_surface_info.msaa_samples)
+                           : rb_surface_info.msaa_samples;
+  flags |= uint32_t(host_msaa_samples) << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     flags |= SpirvShaderTranslator::kSysFlag_DepthFloat24;
@@ -7380,50 +9668,19 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
         point_screen_diameter_to_ndc_radius_y;
   }
 
-  // Texture signedness / gamma.
-  uint32_t textures_resolution_scaled = 0;
-  {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_signs_uint = system_constants_.texture_swizzled_signs[texture_index >> 2];
-      uint32_t texture_signs_shift = 8 * (texture_index & 3);
-      uint8_t texture_signs = texture_cache_->GetActiveTextureSwizzledSigns(texture_index);
-      uint32_t texture_signs_shifted = uint32_t(texture_signs) << texture_signs_shift;
-      uint32_t texture_signs_mask = ((UINT32_C(1) << 8) - 1) << texture_signs_shift;
-      dirty |= (texture_signs_uint & texture_signs_mask) != texture_signs_shifted;
-      texture_signs_uint = (texture_signs_uint & ~texture_signs_mask) | texture_signs_shifted;
-      textures_resolution_scaled |=
-          uint32_t(texture_cache_->IsActiveTextureResolutionScaled(texture_index)) << texture_index;
-    }
-  }
-  dirty |= system_constants_.textures_resolution_scaled != textures_resolution_scaled;
-  system_constants_.textures_resolution_scaled = textures_resolution_scaled;
-
-  // Texture host swizzle in the shader.
-  if (!GetVulkanDevice()->properties().imageViewFormatSwizzle) {
-    uint32_t textures_remaining = used_texture_mask;
-    uint32_t texture_index;
-    while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
-      textures_remaining &= ~(UINT32_C(1) << texture_index);
-      uint32_t& texture_swizzles_uint = system_constants_.texture_swizzles[texture_index >> 1];
-      uint32_t texture_swizzle_shift = 12 * (texture_index & 1);
-      uint32_t texture_swizzle = texture_cache_->GetActiveTextureHostSwizzle(texture_index);
-      uint32_t texture_swizzle_shifted = uint32_t(texture_swizzle) << texture_swizzle_shift;
-      uint32_t texture_swizzle_mask = ((UINT32_C(1) << 12) - 1) << texture_swizzle_shift;
-      dirty |= (texture_swizzles_uint & texture_swizzle_mask) != texture_swizzle_shifted;
-      texture_swizzles_uint =
-          (texture_swizzles_uint & ~texture_swizzle_mask) | texture_swizzle_shifted;
-    }
-  }
-
   // Alpha test.
   dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
   system_constants_.alpha_test_reference = rb_alpha_ref;
   uint32_t alpha_to_mask =
-      rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8)
-                                           : 0;
+      rb_colorcontrol.alpha_to_mask_enable ? (rb_colorcontrol.value >> 24) | (UINT32_C(1) << 8) : 0;
+  // With fewer host samples than the guest's, the guest's per-pixel dither
+  // offsets have no samples to average over and become a pattern that
+  // crawls on foliage and cut-out sign edges as the camera moves: every
+  // pixel gets the middle offset, a steady threshold (0.5 at 1x).
+  if (alpha_to_mask && host_msaa_samples < rb_surface_info.msaa_samples &&
+      REXCVAR_GET(fh1_stable_alpha_to_coverage)) {
+    alpha_to_mask = 0xAA | (UINT32_C(1) << 8);
+  }
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 
@@ -7569,6 +9826,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     system_constants_.edram_blend_constant[3] = regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA);
   }
 
+  if (memo_verify &&
+      std::memcmp(&memo_expected, &system_constants_, sizeof(memo_expected)) != 0) {
+    ++system_constants_memo_mismatches_;
+  }
+
   if (dirty) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem);
@@ -7624,6 +9886,17 @@ float HostFetchNumberFormatScale(const xenos::xe_gpu_texture_fetch_t& fetch) {
 }
 
 }  // namespace
+
+void VulkanCommandProcessor::CountConstantUpload(uint32_t buffer, const void* data, size_t size) {
+  ConstantCensus& c = constant_census_;
+  ++c.uploads[buffer];
+  c.bytes[buffer] += size;
+  std::vector<uint8_t>& last = c.last[buffer];
+  if (last.size() == size && std::memcmp(last.data(), data, size) == 0) {
+    ++c.repeats[buffer];
+  }
+  last.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+}
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
@@ -7683,6 +9956,56 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Write the new constant buffers.
   constexpr uint32_t kAllConstantBuffersMask =
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+  const bool bindless = texture_cache_->bindless();
+  bindless_indices_draws_ += bindless && draw_cost_.enabled;
+  if (bindless && (bindless_indices_vertex_shader_ != vertex_shader ||
+                   bindless_indices_pixel_shader_ != pixel_shader ||
+                   bindless_indices_bindings_generation_ != texture_cache_->bindings_generation() ||
+                   bindless_indices_sampler_generation_ != bindless_sampler_generation_)) {
+    bindless_indices_vertex_shader_ = vertex_shader;
+    bindless_indices_pixel_shader_ = pixel_shader;
+    bindless_indices_bindings_generation_ = texture_cache_->bindings_generation();
+    bindless_indices_sampler_generation_ = bindless_sampler_generation_;
+    bindless_indices_computed_ += draw_cost_.enabled;
+    // PD-4: the draw's texture and sampler slots, uploaded after the fetch
+    // constants when one changed.
+    bool indices_changed = false;
+    auto set_index = [&](uint32_t position, uint32_t slot) {
+      indices_changed |= bindless_indices_[position] != slot;
+      bindless_indices_[position] = slot;
+    };
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+      const VulkanShader* shader = stage ? pixel_shader : vertex_shader;
+      if (!shader) {
+        continue;
+      }
+      const uint32_t base = stage * SpirvShaderTranslator::kBindlessIndicesPerStage;
+      const std::vector<VulkanShader::TextureBinding>& textures =
+          shader->GetTextureBindingsAfterTranslation();
+      const size_t texture_count =
+          std::min(textures.size(), size_t(SpirvShaderTranslator::kBindlessSamplerIndexBase));
+      for (size_t k = 0; k < texture_count; ++k) {
+        const VulkanShader::TextureBinding& texture = textures[k];
+        set_index(base + uint32_t(k),
+                  texture_cache_->GetActiveBindingBindlessIndex(
+                      texture.fetch_constant, texture.dimension, bool(texture.is_signed)));
+      }
+      const std::vector<SamplerCacheEntry>& samplers =
+          stage ? sampler_cache_pixel_ : sampler_cache_vertex_;
+      const size_t sampler_count = std::min(
+          shader->GetSamplerBindingsAfterTranslation().size(),
+          size_t(SpirvShaderTranslator::kBindlessIndicesPerStage -
+                 SpirvShaderTranslator::kBindlessSamplerIndexBase));
+      for (size_t k = 0; k < sampler_count && k < samplers.size(); ++k) {
+        set_index(base + SpirvShaderTranslator::kBindlessSamplerIndexBase + uint32_t(k),
+                  samplers[k].bindless_slot);
+      }
+    }
+    if (indices_changed) {
+      current_constant_buffers_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
+    }
+  }
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
     current_graphics_descriptor_set_values_up_to_date_ &=
@@ -7702,6 +10025,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
+      if (constant_census_enabled_) {
+        CountConstantUpload(0, mapping, sizeof(SpirvShaderTranslator::SystemConstants));
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferSystem;
     }
@@ -7726,6 +10052,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_vertex_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+      if (constant_census_enabled_) {
+        CountConstantUpload(1, mapping, float_constants_size);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
@@ -7745,6 +10074,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       buffer_info.range = VkDeviceSize(float_constants_size);
       GatherFloatConstants(mapping, current_float_constant_map_pixel_,
                            &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]);
+      if (constant_census_enabled_) {
+        CountConstantUpload(2, mapping, float_constants_size);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
@@ -7762,6 +10094,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
+      if (constant_census_enabled_) {
+        CountConstantUpload(3, mapping, kBoolLoopConstantsSize);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferBoolLoop;
     }
@@ -7771,13 +10106,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       VkDescriptorBufferInfo& buffer_info =
           current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFetch];
       constexpr size_t kFetchConstantsSize = sizeof(uint32_t) * 6 * 32;
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, kFetchConstantsSize,
+      const size_t fetch_buffer_size =
+          kFetchConstantsSize + (bindless ? SpirvShaderTranslator::kBindlessIndicesBytes : 0);
+      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, fetch_buffer_size,
                                                        uniform_buffer_alignment, buffer_info.buffer,
                                                        buffer_info.offset);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kFetchConstantsSize);
+      buffer_info.range = VkDeviceSize(fetch_buffer_size);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
       // Word 1 of a texture fetch constant carries the number format scale to
       // the shaders (SpirvShaderTranslator's texture fetch); vertex fetch
@@ -7791,11 +10128,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         const float scale = HostFetchNumberFormatScale(fetch);
         std::memcpy(mapping + sizeof(uint32_t) * (6 * i + 1), &scale, sizeof(scale));
       }
+      if (bindless) {
+        std::memcpy(mapping + kFetchConstantsSize, bindless_indices_,
+                    SpirvShaderTranslator::kBindlessIndicesBytes);
+      }
+      if (constant_census_enabled_) {
+        CountConstantUpload(4, mapping, kFetchConstantsSize);
+      }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
     }
   }
 
+  DrawCostMark(kCostConstantUploads);
+  constant_census_.draws += constant_census_enabled_;
   // Textures and samplers.
   const std::vector<VulkanShader::SamplerBinding>& samplers_vertex =
       vertex_shader->GetSamplerBindingsAfterTranslation();
@@ -7817,111 +10163,221 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
+  if (bindless) {
+    // PD-4: no per-draw texture sets, writes or pushes; the bindless set is
+    // bound like the shared memory set.
+    texture_count_vertex = sampler_count_vertex = 0;
+    texture_count_pixel = sampler_count_pixel = 0;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetBindless] =
+        texture_cache_->bindless_descriptor_set();
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetBindless;
+  }
   // Texture and sampler descriptor sets are rebuilt only when their contents
   // change: within a frame, the last set written for a stage with the same
   // layout, image views and samplers is still alive and is reused.
   bool write_vertex_textures = texture_count_vertex || sampler_count_vertex;
   bool write_pixel_textures = texture_count_pixel || sampler_count_pixel;
-  descriptor_write_image_info_.clear();
-  descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
-  size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
-    for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_vertex_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
-  size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
-    for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
-          texture_binding.fetch_constant, texture_binding.dimension,
-          bool(texture_binding.is_signed));
-      descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
-                                              ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-  }
-  size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
-    for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
-         current_samplers_pixel_) {
-      VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
-      descriptor_image_info.sampler = sampler_pair.second;
-    }
-  }
-
-  if (write_vertex_textures &&
-      ReuseTextureDescriptorSet(
-          false, texture_count_vertex, sampler_count_vertex,
-          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
-          descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
-          descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)) {
-    write_vertex_textures = false;
-  }
   // Pushed pixel textures: no set to allocate or write, only a push recorded
   // after the binds when the contents or the layout changed.
   const bool push_pixel_textures =
       write_pixel_textures && current_guest_graphics_pipeline_layout_->textures_pixel_pushed();
   bool pixel_textures_push_needed = false;
-  if (push_pixel_textures) {
-    write_pixel_textures = false;
-    const uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
-    const VkDescriptorSetLayout pixel_layout =
-        current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
-    const VkDescriptorImageInfo* pixel_textures =
-        descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
-    const VkDescriptorImageInfo* pixel_samplers =
-        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset;
-    LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
-    bool same = (current_graphics_descriptor_sets_bound_up_to_date_ & pixel_bit) &&
-                last.layout == pixel_layout && last.texture_count == texture_count_pixel &&
-                last.sampler_count == sampler_count_pixel;
-    for (uint32_t i = 0; same && i < texture_count_pixel + sampler_count_pixel; ++i) {
-      const VkDescriptorImageInfo& a = last.infos[i];
-      const VkDescriptorImageInfo& b =
-          i < texture_count_pixel ? pixel_textures[i] : pixel_samplers[i - texture_count_pixel];
-      same = a.sampler == b.sampler && a.imageView == b.imageView &&
-             a.imageLayout == b.imageLayout;
+  const VkDescriptorImageInfo* push_pixel_texture_infos = nullptr;
+  const VkDescriptorImageInfo* push_pixel_sampler_infos = nullptr;
+  size_t vertex_texture_image_info_offset = 0, vertex_sampler_image_info_offset = 0;
+  size_t pixel_texture_image_info_offset = 0, pixel_sampler_image_info_offset = 0;
+  // NL-3.2: with the same shaders, layout, frame, samplers and texture
+  // bindings as the last UpdateBindings, its image infos, and so its sets or
+  // its push, are this draw's.
+  const uint32_t pixel_set_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  TextureSectionInputs& section = texture_section_inputs_;
+  auto last_set_matches = [&](const LastTextureDescriptorSet& last, VkDescriptorSetLayout layout,
+                              uint32_t texture_count, uint32_t sampler_count, bool needs_set) {
+    return (!needs_set || (last.set != VK_NULL_HANDLE && last.frame == frame_current_)) &&
+           last.layout == layout && last.texture_count == texture_count &&
+           last.sampler_count == sampler_count &&
+           last.infos.size() == size_t(texture_count) + sampler_count;
+  };
+  const bool texture_section_unchanged =
+      texture_section_skip_allowed_ && !bindless && section.valid &&
+      section.vertex_shader == vertex_shader && section.pixel_shader == pixel_shader &&
+      section.layout == current_guest_graphics_pipeline_layout_ &&
+      section.frame == frame_current_ &&
+      section.texture_inputs_generation == texture_inputs_generation_ &&
+      (!write_vertex_textures ||
+       last_set_matches(
+           last_texture_descriptor_sets_[0],
+           current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+           texture_count_vertex, sampler_count_vertex, true)) &&
+      (!write_pixel_textures ||
+       last_set_matches(
+           push_pixel_textures ? last_pushed_pixel_textures_ : last_texture_descriptor_sets_[1],
+           current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
+           texture_count_pixel, sampler_count_pixel, !push_pixel_textures));
+  section.valid = false;
+  if (texture_section_unchanged && !texture_section_verify_) {
+    ++unchanged_census_.texture_sections;
+    // As ReuseTextureDescriptorSet and the push comparison find them.
+    auto reuse_set = [&](uint32_t set_index, VkDescriptorSet set) {
+      if (current_graphics_descriptor_sets_[set_index] != set) {
+        current_graphics_descriptor_sets_[set_index] = set;
+        current_graphics_descriptor_sets_bound_up_to_date_ &= ~(UINT32_C(1) << set_index);
+      }
+      current_graphics_descriptor_set_values_up_to_date_ |= UINT32_C(1) << set_index;
+    };
+    if (write_vertex_textures) {
+      reuse_set(SpirvShaderTranslator::kDescriptorSetTexturesVertex,
+                last_texture_descriptor_sets_[0].set);
+      write_vertex_textures = false;
     }
-    if (!same) {
-      pixel_textures_push_needed = true;
-      last.layout = pixel_layout;
-      last.texture_count = texture_count_pixel;
-      last.sampler_count = sampler_count_pixel;
-      last.infos.assign(pixel_textures, pixel_textures + texture_count_pixel);
-      last.infos.insert(last.infos.end(), pixel_samplers, pixel_samplers + sampler_count_pixel);
+    if (push_pixel_textures) {
+      const LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
+      pixel_textures_push_needed =
+          !(current_graphics_descriptor_sets_bound_up_to_date_ & pixel_set_bit);
+      push_pixel_texture_infos = last.infos.data();
+      push_pixel_sampler_infos = last.infos.data() + texture_count_pixel;
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+          VK_NULL_HANDLE;
+      current_graphics_descriptor_set_values_up_to_date_ |= pixel_set_bit;
+      write_pixel_textures = false;
+    } else if (write_pixel_textures) {
+      reuse_set(SpirvShaderTranslator::kDescriptorSetTexturesPixel,
+                last_texture_descriptor_sets_[1].set);
+      write_pixel_textures = false;
     }
-    // A later non-pushed layout must not take this slot as a bound set.
-    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
-        VK_NULL_HANDLE;
-    current_graphics_descriptor_set_values_up_to_date_ |= pixel_bit;
-  }
-  if (write_pixel_textures &&
-      ReuseTextureDescriptorSet(
-          true, texture_count_pixel, sampler_count_pixel,
-          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
-          descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
-          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset)) {
-    write_pixel_textures = false;
-  }
+    DrawCostMark(kCostImageInfos);
+  } else {
+    descriptor_write_image_info_.clear();
+    descriptor_write_image_info_.reserve(
+        (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+        (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+    vertex_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (write_vertex_textures && texture_count_vertex) {
+      for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (write_vertex_textures && sampler_count_vertex) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_vertex_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+    pixel_texture_image_info_offset = descriptor_write_image_info_.size();
+    if (write_pixel_textures && texture_count_pixel) {
+      for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
+            texture_binding.fetch_constant, texture_binding.dimension,
+            bool(texture_binding.is_signed));
+        descriptor_image_info.imageLayout = descriptor_image_info.imageView != VK_NULL_HANDLE
+                                                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                : VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+    }
+    pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
+    if (write_pixel_textures && sampler_count_pixel) {
+      for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
+           current_samplers_pixel_) {
+        VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
+        descriptor_image_info.sampler = sampler_pair.second;
+      }
+    }
+    if (texture_section_unchanged) {
+      // Verify: the skip would have taken the last infos for these.
+      ++unchanged_census_.texture_sections;
+      auto same_infos = [&](const LastTextureDescriptorSet& last, size_t texture_offset,
+                            uint32_t texture_count, size_t sampler_offset,
+                            uint32_t sampler_count) {
+        const VkDescriptorImageInfo* infos = descriptor_write_image_info_.data();
+        for (uint32_t k = 0; k < texture_count + sampler_count; ++k) {
+          const VkDescriptorImageInfo& a = last.infos[k];
+          const VkDescriptorImageInfo& b = k < texture_count
+                                               ? infos[texture_offset + k]
+                                               : infos[sampler_offset + k - texture_count];
+          if (a.sampler != b.sampler || a.imageView != b.imageView ||
+              a.imageLayout != b.imageLayout) {
+            return false;
+          }
+        }
+        return true;
+      };
+      unchanged_census_.mismatches +=
+          (write_vertex_textures &&
+           !same_infos(last_texture_descriptor_sets_[0], vertex_texture_image_info_offset,
+                       texture_count_vertex, vertex_sampler_image_info_offset,
+                       sampler_count_vertex)) ||
+          (write_pixel_textures &&
+           !same_infos(push_pixel_textures ? last_pushed_pixel_textures_
+                                           : last_texture_descriptor_sets_[1],
+                       pixel_texture_image_info_offset, texture_count_pixel,
+                       pixel_sampler_image_info_offset, sampler_count_pixel));
+    }
 
+    DrawCostMark(kCostImageInfos);
+    if (write_vertex_textures &&
+        ReuseTextureDescriptorSet(
+            false, texture_count_vertex, sampler_count_vertex,
+            current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref(),
+            descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+            descriptor_write_image_info_.data() + vertex_sampler_image_info_offset)) {
+      write_vertex_textures = false;
+    }
+    // Pushed pixel textures: no set to allocate or write, only a push recorded
+    // after the binds when the contents or the layout changed.
+    if (push_pixel_textures) {
+      write_pixel_textures = false;
+      const uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+      const VkDescriptorSetLayout pixel_layout =
+          current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref();
+      const VkDescriptorImageInfo* pixel_textures =
+          descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
+      const VkDescriptorImageInfo* pixel_samplers =
+          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset;
+      push_pixel_texture_infos = pixel_textures;
+      push_pixel_sampler_infos = pixel_samplers;
+      LastTextureDescriptorSet& last = last_pushed_pixel_textures_;
+      bool same = (current_graphics_descriptor_sets_bound_up_to_date_ & pixel_bit) &&
+                  last.layout == pixel_layout && last.texture_count == texture_count_pixel &&
+                  last.sampler_count == sampler_count_pixel;
+      for (uint32_t i = 0; same && i < texture_count_pixel + sampler_count_pixel; ++i) {
+        const VkDescriptorImageInfo& a = last.infos[i];
+        const VkDescriptorImageInfo& b =
+            i < texture_count_pixel ? pixel_textures[i] : pixel_samplers[i - texture_count_pixel];
+        same = a.sampler == b.sampler && a.imageView == b.imageView &&
+               a.imageLayout == b.imageLayout;
+      }
+      if (!same) {
+        pixel_textures_push_needed = true;
+        last.layout = pixel_layout;
+        last.texture_count = texture_count_pixel;
+        last.sampler_count = sampler_count_pixel;
+        last.infos.assign(pixel_textures, pixel_textures + texture_count_pixel);
+        last.infos.insert(last.infos.end(), pixel_samplers, pixel_samplers + sampler_count_pixel);
+      }
+      // A later non-pushed layout must not take this slot as a bound set.
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+          VK_NULL_HANDLE;
+      current_graphics_descriptor_set_values_up_to_date_ |= pixel_bit;
+    }
+    if (write_pixel_textures &&
+        ReuseTextureDescriptorSet(
+            true, texture_count_pixel, sampler_count_pixel,
+            current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
+            descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+            descriptor_write_image_info_.data() + pixel_sampler_image_info_offset)) {
+      write_pixel_textures = false;
+    }
+  }
   // Make sure new descriptor sets are bound to the command buffer.
   current_graphics_descriptor_sets_bound_up_to_date_ &=
       current_graphics_descriptor_set_values_up_to_date_;
@@ -7931,6 +10387,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
   // identical stage flags, but for the constants they vary. Plus vertex and
   // pixel texture images and samplers.
+  DrawCostMark(kCostTextureBindings);
   std::array<VkWriteDescriptorSet, SpirvShaderTranslator::kConstantBufferCount + 2 * 2>
       write_descriptor_sets;
   uint32_t write_descriptor_set_count = 0;
@@ -7944,7 +10401,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     // the offsets are dynamic, so draws whose constants share upload pages and
     // sizes share one set per frame.
     if (constants_descriptor_sets_frame_index_ != frame_current_) {
-      constants_descriptor_sets_frame_.clear();
+      constants_descriptor_sets_frame_.Clear();
       constants_descriptor_sets_frame_index_ = frame_current_;
       last_constants_descriptor_set_ = VK_NULL_HANDLE;
     }
@@ -7955,14 +10412,15 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       current_constant_dynamic_offsets_[i] = uint32_t(current_constant_buffer_infos_[i].offset);
     }
     VkDescriptorSet constants_descriptor_set;
-    auto constants_set_it = constants_descriptor_sets_frame_.end();
+    VkDescriptorSet* frame_constants_set = nullptr;
     if (last_constants_descriptor_set_ != VK_NULL_HANDLE &&
         last_constants_descriptor_set_key_ == constants_key) {
       // Consecutive draws nearly always share buffers and sizes.
       constants_descriptor_set = last_constants_descriptor_set_;
-    } else if ((constants_set_it = constants_descriptor_sets_frame_.find(constants_key)) !=
-               constants_descriptor_sets_frame_.end()) {
-      constants_descriptor_set = constants_set_it->second;
+      constants_set_last_ += draw_cost_.enabled;
+    } else if ((frame_constants_set = constants_descriptor_sets_frame_.Find(constants_key))) {
+      constants_descriptor_set = *frame_constants_set;
+      constants_set_table_ += draw_cost_.enabled;
     } else {
       if (!constants_transient_descriptors_free_.empty()) {
         constants_descriptor_set = constants_transient_descriptors_free_.back();
@@ -7977,8 +10435,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           return false;
         }
       }
+      constants_set_new_ += draw_cost_.enabled;
       constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
-      constants_descriptor_sets_frame_.emplace(constants_key, constants_descriptor_set);
+      constants_descriptor_sets_frame_.Insert(constants_key, constants_descriptor_set);
       // Consecutive bindings updated via a single VkWriteDescriptorSet must
       // have identical stage flags, but for the constants they vary.
       for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
@@ -8005,9 +10464,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
         constants_descriptor_set;
     // New offsets need a new bind even for the same set.
-    current_graphics_descriptor_sets_bound_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    if (!REXCVAR_GET(fh1_debug_keep_constant_binds) ||
+        last_constants_bound_debug_ != constants_descriptor_set) {
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+      last_constants_bound_debug_ = constants_descriptor_set;
+    }
   }
+  DrawCostMark(kCostConstantsSet);
   // Vertex shader textures and samplers.
   if (write_vertex_textures) {
     VkWriteDescriptorSet* write_textures =
@@ -8046,6 +10510,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     last_texture_descriptor_sets_[1].set = write_textures[0].dstSet;
     last_texture_descriptor_sets_[1].frame = frame_current_;
   }
+  DrawCostMark(kCostTextureSets);
   if (checkpoints_enabled_ && write_pixel_textures && texture_count_pixel) {
     std::string views;
     for (uint32_t i = 0; i < texture_count_pixel; ++i) {
@@ -8064,9 +10529,10 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
 
+  DrawCostMark(kCostDescriptorUpdate);
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
-  if (!texture_count_vertex && !sampler_count_vertex) {
+  if (!texture_count_vertex && !sampler_count_vertex && !bindless) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
   }
   if ((!texture_count_pixel && !sampler_count_pixel) || push_pixel_textures) {
@@ -8100,13 +10566,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       deferred_command_buffer_.CmdVkPushTextureDescriptorSet(
           current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
           SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_count_pixel,
-          sampler_count_pixel, descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
-          descriptor_write_image_info_.data() + pixel_sampler_image_info_offset);
+          sampler_count_pixel, push_pixel_texture_infos, push_pixel_sampler_infos);
     }
     current_graphics_descriptor_sets_bound_up_to_date_ |=
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
   }
-
+  if (!bindless) {
+    section.vertex_shader = vertex_shader;
+    section.pixel_shader = pixel_shader;
+    section.layout = current_guest_graphics_pipeline_layout_;
+    section.frame = frame_current_;
+    section.texture_inputs_generation = texture_inputs_generation_;
+    section.valid = true;
+  }
+  DrawCostMark(kCostDescriptorBinds);
   return true;
 }
 

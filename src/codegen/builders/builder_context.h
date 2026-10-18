@@ -10,9 +10,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <fmt/core.h>
 
@@ -24,6 +26,21 @@ struct ppc_insn;
 namespace rex::codegen {
 
 class FunctionNode;
+
+/// The first register a `<prefix>N` save/restore helper name covers (N), or -1.
+inline int SaveRestoreHelperFirstRegister(std::string_view name, std::string_view prefix) {
+  if (!name.starts_with(prefix) || name.size() == prefix.size())
+    return -1;
+  int value = 0;
+  for (char c : name.substr(prefix.size())) {
+    if (c < '0' || c > '9')
+      return -1;
+    value = value * 10 + (c - '0');
+    if (value > 31)
+      return -1;
+  }
+  return value >= 14 ? value : -1;
+}
 
 struct RecompilerLocalVariables {
   bool ctr{};
@@ -37,6 +54,33 @@ struct RecompilerLocalVariables {
   bool temp{};
   bool v_temp{};
   bool ea{};
+  /// host_local_register_saves: the first GPR (14-31) this function's prologue
+  /// saves into the `rex_save_rN` locals instead of calling __savegprlr_N, or
+  /// 0 when the function keeps the helper calls.
+  uint8_t hostSaveFirst{};
+  /// host_local_lr: the LR save slot (entry r1 - 8) lives in the
+  /// `rex_saved_lr` local. hostLrStore is the explicit `stw` that fills it (0
+  /// when the `__savegprlr_N` save does), hostLrLoads the sorted `lwz` reloads
+  /// that read it (the `__restgprlr_N` restores read it too).
+  bool hostLr{};
+  uint32_t hostLrStore{};
+  std::vector<uint32_t> hostLrLoads;
+  bool isHostLrLoad(uint32_t address) const {
+    return hostLr && std::binary_search(hostLrLoads.begin(), hostLrLoads.end(), address);
+  }
+
+  /// register_locals_functions (NN-5.1): every GPR, FPR and VR this function
+  /// names is a local, synchronized with ctx at calls, tail calls and returns.
+  bool allRegisters{};
+  /// fixed_fp_mode_functions (NN-5.1): flush-mode toggles test the
+  /// `rex_fixed_fp` local, read once at entry.
+  bool fixedFpHoist{};
+  /// single_precision_functions (NN-5.1): bit N set when fN is known to hold a
+  /// single-precision value at the current instruction (straight-line only:
+  /// cleared at labels, calls and hooks). Kept up to date by emitCpp.
+  bool singlePrecision{};
+  uint32_t singleFprs{};
+  bool isSingle(size_t index) const { return singlePrecision && index < 32 && (singleFprs >> index) & 1; }
 
   /// Tracks which GPRs contain MMIO base addresses (bit N = rN is MMIO base)
   /// Set when lis loads a value with upper 16 bits >= 0x7F00 (address >= 0x7F000000)
@@ -113,6 +157,24 @@ struct BuilderContext {
    * False when the function shares registers with an intra-function bl partner.
    */
   bool localizeNonVolatiles() const;
+  /// True while emitting a `ref_` reference copy for the lockstep verifier.
+  bool isReferenceCopy() const;
+  /// `__savegprlr_N`, `__restfpr_N` and the other register save/restore helpers.
+  static bool isSaveRestoreHelper(std::string_view name);
+  /// Write the localized non-volatile GPRs, FPRs and VRs referenced so far to
+  /// ctx (before a call into a function that reads them through ctx), and read
+  /// them back (after it returns).
+  void publishLocalNonVolatiles(std::string_view indent);
+  void reloadLocalNonVolatiles(std::string_view indent);
+  /// Emit a save/restore helper's body with this function's locals in place of
+  /// the registers it stores or loads (`return;` after it when tail-called).
+  void inlineSaveRestoreHelper(const rex::codegen::FunctionNode& helper, std::string_view indent,
+                               bool tail);
+  /// host_local_register_saves: emit a `__savegprlr_N` call as copies of
+  /// rN-r31 into the `rex_save_rN` locals plus the LR slot store, and a
+  /// `__restgprlr_N` call or tail call as the copies back plus the LR reload.
+  /// False when `name` is not a helper this function's plan covers.
+  bool emitHostLocalSaveRestore(std::string_view name, std::string_view indent, bool tail);
 
   /**
    * @brief Get expression for general-purpose register access.
@@ -162,6 +224,9 @@ struct BuilderContext {
 
   /// Get expression for effective address temporary (always "ea")
   const char* ea();
+
+  /// The symbol a direct call or tail call to `fn` names.
+  std::string calleeSymbol(const rex::codegen::FunctionNode& fn) const;
 
   //=========================================================================
   // Output Helpers

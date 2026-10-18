@@ -8,11 +8,83 @@
 #==========================================================
 include_guard(GLOBAL)
 
+option(REXGLUE_FIDELITYFX_RUNTIME
+    "Build AMD's FidelityFX library (FSR 2 and 3) from source beside the game on Linux and macOS"
+    ON)
+
+# The FidelityFX library the FSR provider loads, built from source by
+# thirdparty/fidelityfx-vk (a separate CMake project) and staged in
+# upscalers/fidelityfx/<version>/ beside the executable. Windows uses AMD's
+# signed runtime and Android packages its own build (tools/pinyon_android.py).
+function(_rexglue_stage_fidelityfx_runtime target_name)
+    set(_source "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../thirdparty/fidelityfx-vk")
+    if(NOT REXGLUE_FIDELITYFX_RUNTIME OR WIN32 OR ANDROID OR NOT REXGLUE_USE_VULKAN
+       OR NOT REXGLUE_FFX_API_INCLUDE_DIR OR NOT EXISTS "${_source}/CMakeLists.txt"
+       OR TARGET rexglue_fidelityfx_runtime)
+        return()
+    endif()
+    include(ExternalProject)
+    set(_binary "${CMAKE_BINARY_DIR}/fidelityfx-vk")
+    set(_arguments
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+    if(CMAKE_MAKE_PROGRAM)
+        list(APPEND _arguments -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+    endif()
+    set(_depends "")
+    if(APPLE)
+        set(_library_name libamd_fidelityfx_vk.dylib)
+        list(APPEND _arguments
+            -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+        # The loader the game stages in vulkan/lib (install name
+        # @rpath/libvulkan.1.dylib, found through the library's rpath).
+        foreach(_loader Vulkan::Loader rex::vulkan-loader)
+            if(TARGET ${_loader})
+                list(APPEND _arguments "-DVulkan_LIBRARY=$<TARGET_FILE:${_loader}>")
+                get_target_property(_imported ${_loader} IMPORTED)
+                if(NOT _imported)
+                    list(APPEND _depends ${_loader})
+                endif()
+                break()
+            endif()
+        endforeach()
+    else()
+        set(_library_name libamd_fidelityfx_vk.so)
+    endif()
+    ExternalProject_Add(rexglue_fidelityfx_runtime
+        SOURCE_DIR "${_source}"
+        BINARY_DIR "${_binary}"
+        CMAKE_ARGS ${_arguments}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target amd_fidelityfx_vk
+        BUILD_BYPRODUCTS "${_binary}/ffx-api/${_library_name}"
+        INSTALL_COMMAND ""
+        DEPENDS ${_depends}
+        BUILD_ALWAYS ON
+        USES_TERMINAL_BUILD ON)
+    # SDK 1.1.4: FSR 3.1.4 and FSR 2.3.3. Staged whenever the library
+    # changes, not only when the executable relinks.
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-stage-fidelityfx.stamp")
+    add_custom_command(OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:${target_name}>/upscalers/fidelityfx/1.1.4"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_binary}/ffx-api/${_library_name}"
+            "$<TARGET_FILE_DIR:${target_name}>/upscalers/fidelityfx/1.1.4/${_library_name}"
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS "${_binary}/ffx-api/${_library_name}" rexglue_fidelityfx_runtime
+        VERBATIM)
+    add_custom_target(${target_name}-stage-fidelityfx DEPENDS ${_stamp})
+    add_dependencies(${target_name} ${target_name}-stage-fidelityfx)
+endfunction()
+
 function(_rexglue_stage_macos_vulkan_runtime target_name)
     if(TARGET Vulkan::Loader AND TARGET MoltenVK::MoltenVK)
         set(_rexglue_vulkan_loader Vulkan::Loader)
         set(_rexglue_moltenvk MoltenVK::MoltenVK)
-        set(_rexglue_moltenvk_icd "${REXGLUE_ROOT}/cmake/MoltenVK_icd.json")
+        # REXGLUE_ROOT is unset when a game adds the SDK as a subdirectory.
+        set(_rexglue_moltenvk_icd "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/MoltenVK_icd.json")
     elseif(TARGET rex::vulkan-loader AND TARGET rex::moltenvk)
         set(_rexglue_vulkan_loader rex::vulkan-loader)
         set(_rexglue_moltenvk rex::moltenvk)
@@ -46,12 +118,21 @@ endfunction()
 #==========================================================
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
-        # Large executable support
+        # Code model (REXGLUE_X86_64_CODE_MODEL, small unless large is asked for)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_link_options(${target_name} PRIVATE -Wl,--no-relax)
-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
+            if(REXGLUE_X86_64_CODE_MODEL STREQUAL "large")
+                target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+                target_compile_options(${target_name} PRIVATE -mcmodel=large)
+            else()
+                target_compile_options(${target_name} PRIVATE -mcmodel=small)
+            endif()
         elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
-            target_compile_options(${target_name} PRIVATE -march=armv8-a)
+            # A consumer may raise the baseline (REXGLUE_ARM64_MARCH, e.g. armv8.2-a
+            # for LSE atomics instead of LL/SC loops and outline-atomic calls).
+            if(NOT REXGLUE_ARM64_MARCH)
+                set(REXGLUE_ARM64_MARCH armv8-a)
+            endif()
+            target_compile_options(${target_name} PRIVATE -march=${REXGLUE_ARM64_MARCH})
         endif()
     endif()
 
@@ -74,6 +155,28 @@ endfunction()
 #     Guest modules colocate with the host (see rexglue_configure_module_target),
 #     so this single copy handles them transitively.
 #==========================================================
+# Copies a library next to the host whenever the library's file changes. A
+# POST_BUILD copy on the host runs only when the host relinks, which a
+# runtime-loaded plugin, or a DLL whose exports did not change, never causes:
+# the host then ran the previous build's DLL.
+function(rexglue_stage_on_change target_name library_target name)
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-stage-${name}.stamp")
+    add_custom_command(OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:${library_target}>
+            $<TARGET_FILE_DIR:${target_name}>
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS $<TARGET_FILE:${library_target}>
+        VERBATIM
+    )
+    add_custom_target(${target_name}-stage-${name} DEPENDS ${_stamp})
+    get_target_property(_imported ${library_target} IMPORTED)
+    if(NOT _imported)
+        add_dependencies(${target_name}-stage-${name} ${library_target})
+    endif()
+    add_dependencies(${target_name} ${target_name}-stage-${name})
+endfunction()
+
 function(rexglue_configure_target target_name)
     cmake_parse_arguments(ARG "" "" "GPU_PLUGINS" ${ARGN})
 
@@ -163,12 +266,24 @@ function(rexglue_configure_target target_name)
                 $<TARGET_FILE_DIR:${target_name}>
             VERBATIM
         )
+        rexglue_stage_on_change(${target_name} ${_plugin_target} gpu-${_plugin})
         unset(_plugin_target)
     endforeach()
+    # The runtime DLL too: a change that keeps its exports keeps its import
+    # library, so the host does not relink and its POST_BUILD copy skips it.
+    if(WIN32)
+        foreach(_rexglue_runtime_lib rexruntime rex::runtime)
+            if(TARGET ${_rexglue_runtime_lib})
+                rexglue_stage_on_change(${target_name} ${_rexglue_runtime_lib} runtime)
+                break()
+            endif()
+        endforeach()
+    endif()
 
     if(APPLE AND REXGLUE_USE_VULKAN)
         _rexglue_stage_macos_vulkan_runtime(${target_name})
     endif()
+    _rexglue_stage_fidelityfx_runtime(${target_name})
 endfunction()
 
 #==========================================================

@@ -53,6 +53,21 @@ std::string Trim(std::string_view text) {
 
 }  // namespace
 
+uint16_t PadChordButtons(std::string_view text) {
+  uint16_t buttons = 0;
+  size_t start = 0;
+  while (start <= text.size()) {
+    const size_t plus = text.find('+', start);
+    const auto control = PadControlFromName(
+        text.substr(start, plus == std::string_view::npos ? std::string_view::npos : plus - start));
+    if (!control) return 0;
+    buttons |= kBits[size_t(*control)];
+    if (plus == std::string_view::npos) break;
+    start = plus + 1;
+  }
+  return buttons;
+}
+
 std::string_view PadControlName(PadControl control) {
   return control < PadControl::kCount ? kNames[size_t(control)] : std::string_view();
 }
@@ -105,25 +120,26 @@ std::string FormatPadRemap(const PadRemap& remap) {
   return text;
 }
 
-void ApplyPadRemap(X_INPUT_GAMEPAD& pad) {
-  if (REXCVAR_GET(pad_invert_right_stick_y)) {
-    pad.thumb_ry = int16_t(std::clamp(-int32_t(int16_t(pad.thumb_ry)), -32768, 32767));
-  }
+PadRemap CurrentPadRemap() {
   // Parsed again only when the cvar text changes.
   static std::mutex mutex;
   static std::string parsed_text;
   static PadRemap remap = IdentityPadRemap();
-  PadRemap current;
-  {
-    std::lock_guard lock(mutex);
-    const std::string& text = REXCVAR_GET(pad_remap);
-    if (text != parsed_text) {
-      parsed_text = text;
-      remap = ParsePadRemap(text);
-    }
-    if (parsed_text.empty()) return;
-    current = remap;
+  std::lock_guard lock(mutex);
+  const std::string& text = REXCVAR_GET(pad_remap);
+  if (text != parsed_text) {
+    parsed_text = text;
+    remap = ParsePadRemap(text);
   }
+  return remap;
+}
+
+void ApplyPadRemap(X_INPUT_GAMEPAD& pad) {
+  if (REXCVAR_GET(pad_invert_right_stick_y)) {
+    pad.thumb_ry = int16_t(std::clamp(-int32_t(int16_t(pad.thumb_ry)), -32768, 32767));
+  }
+  const PadRemap current = CurrentPadRemap();
+  if (current == IdentityPadRemap()) return;
   const uint16_t buttons = uint16_t(pad.buttons);
   const uint8_t triggers[2] = {uint8_t(pad.left_trigger), uint8_t(pad.right_trigger)};
   uint16_t out_buttons = 0;

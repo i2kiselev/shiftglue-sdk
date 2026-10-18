@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/filesystem.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -17,6 +18,7 @@
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/ppc/context.h>          // PPCFuncMapping
+#include <rex/ppc/probe.h>
 #include <rex/platform/exceptions.h>  // SEH exception support
 #include <rex/kernel/crt/heap.h>
 #include <rex/runtime.h>
@@ -204,6 +206,8 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
   }
 
   codegen_flags_ = image_info.codegen_flags;
+  folded_ranges_ = image_info.folded_ranges;
+  folded_hash_ = image_info.folded_hash;
 
   if (!function_dispatcher_->InitializeFunctionTable(image_info.code_base, image_info.code_size,
                                                      image_info.image_base, image_info.image_size,
@@ -261,6 +265,13 @@ void Runtime::Shutdown() {
     return;
   }
 
+  // Probe build (codegen call_probes): the call counts and indirect targets.
+  if (rex::ppc::ProbeActive()) {
+    auto path = user_data_root_ / "logs" / "probe.json";
+    if (rex::ppc::ProbeDump(path))
+      REXSYS_INFO("Probe data written to {}", path.string());
+  }
+
   if (instance_ == this) {
     instance_ = nullptr;
   }
@@ -299,7 +310,8 @@ bool Runtime::SetupVfs() {
 
   auto abs_game_root = std::filesystem::absolute(game_data_root_);
   if (!std::filesystem::exists(abs_game_root)) {
-    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
+    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}",
+                 rex::path_to_utf8(abs_game_root));
     return false;
   }
 
@@ -315,7 +327,7 @@ bool Runtime::SetupVfs() {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
     return false;
   }
-  REXSYS_DEBUG("  Mounted {} at {}", abs_game_root.string(), mount_path);
+  REXSYS_DEBUG("  Mounted {} at {}", rex::path_to_utf8(abs_game_root), mount_path);
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);
@@ -331,7 +343,7 @@ bool Runtime::SetupVfs() {
           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
         file_system_->RegisterSymbolicLink("update:", update_mount);
-        REXSYS_DEBUG("  Mounted {} at update:", abs_update_root.string());
+        REXSYS_DEBUG("  Mounted {} at update:", rex::path_to_utf8(abs_update_root));
       }
     }
   }
@@ -354,7 +366,7 @@ bool Runtime::SetupVfs() {
       return false;
     }
     file_system_->RegisterSymbolicLink("cache:", cache_mount);
-    REXSYS_INFO("  Mounted {} at cache:", abs_cache_root.string());
+    REXSYS_INFO("  Mounted {} at cache:", rex::path_to_utf8(abs_cache_root));
   }
 
   // Setup NullDevice for raw HDD partition accesses
@@ -386,6 +398,30 @@ X_STATUS Runtime::LoadXexImage(const std::string_view module_path) {
 
   kernel_state_->SetExecutableModule(module);
   REXSYS_DEBUG("  XEX image loaded successfully");
+
+  // The generated code folded read-only image bytes into literals; a different
+  // or patched image would run with stale constants, so refuse it.
+  if (folded_ranges_ && folded_ranges_[0].size != 0) {
+    uint64_t hash = 14695981039346656037ull;
+    size_t ranges = 0, bytes = 0;
+    for (const PPCFoldedRange* range = folded_ranges_; range->size != 0; ++range) {
+      const auto* data = memory_->TranslateVirtual<const uint8_t*>(range->guest);
+      for (uint32_t i = 0; i < range->size; ++i) {
+        hash ^= data[i];
+        hash *= 1099511628211ull;
+      }
+      ++ranges;
+      bytes += range->size;
+    }
+    if (hash != folded_hash_) {
+      REXSYS_ERROR(
+          "Runtime::LoadXexImage: the image's read-only data differs from the data the generated "
+          "code folded ({} ranges, {} bytes): hash {:016X}, expected {:016X}",
+          ranges, bytes, hash, folded_hash_);
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    REXSYS_INFO("  Folded read-only data verified ({} ranges, {} bytes)", ranges, bytes);
+  }
   return X_STATUS_SUCCESS;
 }
 

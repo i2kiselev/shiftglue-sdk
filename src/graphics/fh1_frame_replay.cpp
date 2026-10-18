@@ -1,3 +1,4 @@
+#include <rex/filesystem.h>
 #include <rex/graphics/fh1_frame_replay.h>
 
 #include <cstring>
@@ -14,6 +15,12 @@
 REXCVAR_DEFINE_STRING(fh1_frame_replay, "", "GPU",
                       "Replay this FH1 frame dump instead of running the title; the result is "
                       "written next to it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_frame_replay_repeat, 1, "GPU",
+                     "Diagnostics: run the replayed frame this many times (a deterministic GPU "
+                     "benchmark with fh1_native_gpu_profile, which logs every 600 frames); the "
+                     "front buffer is compared after the last")
+    .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
@@ -44,7 +51,7 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   if (!in.read(magic, sizeof(magic)) || std::memcmp(magic, kMagic, sizeof(kMagic)) ||
       !Get(in, frame) || !Get(in, register_count) ||
       register_count > RegisterFile::kRegisterCount) {
-    REXGPU_ERROR("FH1 frame replay: {} is not a frame dump", path.string());
+    REXGPU_ERROR("FH1 frame replay: {} is not a frame dump", rex::path_to_utf8(path));
     return 2;
   }
   std::vector<uint32_t> registers(register_count);
@@ -95,7 +102,7 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   std::vector<uint8_t> expected(front_length);
   in.read(reinterpret_cast<char*>(expected.data()), front_length);
   if (!in) {
-    REXGPU_ERROR("FH1 frame replay: {} is truncated", path.string());
+    REXGPU_ERROR("FH1 frame replay: {} is truncated", rex::path_to_utf8(path));
     return 2;
   }
 
@@ -103,9 +110,11 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
   shared_memory.InvalidateAllPages();
   std::memcpy(register_file.values, registers.data(), registers.size() * 4);
   REXGPU_INFO("FH1 frame replay: frame {} from {} ({} packet dwords, {} blocks, {} MB)", frame,
-              path.string(), packet_count, block_count, block_bytes >> 20);
-  const bool executed =
-      command_processor.ExecuteHostPackets(packets.data(), uint32_t(packets.size()));
+              rex::path_to_utf8(path), packet_count, block_count, block_bytes >> 20);
+  bool executed = true;
+  for (int32_t i = 0; executed && i < REXCVAR_GET(fh1_frame_replay_repeat); ++i) {
+    executed = command_processor.ExecuteHostPackets(packets.data(), uint32_t(packets.size()));
+  }
 
   // Compare the front buffer the replay resolved with the recorded one.
   std::vector<uint8_t> actual(front_length);
@@ -130,7 +139,7 @@ int RunFh1FrameReplay(CommandProcessor& command_processor, RegisterFile& registe
                       << ",\"tiled\":" << tiled << ",\"differing_words\":" << differing_words
                       << "}\n";
   REXGPU_INFO("FH1 frame replay: done, {} of {} front buffer words differ ({})", differing_words,
-              front_length / 4, json.string());
+              front_length / 4, rex::path_to_utf8(json));
   return executed ? 0 : 1;
 }
 

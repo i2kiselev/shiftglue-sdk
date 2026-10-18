@@ -17,6 +17,10 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    d3d_census_decoder.cpp
+    d3d_draw_path.cpp
+    d3d_list_compiler.cpp
+    d3d_shader_cache.cpp
     fh1_depth_overwrite.cpp
     fh1_edram_resolve.cpp
     fh1_frame_dump.cpp
@@ -27,7 +31,12 @@ set(REXGPU_XENOS_SOURCES
     primitive_processor.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
+    pipeline/texture/replacement.cpp
+    cube_lut.cpp
     pipeline/shader/interpreter.cpp
+
+    # Null backend (gpu_backend=null): packets without a device
+    null/graphics_system.cpp
 )
 
 set(REXGPU_FH1_SHADER_ANALYSIS_SOURCES
@@ -54,11 +63,14 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_frame_dump.cpp
     vulkan/fh1_native_executor.cpp
+    vulkan/fh1_camera.cpp
     vulkan/command_processor.cpp
+    vulkan/scene_post.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
+    vulkan/shader_overrides.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
 )
@@ -165,6 +177,28 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
     endif()
 endforeach()
 set_target_properties(rexgpu-fh1 PROPERTIES EXPORT_NAME gpu-fh1)
+
+# Symbols for profiling the optimized plugin: a RelWithDebInfo plugin links
+# its own runtime and does not load into a Release executable, so this keeps
+# the Release build and only adds CodeView debug info and a PDB.
+option(REXGPU_FH1_DEBUG_INFO "Build rexgpu-fh1 with a PDB in every configuration" OFF)
+if(REXGPU_FH1_DEBUG_INFO)
+    target_compile_options(rexgpu-fh1 PRIVATE -g -gcodeview)
+    target_link_options(rexgpu-fh1 PRIVATE -g)
+endif()
+# ThinLTO within the plugin in Release: the recorder's per-draw path crosses
+# many small functions in the command processor, texture cache and executor
+# units (4.3 % less recorder time a draw on the 1x race start).
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(_rexgpu_fh1_lto_default ON)
+else()
+    set(_rexgpu_fh1_lto_default OFF)
+endif()
+option(REXGPU_FH1_LTO "Build rexgpu-fh1 with ThinLTO in Release" ${_rexgpu_fh1_lto_default})
+if(REXGPU_FH1_LTO)
+    target_compile_options(rexgpu-fh1 PRIVATE $<$<CONFIG:Release>:-flto=thin>)
+    target_link_options(rexgpu-fh1 PRIVATE $<$<CONFIG:Release>:-flto=thin>)
+endif()
 
 if(REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES)
     set_source_files_properties(${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}

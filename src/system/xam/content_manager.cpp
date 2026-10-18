@@ -9,8 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <queue>
 #include <string>
 
@@ -20,7 +23,9 @@
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/util/xdbf_utils.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
@@ -46,7 +51,11 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+  // Marketplace content is the player's verified import: mount it read-only
+  // so the title can never change a verified payload.
+  const bool read_only = data.content_type == XContentType::kMarketplaceContent;
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path,
+                                                                  read_only,
                                                                   /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
@@ -98,7 +107,10 @@ std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContent
 
   // Package root path:
   // content_root/xuid/title_id/content_type/
-  return root_path_ / xuid_str / title_id_str / content_type_str;
+  const auto& root = content_type == XContentType::kMarketplaceContent &&
+                             !marketplace_root_path_.empty()
+                         ? marketplace_root_path_ : root_path_;
+  return root / xuid_str / title_id_str / content_type_str;
 }
 
 std::filesystem::path ContentManager::ResolvePackagePath(uint64_t xuid,
@@ -134,8 +146,24 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
 
   // Header root path:
   // content_root/xuid/title_id/Headers/content_type/filename.header
-  return root_path_ / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
+  const auto& root = content_type == XContentType::kMarketplaceContent &&
+                             !marketplace_root_path_.empty()
+                         ? marketplace_root_path_ : root_path_;
+  return root / xuid_str / title_id_str / kGameContentHeaderDirName / content_type_str /
          final_name;
+}
+
+bool ContentManager::IsHiddenPackage(const XCONTENT_AGGREGATE_DATA& data) const {
+  if (data.content_type != XContentType::kMarketplaceContent) {
+    return false;
+  }
+  const std::string name = data.file_name();
+  for (const auto& hidden : hidden_marketplace_packages_) {
+    if (rex::string::compare_case(hidden.c_str(), name.c_str()) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
@@ -160,7 +188,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {
-      result.emplace_back(std::move(content_data));
+      if (!IsHiddenPackage(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     } else {
       content_data.device_id = device_id;
       content_data.content_type = content_type;
@@ -168,7 +198,9 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       content_data.set_file_name(rex::path_to_utf8(file_info.name));
       content_data.title_id = title_id;
       content_data.xuid = xuid;
-      result.emplace_back(std::move(content_data));
+      if (!IsHiddenPackage(content_data)) {
+        result.emplace_back(std::move(content_data));
+      }
     }
   }
 
@@ -178,7 +210,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
 std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
   auto package_path = ResolvePackagePath(xuid, data);
-  if (!std::filesystem::exists(package_path)) {
+  if (IsHiddenPackage(data) || !std::filesystem::exists(package_path)) {
     return nullptr;
   }
   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
@@ -186,6 +218,9 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (IsHiddenPackage(data)) {
+    return false;
+  }
   auto path = ResolvePackagePath(xuid, data);
   return std::filesystem::exists(path);
 }
@@ -257,6 +292,19 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   return X_ERROR_SUCCESS;
 }
 
+// A content root must never shadow an existing device link such as game: or
+// update: (the behaviour of Xenia Canary 9bfaff504).
+static bool ShadowsExistingLink(KernelState* kernel_state, const std::string_view root_name) {
+  std::string existing_link;
+  if (!kernel_state->file_system()->FindSymbolicLink(std::string(root_name) + ':',
+                                                     existing_link)) {
+    return false;
+  }
+  REXSYS_WARN("Refusing to mount content at {}: over the existing link to {}", root_name,
+              existing_link);
+  return true;
+}
+
 X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_t xuid,
                                        const XCONTENT_AGGREGATE_DATA& data) {
   {
@@ -264,6 +312,9 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
+  }
+  if (ShadowsExistingLink(kernel_state_, root_name)) {
+    return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
@@ -286,6 +337,53 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
   return X_ERROR_SUCCESS;
 }
 
+namespace {
+
+// Marketplace packages carry the title's achievement table extended with their
+// own entries (spa.bin). Register only IDs the title does not already define,
+// so base metadata (and its unlock state, stored by ID) is never replaced.
+void RegisterContentAchievements(KernelState* kernel_state,
+                                 const std::filesystem::path& package_path) {
+  std::ifstream file(package_path / "spa.bin", std::ios::binary);
+  if (!file) {
+    return;
+  }
+  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+  const util::XdbfGameData db(data.data(), data.size());
+  if (!db.is_valid()) {
+    REXSYS_WARN("Ignoring unreadable content spa.bin in {}", rex::path_to_utf8(package_path));
+    return;
+  }
+  auto& manager = kernel_state->achievements();
+  const auto known = manager.ListAchievements();
+  const XLanguage language =
+      db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+  size_t added = 0;
+  for (const auto& entry : db.GetAchievements()) {
+    const uint32_t id = entry.id;
+    if (std::any_of(known.begin(), known.end(),
+                    [id](const AchievementInfo& info) { return info.id == id; })) {
+      continue;
+    }
+    AchievementInfo info;
+    info.id = id;
+    info.label = db.GetStringTableEntry(language, entry.label_id);
+    info.description = db.GetStringTableEntry(language, entry.description_id);
+    info.unachieved_description = db.GetStringTableEntry(language, entry.unachieved_id);
+    info.image_id = entry.image_id;
+    info.gamerscore = entry.gamerscore;
+    info.flags = entry.flags;
+    added += manager.RegisterAchievement(std::move(info)) ? 1 : 0;
+  }
+  if (added) {
+    REXSYS_INFO("Registered {} achievement(s) from content {}", added,
+                rex::path_to_utf8(package_path.filename()));
+  }
+}
+
+}  // namespace
+
 X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t xuid,
                                      const XCONTENT_AGGREGATE_DATA& data,
                                      uint32_t& content_license) {
@@ -294,6 +392,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
     if (open_packages_.count(string::string_key_case(root_name))) {
       return X_ERROR_ALREADY_EXISTS;
     }
+  }
+  if (ShadowsExistingLink(kernel_state_, root_name)) {
+    return X_ERROR_ALREADY_EXISTS;
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
@@ -312,6 +413,9 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
       return X_ERROR_ALREADY_EXISTS;
     }
     open_packages_.insert({string::string_key_case::create(root_name), package.release()});
+  }
+  if (data.content_type == XContentType::kMarketplaceContent) {
+    RegisterContentAchievements(kernel_state_, package_path);
   }
   return X_ERROR_SUCCESS;
 }

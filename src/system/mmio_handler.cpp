@@ -18,12 +18,18 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_LINUX
+#include <dlfcn.h>
+#endif
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
 using namespace rex::arch;
 
 namespace rex::runtime {
+
+// critical_region_census (NN-3.10): the access-violation handler's lock.
+constexpr auto kMmioFaultLockSource = rex::thread::LockSource::kWriteWatchFault;
 
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
@@ -405,7 +411,44 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // Recheck if the pages are still protected (race condition - another thread
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
-    auto lock = global_critical_region_.Acquire();
+    auto lock = global_critical_region_.Acquire(kMmioFaultLockSource);
+#if REX_PLATFORM_LINUX
+    // QueryProtect parses /proc/self/maps as text on Linux and Android, and on
+    // a phone that took three quarters of the title's busiest thread at every
+    // write-watch fault. The callback settles a watch from the heaps' own
+    // records, including one another thread cleared meanwhile, so the maps
+    // are read only for a fault it does not handle.
+    if (access_violation_callback_) {
+      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                     fault_host_address, is_write)) {
+        return true;
+      }
+      lock = global_critical_region_.Acquire(kMmioFaultLockSource);
+    }
+    {
+      memory::PageAccess unhandled_access;
+      size_t unhandled_length = memory::page_size();
+      memory::QueryProtect(fault_host_address, unhandled_length, unhandled_access);
+      const bool handled = unhandled_access != memory::PageAccess::kNoAccess &&
+                           (!is_write || unhandled_access != memory::PageAccess::kReadOnly);
+      if (!handled) {
+        // Where the faulting access was, as a library and offset to
+        // symbolize: the guest link register only names the last guest
+        // call, and host code reading guest memory reports the same way.
+        Dl_info info = {};
+        const auto pc = reinterpret_cast<uintptr_t>(ex->pc());
+        if (dladdr(reinterpret_cast<const void*>(pc), &info) && info.dli_fname) {
+          REXSYS_ERROR("Unhandled fault at host {} +0x{:X} ({} +0x{:X})", info.dli_fname,
+                       pc - reinterpret_cast<uintptr_t>(info.dli_fbase),
+                       info.dli_sname ? info.dli_sname : "?",
+                       info.dli_saddr ? pc - reinterpret_cast<uintptr_t>(info.dli_saddr) : 0);
+        } else {
+          REXSYS_ERROR("Unhandled fault at host 0x{:X}", pc);
+        }
+      }
+      return handled;
+    }
+#endif
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);

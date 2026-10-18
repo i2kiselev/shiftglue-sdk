@@ -13,6 +13,10 @@
 #include "helpers.h"
 
 #include <algorithm>
+#include <cctype>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
@@ -45,12 +49,207 @@ const FunctionGraph& BuilderContext::graph() const {
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  // The save/restore helpers read and write the caller's registers through
+  // ctx for the share_registers functions that still call them; a localized
+  // caller inlines their bodies on its locals instead.
+  // register_locals_functions (NN-5.1) localizes every register, so the
+  // non-volatiles too; emitCpp only sets allRegisters for eligible functions.
+  if (locals.allRegisters)
+    return true;
+  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters() &&
+         !isSaveRestoreHelper(fn.name());
+}
+
+bool BuilderContext::isReferenceCopy() const {
+  return emitCtx.namePrefix == "ref_";
+}
+
+bool BuilderContext::isSaveRestoreHelper(std::string_view name) {
+  return name.find("__rest") == 0 || name.find("__save") == 0;
+}
+
+void BuilderContext::publishLocalNonVolatiles(std::string_view indent) {
+  for (size_t i = 14; i < 32; ++i) {
+    if (locals.r[i])
+      println("{}ctx.r{} = r{};", indent, i, i);
+    if (locals.f[i])
+      println("{}ctx.f{} = f{};", indent, i, i);
+  }
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64)
+      continue;
+    if (locals.v[i])
+      println("{}ctx.v{} = v{};", indent, i, i);
+  }
+}
+
+// A localized function keeps the registers a save/restore helper would store
+// or load in locals the helper cannot see, so the helper's body is inlined
+// with the caller's locals in place of ctx: the frame holds exactly what the
+// guest code expects, and the restore leaves the locals at their entry values
+// for the publish at return. The helper's own generated body is the source,
+// rendered once and cached, so every helper variant is covered.
+void BuilderContext::inlineSaveRestoreHelper(const rex::codegen::FunctionNode& helper,
+                                             std::string_view indent, bool tail) {
+  static std::mutex cacheMutex;
+  static std::unordered_map<std::string, std::vector<std::string>> cache;
+  std::vector<std::string> lines;
+  {
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    // Reference copies render the helper with their own options.
+    const std::string key = emitCtx.namePrefix + helper.name();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      rex::codegen::EmitContext sub = emitCtx;
+      sub.referenced = nullptr;
+      sub.referenceBlocked = nullptr;
+      const std::string body = helper.emitCpp(sub);
+      size_t pos = 0;
+      while (pos < body.size()) {
+        size_t end = body.find('\n', pos);
+        if (end == std::string::npos)
+          end = body.size();
+        std::string_view line(body.data() + pos, end - pos);
+        pos = end + 1;
+        size_t first = line.find_first_not_of('\t');
+        if (first == std::string_view::npos)
+          continue;
+        std::string_view code = line.substr(first);
+        if (code.starts_with("//") || code.starts_with("DEFINE_REX_FUNC") ||
+            code.starts_with("REX_FUNC_PROLOGUE") || code.starts_with("REX_PROBE_CALL") ||
+            code.starts_with("REX_PROBE_INDIRECT") || code == "}" || code == "return;" ||
+            code.starts_with("PPC") || code.starts_with("uint32_t ea"))
+          continue;
+        lines.emplace_back(code);
+      }
+      it = cache.emplace(key, std::move(lines)).first;
+    }
+    lines = it->second;
+  }
+  for (const std::string& line : lines) {
+    std::string rewritten;
+    size_t pos = 0;
+    while (pos < line.size()) {
+      size_t at = line.find("ctx.", pos);
+      if (at == std::string::npos) {
+        rewritten.append(line, pos, std::string::npos);
+        break;
+      }
+      rewritten.append(line, pos, at - pos);
+      size_t p = at + 4;
+      char kind = p < line.size() ? line[p] : 0;
+      size_t q = p + 1;
+      while (q < line.size() && std::isdigit(static_cast<unsigned char>(line[q])))
+        q++;
+      if ((kind == 'r' || kind == 'f' || kind == 'v') && q > p + 1 &&
+          (q == line.size() || !std::isalnum(static_cast<unsigned char>(line[q])))) {
+        size_t index = std::stoul(std::string(line.substr(p + 1, q - p - 1)));
+        std::string name;
+        // With every register local (NN-5.1), the helper's frame pointer
+        // (r12) and any other register it names are the caller's locals too.
+        const bool all = locals.allRegisters;
+        if (kind == 'r' && (index >= 14 || (all && index < 32)))
+          name = r(index);
+        else if (kind == 'f' && (index >= 14 || (all && index < 32)))
+          name = f(index);
+        else if (kind == 'v' && ((index >= 14 && index < 32) || index >= 64 || (all && index < 128)))
+          name = v(index);
+        if (!name.empty()) {
+          rewritten += name;
+          pos = q;
+          continue;
+        }
+      }
+      rewritten.append("ctx.");
+      pos = at + 4;
+    }
+    if (rewritten.find("ea") != std::string::npos)
+      (void)ea();
+    if (rewritten.find("temp") != std::string::npos)
+      (void)temp();
+    // The marker tells the publish pass that a local written here only takes
+    // its entry value back (a restore), which ctx still holds.
+    if (rewritten.starts_with("ctx.fpscr."))
+      println("{}{}", indent, rewritten);  // the flush-mode pass matches these lines exactly
+    else
+      println("{}{}  // nv-helper", indent, rewritten);
+  }
+  if (tail)
+    println("{}return;", indent);
+}
+
+// host_local_register_saves (Pinyon Shift NEAR_NATIVE_RESEARCH.md NN-1.2).
+// ctx is write-through: every callee leaves r14-r31 in ctx as it found them,
+// so copying rN-r31 to host locals where the prologue would call __savegprlr_N
+// and copying them back where an epilogue reaches __restgprlr_N hands the
+// caller the same registers as the helpers' stack round trip. The helper's
+// LR slot store (r12 at r1-8) and its reload into r12 and LR stay, so the
+// back chain, the LR slot and ctx.lr look as before; only the GPR slots are
+// no longer written. The scan in function_graph.cpp sets hostSaveFirst only
+// for functions that never touch those slots otherwise. With host_local_lr
+// (NN-1.3) the LR slot store and reload become copies through the
+// `rex_saved_lr` local as well (ScanHostLocalLr cleared the slot), so r12 and
+// ctx.lr still take the saved value and only the guest stack word is gone.
+bool BuilderContext::emitHostLocalSaveRestore(std::string_view name, std::string_view indent,
+                                              bool tail) {
+  const int first = locals.hostSaveFirst;
+  if (const int n = SaveRestoreHelperFirstRegister(name, "__savegprlr_"); n >= 0) {
+    if (n != first)
+      return false;
+    for (int i = n; i < 32; ++i)
+      println("{}rex_save_r{} = {}.u64;", indent, i, r(i));
+    // host_local_lr (NN-1.3): the LR slot lives in a local, not at r1-8.
+    if (locals.hostLr) {
+      println("{}rex_saved_lr = {}.u32;", indent, r(12));
+      if (config().abiPoisonChecks)
+        println("{}REX_STACK_STORE_U32({}.u32 + -8, REX_LR_SLOT_POISON(0x{:08X}));", indent, r(1),
+                fn.base());
+    } else
+      println("{}REX_STACK_STORE_U32({}.u32 + -8, {}.u32);", indent, r(1), r(12));
+    if (tail)
+      println("{}return;", indent);
+    return true;
+  }
+  if (const int n = SaveRestoreHelperFirstRegister(name, "__restgprlr_"); n >= 0) {
+    if (n < first)
+      return false;
+    for (int i = n; i < 32; ++i)
+      println("{}{}.u64 = rex_save_r{};", indent, r(i), i);
+    if (locals.hostLr) {
+      if (config().abiPoisonChecks)
+        println("{}REX_LR_SLOT_CHECK(0x{:08X}, 0x{:08X}, REX_STACK_LOAD_U32({}.u32 + -8));", indent,
+                fn.base(), base, r(1));
+      println("{}{}.u64 = rex_saved_lr;", indent, r(12));
+    } else
+      println("{}{}.u64 = REX_STACK_LOAD_U32({}.u32 + -8);", indent, r(12), r(1));
+    if (!config().skipLr)
+      println("{}ctx.lr = {}.u64;", indent, r(12));
+    if (tail)
+      println("{}return;", indent);
+    return true;
+  }
+  return false;
+}
+
+void BuilderContext::reloadLocalNonVolatiles(std::string_view indent) {
+  for (size_t i = 14; i < 32; ++i) {
+    if (locals.r[i])
+      println("{}r{} = ctx.r{};", indent, i, i);
+    if (locals.f[i])
+      println("{}f{} = ctx.f{};", indent, i, i);
+  }
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64)
+      continue;
+    if (locals.v[i])
+      println("{}v{} = ctx.v{};", indent, i, i);
+  }
 }
 
 std::string BuilderContext::r(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables &&
+  if (locals.allRegisters ||
+      (cfg.nonArgumentRegistersAsLocalVariables &&
        (index == 0 || index == 2 || index == 11 || index == 12)) ||
       (localizeNonVolatiles() && index >= 14)) {
     locals.r[index] = true;
@@ -61,8 +260,8 @@ std::string BuilderContext::r(size_t index) {
 
 std::string BuilderContext::f(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
-      (localizeNonVolatiles() && index >= 14)) {
+  if (locals.allRegisters || (cfg.nonArgumentRegistersAsLocalVariables && index == 0) ||
+      (localizeNonVolatiles() && cfg.nonVolatileFprsAsLocalVariables && index >= 14)) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -71,8 +270,10 @@ std::string BuilderContext::f(size_t index) {
 
 std::string BuilderContext::v(size_t index) {
   const auto& cfg = config();
-  if ((cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
-      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+  if (locals.allRegisters ||
+      (cfg.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+      (localizeNonVolatiles() && cfg.nonVolatileVectorsAsLocalVariables &&
+       ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
@@ -172,6 +373,19 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+std::string BuilderContext::calleeSymbol(const rex::codegen::FunctionNode& fn) const {
+  const auto& cfg = config();
+  // Only generated guest functions have the weak thunk over a strong `__imp__`
+  // body; a [rexcrt] hook or a save/restore helper is named directly.
+  if (!cfg.directCallsBypassThunk || fn.authority() == rex::codegen::FunctionAuthority::IMPORT ||
+      !fn.name().starts_with("sub_"))
+    return fn.name();
+  if (std::binary_search(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end(),
+                         static_cast<uint32_t>(fn.base())))
+    return fn.name();
+  return "__imp__" + fn.name();
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -197,37 +411,50 @@ void BuilderContext::emit_function_call(uint32_t address) {
     if (target->isFunction()) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
+      // The strong `__imp__` definition when the host does not override the
+      // function (cfg.directCallsBypassThunk), so Clang can inline it.
+      const std::string callee = calleeSymbol(*targetFn);
 
-      // Handle save/restore helpers. Gated on the global setting, not this
-      // function's: the helper bodies are emitted under it too, so once they
-      // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        // print nothing - these are handled by local variable tracking
+      // A localized function keeps its non-volatiles in locals the helper
+      // cannot see, so the helper's body is inlined on them. A share_registers
+      // function works in ctx and keeps the call (the helper bodies are never
+      // localized).
+      // host_local_register_saves: the save-area scan cleared this function
+      // to keep its saved registers in host locals instead of the stack slots.
+      if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, "\t", false))
+        return;
+
+      // A reference copy (NN-5.1) inlines the helpers as they are, so their
+      // stack stores go through the logged macros and the copy can be rolled
+      // back; a call would write the frame behind the log's back.
+      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+        inlineSaveRestoreHelper(*targetFn, "\t", false);
         return;
       }
 
       // An SEH funclet runs on its owner's frame and reads whatever non-volatiles
-      // the owner left live, so hand it the localized copies through ctx and take
-      // them back afterwards. Only registers already localized here can be live at
-      // this point, so that set is the whole live-in the funclet can see.
+      // the owner left live, and a share_registers function reads the caller's
+      // registers through ctx, so hand them the localized copies and take them
+      // back afterwards. Only registers already localized here can be live at
+      // this point, so that set is the whole live-in the callee can see.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
-        }
+        publishLocalNonVolatiles("\t");
         emitCtx.reference(name);
-        println("\t{}(ctx, base);", name);
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
-        }
+        println("\t{}(ctx, base);", callee);
+        reloadLocalNonVolatiles("\t");
         return;
       }
 
+      // The save/restore helpers take the frame pointer in r12 and are not
+      // ABI calls, so the checks skip them.
+      const bool poison = cfg.abiPoisonChecks &&
+                          !(name.find("__rest") == 0 || name.find("__save") == 0);
       emitCtx.reference(name);
-      println("\t{}(ctx, base);", name);
+      if (poison)
+        println("\tREX_ABI_POISON_PRE(0x{:08X});", base);
+      println("\t{}(ctx, base);", callee);
+      if (poison)
+        println("\tREX_ABI_POISON_POST(0x{:08X});", base);
       return;
     }
 
@@ -258,7 +485,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
       }
 
       emitCtx.reference(func_name);
+      if (cfg.abiPoisonChecks)
+        println("\tREX_ABI_POISON_PRE(0x{:08X});", base);
       println("\t{}(ctx, base);", func_name);
+      if (cfg.abiPoisonChecks)
+        println("\tREX_ABI_POISON_POST(0x{:08X});", base);
       return;
     }
 
@@ -289,22 +520,23 @@ void BuilderContext::emit_tail_function_call(uint32_t address, std::string_view 
     if (target->isFunction()) {
       auto* targetFn = target->asFunction();
       const auto& name = targetFn->name();
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
-        println("{}return;", indent);
+      // The strong `__imp__` definition when the host does not override the
+      // function (cfg.directCallsBypassThunk), so Clang can inline it.
+      const std::string callee = calleeSymbol(*targetFn);
+      if (locals.hostSaveFirst && emitHostLocalSaveRestore(name, indent, true))
+        return;
+      if ((localizeNonVolatiles() || isReferenceCopy()) && isSaveRestoreHelper(name)) {
+        inlineSaveRestoreHelper(*targetFn, indent, true);
         return;
       }
       // A tail branch never comes back to this frame. Publish localized
-      // non-volatiles before entering a shared-register SEH funclet, but do not
+      // non-volatiles before entering a shared-register function, but do not
       // emit the normal post-call reload sequence.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("{}ctx.r{} = r{};", indent, i, i);
-        }
+        publishLocalNonVolatiles(indent);
       }
       emitCtx.reference(name);
-      println("{}REX_TAIL_CALL({});", indent, name);
+      println("{}REX_TAIL_CALL({});", indent, callee);
       return;
     }
 
@@ -553,6 +785,10 @@ void BuilderContext::emit_load_d_form(const char* load_macro, const char* dest_t
       snprintf(mm_macro, sizeof(mm_macro), "REX_MM_LOAD_%s", load_macro + 9);
       macro = mm_macro;
     }
+  } else if (insn.operands[2] == 1 && strncmp(load_macro, "REX_LOAD_", 9) == 0) {
+    // r1 is the stack pointer: guest stacks are never in the physical view.
+    snprintf(mm_macro, sizeof(mm_macro), "REX_STACK_LOAD_%s", load_macro + 9);
+    macro = mm_macro;
   }
 
   print("\t{}.{} = {}(", r(insn.operands[0]), dest_type, macro);
@@ -593,6 +829,10 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
       snprintf(mm_macro, sizeof(mm_macro), "REX_MM_STORE_%s", store_macro + 10);
       macro = mm_macro;
     }
+  } else if (insn.operands[2] == 1 && strncmp(store_macro, "REX_STORE_", 10) == 0) {
+    // r1 is the stack pointer: guest stacks are never in the physical view.
+    snprintf(mm_macro, sizeof(mm_macro), "REX_STACK_STORE_%s", store_macro + 10);
+    macro = mm_macro;
   }
 
   print("\t{}(", macro);

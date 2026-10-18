@@ -35,21 +35,26 @@ extern "C" uint32_t rex_physical_host_offset_e0;
 
 namespace rex::memory::detail {
 
-/// Compensates for host allocation granularity coarser than 4KB on the 0xE0
-/// physical heap. When the granularity exceeds 0x1000, the backing file maps the
-/// 0xE0 heap at a 0x1000-byte offset that the mapping API rounds away (Windows
-/// MapViewOfFileEx rounds down to 64KB; macOS arm64 uses 16KB pages), so guest
-/// accesses must add it back. This must agree with PhysicalHeap::Initialize,
-/// which only sets host_address_offset when allocation_granularity() > 0x1000:
-///   - Windows:        64KB granularity  -> offset
-///   - macOS arm64:    16KB granularity  -> offset
-///   - macOS x86_64:    4KB granularity  -> no offset
+/// Compensates for a 0xE0 physical view mapped short of its 4KB offset. The
+/// 0xE0 heap starts 0x1000 bytes into the physical heap; where the mapping API
+/// cannot place a view at a page-aligned offset finer than the allocation
+/// granularity, the view is mapped rounded down and guest accesses add the
+/// offset back. This must agree with PhysicalHeap::Initialize, which sets
+/// host_address_offset only when allocation_granularity() > 0x1000 and
+/// MapFileViewOffsetsAreExact() is false:
+///   - Windows:        placeholder views (VirtualAlloc2, MapViewOfFile3) map
+///                     the view exactly -> no offset; Memory::Initialize
+///                     refuses to run where they are missing (before 1803)
+///   - macOS arm64:    16KB pages        -> offset
+///   - macOS x86_64:    4KB pages        -> no offset
 ///   - Linux, Android: the page size, known only at run time: 4KB kernels
 ///                     need no offset, 16KB and 64KB ones (some ARM64
-///                     distributions and devices) do
-#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC
+///                     distributions and devices) do. A build with
+///                     REX_PHYSICAL_HEAP_4K_PAGES assumes 4KB and refuses to
+///                     run on anything else.
+#if REX_PLATFORM_WIN32 || REX_PLATFORM_MAC || defined(REX_PHYSICAL_HEAP_4K_PAGES)
 constexpr u32 PhysicalHostOffset([[maybe_unused]] u32 guest_addr) noexcept {
-#if REX_PLATFORM_WIN32 || defined(__aarch64__)
+#if REX_PLATFORM_MAC && defined(__aarch64__)
   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
 #else
   return 0u;
@@ -249,6 +254,13 @@ class BaseHeap {
   // AcquireHostPageReconcileLock.
   bool SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_number);
 
+  // The access a host page needs for the guest pages it holds, from the guest
+  // page table alone (no watch state). Where guest pages are smaller than host
+  // pages (4 KiB guest pages on Apple silicon's 16 KiB), this is the union over
+  // every committed guest page in it: going by the first one alone would make a
+  // committed neighbour of an uncommitted page fault on every read.
+  rex::memory::PageAccess HostPageGuestAccess(uint32_t host_page_number) const;
+
   // Acquires the global critical region for operations that will run the host
   // page reconcile pass, which reads watch state guarded by it.
   //
@@ -331,11 +343,14 @@ class PhysicalHeap : public BaseHeap {
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers,
                              bool enable_access_notifications = false);
-  // Returns true if any page in the range was watched.
+  // Returns true if any page in the range was watched. With
+  // invalidate_unwatched the callbacks are raised even when no watch is armed,
+  // for a caller that knows the range is about to change (a protect, decommit
+  // or release by the guest) rather than one reacting to a fault.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
                         bool unwatch_exact_range, bool unprotect = true,
-                        bool notify_access_observers = false);
+                        bool notify_access_observers = false, bool invalidate_unwatched = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
@@ -379,6 +394,15 @@ class PhysicalHeap : public BaseHeap {
 // overlap with other ranges. Each range is represented by a BaseHeap of either
 // VirtualHeap or PhysicalHeap depending on type. Heaps model the page tables
 // and can handle reservation and committing of requested pages.
+// Within a physical memory access callback: the guest virtual address whose
+// access triggered it (the callback itself gets whole pages).
+uint32_t CurrentAccessFaultVirtualAddress();
+// Within a physical memory invalidation callback: the guest physical bytes the
+// write actually touched, as {start, length}. The callback's own range is
+// rounded out to host pages, which can be larger than guest pages (16 KB on
+// Apple silicon). {0, 0} outside a callback.
+std::pair<uint32_t, uint32_t> CurrentInvalidationExactPhysicalRange();
+
 class Memory {
  public:
   Memory();
@@ -391,6 +415,13 @@ class Memory {
 
   // Resets all memory to zero and resets all allocations.
   void Reset();
+
+  // Takes all access from a range of the executable image (0x80000000-
+  // 0x8FFFFFFF and its 0x90000000 alias) that nothing reads after load, such
+  // as the guest code the recompiler replaced; with release, also frees its
+  // pages (a hole in the backing file). A later access faults. POSIX only;
+  // returns false elsewhere or for a range outside the image heaps.
+  bool RetireImageRange(uint32_t address, uint32_t size, bool release);
 
   // Full file name and path of the memory-mapped file backing all memory.
   const std::filesystem::path& file_name() const { return file_name_; }
@@ -588,8 +619,8 @@ class Memory {
   bool HasAnyFunctionTable() const;
 
  private:
-#if REX_PLATFORM_MAC
-  int MapViewsMac();
+#if REX_PLATFORM_MAC || REX_PLATFORM_LINUX
+  int MapViewsReserved();
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();

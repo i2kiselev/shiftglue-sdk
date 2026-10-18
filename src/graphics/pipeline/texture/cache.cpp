@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <map>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <utility>
@@ -28,6 +30,33 @@
 #include <rex/math.h>
 #include <rex/perf/counter.h>
 
+REXCVAR_DEFINE_BOOL(texture_band_reloads, true, "GPU",
+                    "Reload only the macro tile rows of a single-level tiled 2D texture that "
+                    "GPU writes (resolves) changed since its last load, when the backend can "
+                    "(Vulkan with vulkan_texture_load_compute_copy), instead of the whole "
+                    "texture")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_layer_reloads, true, "GPU",
+                    "Reload only the array layers (cube faces) of a tiled texture that GPU "
+                    "writes (resolves) changed since its last load, when the backend can "
+                    "(Vulkan), instead of every layer (FH1 renders one face of its reflection "
+                    "cube at a time)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_selective_binding_reset, true, "GPU",
+                    "When a texture becomes outdated, re-derive only the bindings of outdated "
+                    "textures before the next draw instead of every binding and the binding "
+                    "memo (a destroyed texture still resets them all)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(texture_gamma_host_srgb, false, "GPU",
+                    "Sample gamma textures (gamma color, linear alpha, 8-bit RGBA on the host) "
+                    "through sRGB views instead of converting with the Xenos piecewise linear "
+                    "curve in the shader: cheaper, with the sRGB curve and filtering after "
+                    "the conversion")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(android_allow_resolution_scale, false, "GPU",
+                    "Android: allow internal resolution scales above 1x (each needs a "
+                    "dedicated 512 MB x scale^2 resolve buffer)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -51,6 +80,18 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(texture_key_unused_packed_mips, true, "GPU",
+                    "Treat textures whose stored levels are all above the packed mip tail as "
+                    "the same texture whether their fetch constant packs mips or not")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_skip_resolve_reloads_format, 0, "GPU",
+                     "Diagnostics: with fh1_debug_skip_resolve_reloads, skip only textures of "
+                     "this xenos::TextureFormat (0: all)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_debug_skip_resolve_reloads, false, "GPU",
+                    "Diagnostics: never reload textures from resolved memory (stale images), "
+                    "to bound what the remaining reloads cost")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_texture_reload_probe, false, "GPU",
                     "Log FH1 texture invalidation ranges and reload attempts")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -147,6 +188,9 @@ REXCVAR_DEFINE_BOOL(fh1_log_scaled_textures, false, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+// critical_region_census (NN-3.10): this file's global lock acquisitions.
+constexpr auto kTextureCacheLockSource = rex::thread::LockSource::kTextureCache;
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -254,6 +298,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   }
   outdated_rows_global_watch_handle_ =
       shared_memory.RegisterGlobalWatch(OutdatedRowsGlobalWatchCallback, this);
+  write_log_global_watch_handle_ =
+      shared_memory.RegisterGlobalWatch(WriteLogGlobalWatchCallback, this);
 }
 
 TextureCache::~TextureCache() {
@@ -266,6 +312,9 @@ TextureCache::~TextureCache() {
     shared_memory().UnregisterGlobalWatch(reload_probe_global_watch_handle_);
   }
   shared_memory().UnregisterGlobalWatch(outdated_rows_global_watch_handle_);
+  if (write_log_global_watch_handle_) {
+    shared_memory().UnregisterGlobalWatch(write_log_global_watch_handle_);
+  }
 }
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
@@ -277,8 +326,17 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
   uint32_t config_y = use_shared_scale && !rex::cvar::HasNonDefaultValue("draw_resolution_scale_y")
                           ? shared_scale
                           : uint32_t(std::max(INT32_C(1), REXCVAR_GET(draw_resolution_scale_y)));
-  uint32_t clamped_x = std::min(kMaxDrawResolutionScaleAlongAxis, config_x);
-  uint32_t clamped_y = std::min(kMaxDrawResolutionScaleAlongAxis, config_y);
+  uint32_t max_scale = kMaxDrawResolutionScaleAlongAxis;
+#if REX_PLATFORM_ANDROID
+  // Mobile drivers have no sparse buffers, so the scaled resolve buffer is a
+  // dedicated 512 MB x scale^2 allocation in the memory the whole device
+  // shares; 1x is what a phone or handheld can hold (AP-2.5).
+  if (!REXCVAR_GET(android_allow_resolution_scale)) {
+    max_scale = 1;
+  }
+#endif
+  uint32_t clamped_x = std::min(max_scale, config_x);
+  uint32_t clamped_y = std::min(max_scale, config_y);
   x_out = clamped_x;
   y_out = clamped_y;
   return clamped_x == config_x && clamped_y == config_y;
@@ -286,6 +344,20 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
 
 void TextureCache::ClearCache() {
   DestroyAllTextures();
+}
+
+namespace {
+// Host uptime in milliseconds until which memory reduction applies.
+std::atomic<uint64_t> memory_reduction_until_ms{0};
+constexpr uint64_t kMemoryReductionDurationMs = 10000;
+constexpr uint32_t kMemoryReductionFloorMb = 256;
+constexpr uint32_t kMemoryReductionLifetimeMs = 1000;
+}  // namespace
+
+void TextureCache::RequestMemoryReduction() {
+  memory_reduction_until_ms.store(
+      rex::chrono::Clock::QueryHostUptimeMillis() + kMemoryReductionDurationMs,
+      std::memory_order_relaxed);
 }
 
 void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
@@ -302,6 +374,18 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
   uint32_t limit_hard_mb =
       REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
+  // LS-4.2: the fixed limits suit an 8 GB card at 3x; a 4 GB card or shared
+  // memory has less. Never past what the device's budget leaves textures.
+  if (const uint32_t budget_mb = budget_limit_mb_.load(std::memory_order_relaxed)) {
+    limit_hard_mb = std::min(limit_hard_mb, budget_mb);
+    limit_soft_mb = std::min(limit_soft_mb, std::max(budget_mb / 2, kMemoryReductionFloorMb));
+  }
+  const bool reducing = current_time < memory_reduction_until_ms.load(std::memory_order_relaxed);
+  if (reducing) {
+    limit_soft_mb = std::min(limit_soft_mb, kMemoryReductionFloorMb);
+    limit_soft_lifetime = std::min(limit_soft_lifetime, kMemoryReductionLifetimeMs);
+  }
+  const uint64_t usage_before = textures_total_host_memory_usage_;
   bool destroyed_any = false;
   while (texture_used_first_ != nullptr) {
     uint64_t total_host_memory_usage_mb =
@@ -326,7 +410,14 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       // any texture has been destroyed.
       ResetTextureBindings();
     }
-    // Remove the texture from the map and destroy it via its unique_ptr.
+    // Remove the texture from the maps and destroy it via its unique_ptr.
+    for (auto [it, end] = textures_by_base_.equal_range(texture->key().base_page << 12);
+         it != end; ++it) {
+      if (it->second == texture) {
+        textures_by_base_.erase(it);
+        break;
+      }
+    }
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
@@ -336,6 +427,10 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     }
   }
   if (destroyed_any) {
+    if (reducing) {
+      REXGPU_INFO("Texture cache reduced for low memory: {} MB to {} MB",
+                  usage_before >> 20, textures_total_host_memory_usage_ >> 20);
+    }
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   }
 }
@@ -349,8 +444,9 @@ void TextureCache::BeginSubmission(uint64_t new_submission_index) {
 void TextureCache::BeginFrame() {
   // In case there was a failure to create something in the previous frame, make
   // sure bindings are reset so a new attempt will surely be made if the texture
-  // is requested again.
-  ResetTextureBindings();
+  // is requested again. The memo holds only successful derivations of
+  // textures that still exist (destroying one resets it), so it is kept.
+  ResetTextureBindings(false, true);
 }
 
 std::vector<TextureCache::ScaledResolveRun> TextureCache::GetScaledResolveRuns() {
@@ -433,7 +529,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -512,7 +608,7 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   bool mips_outdated = false;
   bool resolve_sourced = false;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
     if (outdated_mask & Texture::kOutdatedBitBase) {
       base_outdated = texture.base_outdated(global_lock);
       texture.base_outdated_rows(global_lock, pending_load_out.base_rows_first,
@@ -538,15 +634,20 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
         "FH1 texture reload attempt {{\"texture\":{},\"base\":\"{:08X}\",\"mips\":\"{:08X}\","
         "\"width\":{},\"height\":{},\"depth\":{},\"format\":{},\"base_dirty\":{},"
         "\"mips_dirty\":{},\"base_bytes\":{},\"mips_bytes\":{},\"scaled\":{},"
-        "\"allocation_id\":{},\"payload_generation\":{}}}",
+        "\"allocation_id\":{},\"payload_generation\":{},\"tiled\":{},\"pitch\":{},"
+        "\"endian\":{},\"mip_max\":{},\"packed\":{},\"dimension\":{}}}",
         reinterpret_cast<uintptr_t>(&texture), uint32_t(key.base_page << 12),
         uint32_t(key.mip_page << 12), key.GetWidth(),
         key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.format), base_outdated,
         mips_outdated, texture.GetGuestBaseSize(), texture.GetGuestMipsSize(),
-        uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation());
+        uint32_t(key.scaled_resolve), texture.allocation_id(), texture.payload_generation(),
+        uint32_t(key.tiled), texture.guest_layout().base.row_pitch_bytes,
+        uint32_t(key.endianness), uint32_t(key.mip_max_level),
+        texture.guest_layout().packed_level, uint32_t(key.dimension));
   }
   if (TryLoadTextureDataFromCpu(texture, base_outdated, mips_outdated, resolve_sourced)) {
-    texture.CompleteLoad(global_critical_region_.Acquire(), base_outdated, mips_outdated);
+    texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource), base_outdated,
+                         mips_outdated);
     texture.LogAction("Loaded from CPU");
     return false;
   }
@@ -602,14 +703,37 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
+  if (pending_load.resolve_sourced && REXCVAR_GET(fh1_debug_skip_resolve_reloads) &&
+      (!REXCVAR_GET(fh1_debug_skip_resolve_reloads_format) ||
+       uint32_t(texture.key().format) == uint32_t(REXCVAR_GET(fh1_debug_skip_resolve_reloads_format)))) {
+    texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource),
+                         pending_load.load_base, pending_load.load_mips);
+    return true;
+  }
   loading_resolve_sourced_ = pending_load.resolve_sourced;
   loading_base_rows_first_ = pending_load.base_rows_first;
   loading_base_rows_end_ = pending_load.base_rows_end;
+  uint64_t write_log_count;
+  {
+    auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
+    write_log_count = write_log_count_;
+    loading_rows_first_ = loading_rows_end_ = 0;
+    loading_layers_mask_ = 0;
+    if (pending_load.load_base && !pending_load.load_mips) {
+      FindReloadRowBand(global_lock, texture);
+    }
+    FindReloadLayers(global_lock, texture);
+  }
   const auto load_start = std::chrono::steady_clock::now();
   const bool loaded = LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                                             pending_load.load_mips);
   loading_base_rows_first_ = 0;
   loading_base_rows_end_ = UINT32_MAX;
+  loading_rows_first_ = loading_rows_end_ = 0;
+  loading_layers_mask_ = 0;
+  if (loaded) {
+    texture.set_loaded_write_log_count(write_log_count);
+  }
   if (pending_load.resolve_sourced) {
     PERF_counter_add(kTextureResolveReloadCpuTimeNs,
                      std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -629,8 +753,8 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   // Only clear loaded ranges whose watches survived the entire upload. A write
   // during RequestRanges or the backend load must remain dirty for the next draw.
-  texture.CompleteLoad(global_critical_region_.Acquire(), pending_load.load_base,
-                       pending_load.load_mips);
+  texture.CompleteLoad(global_critical_region_.Acquire(kTextureCacheLockSource),
+                       pending_load.load_base, pending_load.load_mips);
   texture.LogAction("Loaded");
 
   return true;
@@ -639,11 +763,18 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+  // A plain load first: the flag is almost always clear, and the exchange is
+  // a locked read-modify-write on every draw (PD-2.4).
+  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
+      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
-    ResetTextureBindings();
+    if (REXCVAR_GET(texture_selective_binding_reset)) {
+      ResetOutdatedTextureBindings();
+    } else {
+      ResetTextureBindings();
+    }
   }
 
   // Update the texture keys and the textures.
@@ -687,17 +818,16 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     std::memcpy(binding.fetch_words, fetch_words, sizeof(binding.fetch_words));
     binding.fetch_words_valid = true;
     const BindingMemo* memo = nullptr;
-    for (const BindingMemo& entry : binding_memos_[index]) {
-      if (entry.epoch == binding_memo_epoch_ &&
-          !std::memcmp(entry.fetch_words, fetch_words, sizeof(entry.fetch_words))) {
-        memo = &entry;
-        break;
-      }
+    const BindingMemo& memo_slot = binding_memos_[BindingMemoSlot(fetch_words)];
+    if (memo_slot.epoch == binding_memo_epoch_ &&
+        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words))) {
+      memo = &memo_slot;
     }
     if (memo) {
       // As the derivation below would do for these words.
       const bool changed =
           binding.key != memo->key || binding.host_swizzle != memo->host_swizzle ||
+          binding.host_gamma != memo->host_gamma ||
           texture_util::IsAnySignNotSigned(binding.swizzled_signs) !=
               texture_util::IsAnySignNotSigned(memo->swizzled_signs) ||
           texture_util::IsAnySignSigned(binding.swizzled_signs) !=
@@ -708,6 +838,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       binding.host_swizzle = memo->host_swizzle;
       binding.swizzled_signs = memo->swizzled_signs;
       binding.normalized_fixed_point = memo->normalized_fixed_point;
+      binding.host_gamma = memo->host_gamma;
       binding.texture = memo->texture;
       binding.texture_signed = memo->texture_signed;
       texture_bindings_in_sync_ |= index_bit;
@@ -725,6 +856,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
+    bool old_host_gamma = binding.host_gamma;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     switch (fetch.format) {
       case xenos::TextureFormat::k_16_FLOAT:
@@ -746,6 +878,27 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
             fetch.num_format == 0 &&
             binding.swizzled_signs == kSwizzledSignsUnsigned;
         break;
+    }
+    // Gamma color with linear alpha is what an sRGB view decodes, so the
+    // shader can take those components as unsigned (the normalized fixed
+    // point check above still sees them as gamma).
+    binding.host_gamma = binding.key.is_valid && REXCVAR_GET(texture_gamma_host_srgb) &&
+                         fetch.sign_x == xenos::TextureSign::kGamma &&
+                         fetch.sign_y == xenos::TextureSign::kGamma &&
+                         fetch.sign_z == xenos::TextureSign::kGamma &&
+                         fetch.sign_w != xenos::TextureSign::kGamma &&
+                         IsHostGammaSupported(binding.key);
+    if (binding.host_gamma) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (((binding.swizzled_signs >> (2 * i)) & 0b11) == uint32_t(xenos::TextureSign::kGamma)) {
+          binding.swizzled_signs = uint8_t(
+              (binding.swizzled_signs & ~(0b11 << (2 * i))) |
+              (uint32_t(xenos::TextureSign::kUnsigned) << (2 * i)));
+        }
+      }
+    }
+    if (binding.host_gamma != old_host_gamma) {
+      bindings_changed |= index_bit;
     }
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
@@ -813,13 +966,14 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
     if (binding.texture || binding.texture_signed) {
-      BindingMemo& entry = binding_memos_[index][binding_memo_next_[index]++ % kBindingMemoWays];
+      BindingMemo& entry = binding_memos_[BindingMemoSlot(fetch_words)];
       entry.epoch = binding_memo_epoch_;
       std::memcpy(entry.fetch_words, fetch_words, sizeof(entry.fetch_words));
       entry.key = binding.key;
       entry.host_swizzle = binding.host_swizzle;
       entry.swizzled_signs = binding.swizzled_signs;
       entry.normalized_fixed_point = binding.normalized_fixed_point;
+      entry.host_gamma = binding.host_gamma;
       entry.texture = binding.texture;
       entry.texture_signed = binding.texture_signed;
     }
@@ -1115,6 +1269,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  textures_by_base_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -1237,6 +1392,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    textures_by_base_.emplace(key.base_page << 12, texture);
+    max_texture_base_size_ = std::max(max_texture_base_size_, texture->GetGuestBaseSize());
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1377,11 +1534,16 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   key_out.pitch = fetch.pitch;
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
-  // Without a level in the packed tail the flag changes nothing in the layout;
-  // dropped, one texture read with and without it is one texture.
-  key_out.packed_mips =
-      fetch.packed_mips &&
-      texture_util::GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1) <= mip_max_level;
+  key_out.packed_mips = fetch.packed_mips;
+  // Packing only places the levels of 16 texels or less: when no stored level
+  // is one of them, both settings describe the same texture, and FH1 fetches
+  // its single-level resolve targets both ways, which made two textures over
+  // the same memory of which a resolve could write only one.
+  if (key_out.packed_mips && REXCVAR_GET(texture_key_unused_packed_mips) &&
+      fetch.dimension != xenos::DataDimension::k3D &&
+      mip_max_level < texture_util::GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1)) {
+    key_out.packed_mips = 0;
+  }
   key_out.format = format;
   key_out.endianness = fetch.endianness;
 
@@ -1392,9 +1554,35 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
   }
 }
 
-void TextureCache::ResetTextureBindings(bool from_destructor) {
-  // Remembered derivations may name destroyed or outdated textures.
-  ++binding_memo_epoch_;
+void TextureCache::ResetOutdatedTextureBindings() {
+  // Only a binding whose texture is outdated needs its load rechecked: the
+  // others, and the memo's derivations (fetch words to key to texture, which
+  // an outdated texture keeps), stay valid. A texture outdated after the flag
+  // was taken sets it again, so the next draw rechecks it.
+  auto outdated = [](const Texture* texture) {
+    return texture != nullptr && texture->outdated_mask() != 0;
+  };
+  uint32_t bindings_reset = 0;
+  for (size_t i = 0; i < texture_bindings_.size(); ++i) {
+    TextureBinding& binding = texture_bindings_[i];
+    if (!binding.key.is_valid ||
+        (!outdated(binding.texture) && !outdated(binding.texture_signed))) {
+      continue;
+    }
+    binding.Reset();
+    bindings_reset |= UINT32_C(1) << i;
+  }
+  texture_bindings_in_sync_ &= ~bindings_reset;
+  if (bindings_reset) {
+    UpdateTextureBindingsImpl(bindings_reset);
+  }
+}
+
+void TextureCache::ResetTextureBindings(bool from_destructor, bool keep_memo) {
+  // Remembered derivations may name destroyed textures.
+  if (!keep_memo) {
+    ++binding_memo_epoch_;
+  }
   uint32_t bindings_reset = 0;
   for (size_t i = 0; i < texture_bindings_.size(); ++i) {
     TextureBinding& binding = texture_bindings_[i];
@@ -1439,7 +1627,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
   if (require_all) {
     for (uint32_t block = block_first; block <= block_last; ++block) {
       const uint32_t first_bit = block == block_first ? page_first & 31 : 0;
@@ -1483,6 +1671,292 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
   TextureCache* texture_cache = reinterpret_cast<TextureCache*>(context);
   texture_cache->ScaledResolveGlobalWatchCallback(global_lock, address_first, address_last,
                                                   invalidated_by_gpu);
+}
+
+void TextureCache::WriteLogGlobalWatchCallback(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  TextureCache& texture_cache = *static_cast<TextureCache*>(context);
+  texture_cache.write_log_[texture_cache.write_log_count_ % kWriteLogSize] = {
+      address_first, address_last, invalidated_by_gpu};
+  ++texture_cache.write_log_count_;
+}
+
+void TextureCache::FindReloadRowBand(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    const Texture& texture) {
+  loading_rows_first_ = 0;
+  loading_rows_end_ = 0;
+  const TextureKey& key = texture.key();
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  const FormatInfo* format_info = FormatInfo::Get(key.format);
+  if (!REXCVAR_GET(texture_band_reloads) || !key.tiled ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      key.mip_max_level != 0 || layout.packed_level == 0 || format_info->block_width != 1 ||
+      format_info->block_height != 1) {
+    return;
+  }
+  const uint64_t since = texture.loaded_write_log_count();
+  if (!since || write_log_count_ - since > kWriteLogSize) {
+    return;
+  }
+  const uint32_t base = key.base_page << 12;
+  const uint32_t size = texture.GetGuestBaseSize();
+  const uint32_t macro_row_bytes = layout.base.row_pitch_bytes * 32;
+  if (!size || !macro_row_bytes) {
+    return;
+  }
+  uint32_t row_first = UINT32_MAX, row_last = 0;
+  for (uint64_t i = since; i < write_log_count_; ++i) {
+    const WriteLogEntry& entry = write_log_[i % kWriteLogSize];
+    if (entry.address_last < base || entry.address_first >= base + size) {
+      continue;
+    }
+    if (!entry.by_gpu) {
+      // A CPU write: anything may have changed.
+      return;
+    }
+    const uint32_t first = std::max(entry.address_first, base) - base;
+    const uint32_t last = std::min(entry.address_last - base, size - 1);
+    row_first = std::min(row_first, first / macro_row_bytes);
+    row_last = std::max(row_last, last / macro_row_bytes);
+  }
+  if (row_first == UINT32_MAX) {
+    return;
+  }
+  const uint32_t height = key.GetHeight();
+  const uint32_t first = row_first * 32;
+  const uint32_t end = std::min((row_last + 1) * 32, height);
+  if (first >= end || (first == 0 && end == height)) {
+    return;
+  }
+  loading_rows_first_ = first;
+  loading_rows_end_ = end;
+}
+
+void TextureCache::FindReloadLayers(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
+    const Texture& texture) {
+  loading_layers_mask_ = 0;
+  const TextureKey& key = texture.key();
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  const uint32_t layers = key.GetDepthOrArraySize();
+  if (!REXCVAR_GET(texture_layer_reloads) || !key.tiled || key.scaled_resolve ||
+      key.dimension == xenos::DataDimension::k3D || layers < 2 || layers > 32 ||
+      layout.packed_level == 0) {
+    return;
+  }
+  const uint64_t since = texture.loaded_write_log_count();
+  if (!since || write_log_count_ - since > kWriteLogSize) {
+    return;
+  }
+  const uint32_t all = layers == 32 ? UINT32_MAX : (UINT32_C(1) << layers) - 1;
+  uint32_t mask = 0;
+  // Adds the layers of a level (from start, each stride bytes) that the
+  // bytes [first, end) touch, returning how many of those bytes are in it.
+  auto add = [&](uint32_t first, uint32_t end, uint32_t start, uint32_t stride) -> uint32_t {
+    const uint32_t level_end = start + stride * layers;
+    const uint32_t clipped_first = std::max(first, start);
+    const uint32_t clipped_end = std::min(end, level_end);
+    if (!stride || clipped_first >= clipped_end) {
+      return 0;
+    }
+    const uint32_t layer_first = (clipped_first - start) / stride;
+    const uint32_t layer_last = (clipped_end - 1 - start) / stride;
+    for (uint32_t layer = layer_first; layer <= layer_last; ++layer) {
+      mask |= UINT32_C(1) << layer;
+    }
+    return clipped_end - clipped_first;
+  };
+  const uint32_t base = key.base_page << 12;
+  const uint32_t base_size = texture.GetGuestBaseSize();
+  const uint32_t mips = key.mip_page << 12;
+  const uint32_t mips_size = key.mip_max_level ? texture.GetGuestMipsSize() : 0;
+  const uint32_t mip_last = std::min(uint32_t(key.mip_max_level), layout.packed_level);
+  for (uint64_t i = since; i < write_log_count_; ++i) {
+    const WriteLogEntry& entry = write_log_[i % kWriteLogSize];
+    const uint32_t first = entry.address_first;
+    const uint32_t end = entry.address_last + 1;
+    const bool in_base = base_size && first < base + base_size && base < end;
+    const bool in_mips = mips_size && first < mips + mips_size && mips < end;
+    if (!in_base && !in_mips) {
+      continue;
+    }
+    if (!entry.by_gpu) {
+      // A CPU write: anything may have changed.
+      return;
+    }
+    // Every touched byte must belong to a layer of a level, or the whole
+    // texture reloads.
+    if (in_base) {
+      const uint32_t touched = std::min(end, base + base_size) - std::max(first, base);
+      if (add(first, end, base, layout.base.array_slice_stride_bytes) != touched) {
+        return;
+      }
+    }
+    if (in_mips) {
+      const uint32_t touched = std::min(end, mips + mips_size) - std::max(first, mips);
+      uint32_t covered = 0;
+      for (uint32_t level = 1; level <= mip_last; ++level) {
+        covered += add(first, end, mips + layout.mip_offsets_bytes[level],
+                       layout.mips[level].array_slice_stride_bytes);
+      }
+      if (covered != touched) {
+        return;
+      }
+    }
+  }
+  if (mask && mask != all) {
+    loading_layers_mask_ = mask;
+  }
+}
+
+// FH1 resolves into memory shared by textures of several formats each frame,
+// so each resolve found its own texture outdated by the others and reloaded it.
+REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated, true, "GPU",
+                    "Resolves also write outdated textures directly when they cover all of "
+                    "them, instead of the textures reloading")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_direct_resolve_outdated_partial, REX_PLATFORM_LINUX, "GPU",
+                    "Resolves from texel 0, 0 also write outdated textures they cover only in "
+                    "part, which keep their older texels elsewhere instead of reloading what "
+                    "other writes left in that memory (FH1's shadow cascades, resolved into "
+                    "the corner of textures whose memory later passes reuse)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_resolve_bounded_image_writes, true, "GPU",
+                    "Resolves also write textures smaller than their area directly (their "
+                    "image stores skip texels outside the texture) instead of the textures "
+                    "reloading")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(fh1_trace_direct_resolves, false, "GPU",
+                    "Diagnostics: count why textures over a resolve's destination are not "
+                    "written by it directly, logged every 5000 resolves")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+void TextureCache::FindDirectResolveTargets(uint32_t dest_base, uint32_t extent_start,
+                                            uint32_t extent_length, xenos::TextureFormat format,
+                                            uint32_t pitch_texels, uint32_t dest_width,
+                                            uint32_t dest_height, bool scaled,
+                                            std::vector<DirectResolveTarget>& targets_out,
+                                            bool from_origin) {
+  targets_out.clear();
+  const FormatInfo* format_info = FormatInfo::Get(format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (format_info->block_width != 1 || format_info->block_height != 1 || !bytes_per_block) {
+    return;
+  }
+  const uint32_t pitch_aligned = (pitch_texels + 31) & ~UINT32_C(31);
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
+  static std::map<std::string, uint64_t> reasons;
+  static uint64_t calls = 0;
+  const bool trace = REXCVAR_GET(fh1_trace_direct_resolves);
+  struct TraceEnd {
+    bool trace;
+    std::vector<DirectResolveTarget>& out;
+    std::string misses;
+    ~TraceEnd() {
+      if (!trace) return;
+      ++reasons[out.empty() ? "result none" : out.size() == 1 ? "result one" : "result several"];
+      if (out.empty() && !misses.empty()) ++reasons["miss" + misses];
+      if (++calls % 5000 == 0) {
+        std::string text;
+        for (const auto& [reason, count] : reasons) text += fmt::format(" {}={};", reason, count);
+        REXGPU_INFO("Direct resolve census over {} resolves:{}", calls, text);
+      }
+    }
+  } trace_end{trace, targets_out};
+  if (trace) {
+    // Every texture overlapping the extent, and why it does not qualify.
+    for (const auto& [base, texture_ptr] : textures_by_base_) {
+      const Texture& texture = *texture_ptr;
+      if (base >= extent_start + extent_length || base + texture.GetGuestBaseSize() <= extent_start) {
+        continue;
+      }
+      const TextureKey& key = texture.key();
+      const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+      const char* reason =
+          key.format != format ? "format"
+          : !key.tiled ? "linear"
+          : key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1
+              ? "dimension"
+          : key.mip_max_level != 0 ? "mips"
+          : layout.packed_level == 0 ? "packed"
+          : bool(key.scaled_resolve) != scaled ? "scaled"
+          : texture.outdated_mask() ? "outdated"
+          : layout.base.row_pitch_bytes != pitch_aligned * bytes_per_block ? "pitch"
+          : (dest_base - base) % (layout.base.row_pitch_bytes * 32) || extent_start < base ||
+                  uint64_t(extent_start) + extent_length > uint64_t(base) + texture.GetGuestBaseSize()
+              ? "placement"
+              : "candidate";
+      if (key.format == format) {
+        trace_end.misses += fmt::format(" [{} {}x{} mips{} res {}x{} origin{} off{} pitch{}/{}]",
+                                        reason, key.GetWidth(), key.GetHeight(),
+                                        key.mip_max_level, dest_width, dest_height,
+                                        int(from_origin), dest_base - base,
+                                        layout.base.row_pitch_bytes,
+                                        pitch_aligned * bytes_per_block);
+      }
+      ++reasons[std::string(reason) + (key.format != format
+                                           ? fmt::format(" {}<-{}", uint32_t(key.format),
+                                                         uint32_t(format))
+                                           : std::string())];
+    }
+  }
+  // Textures starting at most 32 MB before the destination.
+  for (auto it = textures_by_base_.upper_bound(dest_base); it != textures_by_base_.begin();) {
+    --it;
+    const uint32_t base = it->first;
+    if (dest_base - base > (UINT32_C(32) << 20) ||
+        uint64_t(base) + max_texture_base_size_ < uint64_t(extent_start) + extent_length) {
+      // No texture from here down is large enough to hold the extent.
+      break;
+    }
+    Texture& texture = *it->second;
+    const TextureKey& key = texture.key();
+    const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+    if (key.format != format || !key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.GetDepthOrArraySize() != 1 || key.mip_max_level != 0 || layout.packed_level == 0 ||
+        bool(key.scaled_resolve) != scaled ||
+        layout.base.row_pitch_bytes != pitch_aligned * bytes_per_block) {
+      continue;
+    }
+    const uint32_t macro_row_bytes = layout.base.row_pitch_bytes * 32;
+    const uint32_t offset = dest_base - base;
+    if (offset % macro_row_bytes || extent_start < base ||
+        uint64_t(extent_start) + extent_length > uint64_t(base) + texture.GetGuestBaseSize()) {
+      continue;
+    }
+    // The texels the resolve writes (its source pixels from the destination's
+    // first row) must lie inside the texture, unless the resolve's image
+    // stores skip texels outside it (a small texture under a resolve of at
+    // least 8x8 texels, its memory still inside the texture's).
+    const uint32_t row_offset = offset / macro_row_bytes * 32;
+    if (!REXCVAR_GET(fh1_resolve_bounded_image_writes) &&
+        (dest_width > key.GetWidth() || row_offset + dest_height > key.GetHeight())) {
+      continue;
+    }
+    // An outdated texture (its memory written since its load, such as by
+    // another texture's resolve over the same memory) can only be written
+    // when the resolve covers all of it (from texel 0, 0), which makes it
+    // current again.
+    if (texture.outdated_mask() &&
+        !(REXCVAR_GET(fh1_direct_resolve_outdated) && from_origin && row_offset == 0 &&
+          ((dest_width >= key.GetWidth() && dest_height >= key.GetHeight()) ||
+           REXCVAR_GET(fh1_direct_resolve_outdated_partial)))) {
+      continue;
+    }
+    targets_out.push_back({&texture, row_offset});
+  }
+}
+
+void TextureCache::CompleteDirectResolve(const std::vector<DirectResolveTarget>& targets) {
+  auto global_lock = global_critical_region_.Acquire(kTextureCacheLockSource);
+  for (const DirectResolveTarget& target : targets) {
+    Texture& texture = *target.texture;
+    texture.WatchPendingLoad(global_lock, true, false);
+    texture.CompleteLoad(global_lock, true, false);
+    texture.set_loaded_write_log_count(write_log_count_);
+  }
 }
 
 void TextureCache::ReloadProbeGlobalWatchCallback(

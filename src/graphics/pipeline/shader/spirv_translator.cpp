@@ -26,16 +26,112 @@
 
 #include <rex/cvar.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/string/buffer.h>
 
-REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, false, "GPU",
-                    "Vulkan: translate pixel shaders without the Direct3D 9 multiply rule "
-                    "(0 * anything = 0) and let the driver fuse multiply-adds. Less pixel "
-                    "shader work at high scales; shaders that rely on 0 * Inf = 0 may show "
-                    "NaN pixels")
+// On Android: Adreno has no pushed pixel textures (see the command processor),
+// so each change allocated and wrote a set; on the Odin 2 Portal bindless takes
+// the recorder's CPU from 9.25 and 9.05 to 7.67 and 7.81 ms a frame (two pairs).
+REXCVAR_DEFINE_BOOL(vulkan_bindless_textures, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Bind textures and samplers from one long-lived descriptor set indexed by "
+                    "per-draw indices instead of per-draw descriptor sets and pushes, on devices "
+                    "with Vulkan 1.2 descriptor indexing (RECORDER_PER_DRAW_BACKLOG PD-4)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// On Android: the rule was most of a typical FH1 vertex shader on the
+// Adreno 740 (a depth-only one: 81 multiplies, 88 compares, 94 selects and 81
+// minimums). Without it the Odin 2 Portal's frame-600 replay falls from 14.19
+// to 13.87 ms, and that frame, free roam, a race, photo mode and the title
+// replay byte-identical.
+REXCVAR_DEFINE_BOOL(spirv_ieee_vertex_math, REX_PLATFORM_ANDROID, "GPU",
+                    "Vulkan: vertex shaders multiply as IEEE floats, without the Direct3D 9 "
+                    "rule that 0 * anything = 0 (a compare and a select per product). "
+                    "Products stay unfused, so positions match between passes; a 0 * Inf "
+                    "vertex comes out NaN")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// On Android: the Odin 2 Portal's 1x drive GPU frame falls about 4 ms (36 to
+// 32), with only scattered pixels of foliage and shadow noise changing. That
+// was with plain IEEE products, whose 0 * Inf = NaN smeared the scene (#403);
+// with the NaN check the Thor's parked scene pass is 10.4 ms, as with the full
+// rule, against 10.0 ms with plain products. On macOS: an M4 Pro free-roam
+// drive's median frame falls from 10.9 to 8.6 ms (two runs each), brightness
+// and the image unchanged against Windows.
+REXCVAR_DEFINE_BOOL(spirv_fast_pixel_math, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+                    "Vulkan: in pixel shaders, apply the Direct3D 9 multiply rule (0 * anything "
+                    "= 0) only to products that come out NaN, and let the driver fuse "
+                    "multiply-adds. Less pixel shader work at high scales; a NaN operand times "
+                    "a nonzero one also gives 0")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// On Android: the Odin 2 Portal's 1x drive frame falls about 3 ms (6 %) when
+// the texture sign switches fold away. On macOS the M4 Pro drive's median
+// frame falls from 10.9 to 9.8 ms.
+REXCVAR_DEFINE_BOOL(spirv_specialize_texture_signs, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
+                    "Vulkan: make each texture fetch's signedness (unsigned, signed, biased, "
+                    "gamma) a specialization constant set from the bound textures when the "
+                    "pipeline is created, so drivers fold the per-fetch switch away; pipelines "
+                    "made without it read the signedness at run time as before")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// Turnip on the Odin 2 Portal (Adreno 740): 6 % off the frame at 4x MSAA,
+// the image unchanged but for a few pixels at level transitions. Qualcomm's
+// own driver gained nothing.
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_turnip, false, "GPU",
+                    "Vulkan: on Mesa Turnip, sample 2D textures in pixel shaders with implicit "
+                    "LOD as spirv_implicit_lod_2d does. Off by default: on the Adreno 740 some "
+                    "2x2 quads of FH1's flags, signs and foliage then sample wrong mips, "
+                    "speckles that change every frame")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// The Turnip speckles came from fetches some pixels of a quad skip: in a
+// per-pixel predicated exec or instruction, a loop or a program with jumps,
+// implicit derivatives are undefined. The rest are safe, and FH1's full-screen
+// passes are among them.
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d_uniform_turnip, true, "GPU",
+                    "Vulkan: on Mesa Turnip, sample 2D textures in pixel shaders with implicit "
+                    "LOD where every pixel of the quad runs the fetch (no per-pixel predicate, "
+                    "loop or jump around it), as spirv_implicit_lod_2d does everywhere")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(spirv_implicit_lod_2d, false, "GPU",
+                    "Vulkan: sample 2D textures whose level the pixel shader computes with "
+                    "implicit level of detail plus the bias, as cube maps already are, "
+                    "instead of explicit gradients - cheaper on tiled mobile GPUs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// The Adreno 740's 128 MB storage buffer range split shared memory into four
+// bindings, and each vertex fetch word was a switch whose loads Turnip
+// serializes (548 instructions and about 470 stalled cycles in a typical FH1
+// vertex shader, 252 and 51 with one texel buffer). The Odin 2 Portal's
+// frame-600 replay: 16.65 to 15.01 ms at 1x, 20.48 to 18.9 at 4x, the image
+// bit-identical.
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Read shared memory (vertex fetches) through one R32_UINT uniform texel "
+                    "buffer over all 512 MB on devices whose storage buffer range is smaller, "
+                    "instead of a switch over several storage buffer bindings")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
+
+spv::Id SpirvShaderTranslator::TextureSignsWord(uint32_t fetch_constant_index,
+                                                spv::Id system_constant_word) {
+  if (!REXCVAR_GET(spirv_specialize_texture_signs)) {
+    return system_constant_word;
+  }
+  const uint32_t word = (fetch_constant_index >> 2) & 7;
+  if (spec_texture_signs_[word] == spv::NoResult) {
+    spv::Id spec = builder_->makeUintConstant(kTextureSignsDynamic, true);
+    builder_->addDecoration(spec, spv::DecorationSpecId,
+                            int(kSpecConstantTextureSignsFirst + word));
+    spec_texture_signs_[word] = spec;
+  }
+  spv::Id spec = spec_texture_signs_[word];
+  return builder_->createTriOp(
+      spv::OpSelect, type_uint_,
+      builder_->createBinOp(spv::OpINotEqual, type_bool_, spec,
+                            builder_->makeUintConstant(kTextureSignsDynamic)),
+      spec, system_constant_word);
+}
 
 SpirvShaderTranslator::Features::Features(bool all)
     : spirv_version(all ? spv::Spv_1_5 : spv::Spv_1_0),
@@ -52,7 +148,11 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all),
       sample_rate_shading(all),
-      quad_operations_fragment(all) {}
+      quad_operations_fragment(all),
+      bindless_textures(false),
+      implicit_lod_2d(false),
+      implicit_lod_2d_uniform(false),
+      shared_memory_texel_buffer(false) {}
 
 SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(vulkan_device->properties().maxStorageBufferRange),
@@ -70,7 +170,13 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
       sample_rate_shading(vulkan_device->properties().sampleRateShading),
-      quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment) {
+      quad_operations_fragment(vulkan_device->properties().subgroupQuadFragment),
+      implicit_lod_2d(REXCVAR_GET(spirv_implicit_lod_2d) ||
+                      (REXCVAR_GET(spirv_implicit_lod_2d_turnip) &&
+                       vulkan_device->properties().driverID == VK_DRIVER_ID_MESA_TURNIP)),
+      implicit_lod_2d_uniform(REXCVAR_GET(spirv_implicit_lod_2d_uniform_turnip) &&
+                              vulkan_device->properties().driverID ==
+                                  VK_DRIVER_ID_MESA_TURNIP) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -84,6 +190,28 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const 
   if (spirv_version < spv::Spv_1_3) {
     quad_operations_fragment = false;
   }
+  const auto& device_properties = vulkan_device->properties();
+  bindless_textures = REXCVAR_GET(vulkan_bindless_textures) &&
+                      vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+                      device_properties.shaderSampledImageArrayDynamicIndexing &&
+                      device_properties.runtimeDescriptorArray &&
+                      device_properties.descriptorBindingSampledImageUpdateAfterBind &&
+                      device_properties.descriptorBindingPartiallyBound &&
+                      device_properties.descriptorBindingUpdateUnusedWhilePending &&
+                      // The sizes VulkanTextureCache::InitializeBindless needs.
+                      device_properties.maxPerStageDescriptorUpdateAfterBindSampledImages >=
+                          12288 &&
+                      device_properties.maxDescriptorSetUpdateAfterBindSampledImages >= 12288 &&
+                      device_properties.maxUpdateAfterBindDescriptorsInAllPools >= 24576 &&
+                      device_properties.maxPerStageDescriptorUpdateAfterBindSamplers >= 256 &&
+                      device_properties.maxDescriptorSetUpdateAfterBindSamplers >= 256;
+  // R32_UINT uniform texel buffers are required by Vulkan, only the element
+  // count limit varies.
+  shared_memory_texel_buffer =
+      REXCVAR_GET(vulkan_shared_memory_texel_buffer) &&
+      GetSharedMemoryStorageBufferCountLog2(max_storage_buffer_range) != 0 &&
+      // 512 MB in dwords.
+      device_properties.maxTexelBufferElements >= (UINT32_C(1) << 27);
 }
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
@@ -177,6 +305,7 @@ void SpirvShaderTranslator::Reset() {
 
   cf_exec_conditional_merge_ = nullptr;
   cf_instruction_predicate_merge_ = nullptr;
+  cf_loop_depth_ = 0;
 }
 
 uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
@@ -193,6 +322,8 @@ void SpirvShaderTranslator::StartTranslation() {
   fast_pixel_math_ = REXCVAR_GET(spirv_fast_pixel_math) && is_pixel_shader() &&
                      !current_shader().writes_depth();
   builder_->allow_contraction = fast_pixel_math_;
+  ieee_math_ = REXCVAR_GET(spirv_ieee_vertex_math) && is_vertex_shader();
+  std::fill(std::begin(spec_texture_signs_), std::end(spec_texture_signs_), spv::NoResult);
 
   builder_->addCapability(IsSpirvTessEvalShader() ? spv::CapabilityTessellation
                                                   : spv::CapabilityShader);
@@ -327,14 +458,24 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"object_slot", offsetof(SystemConstants, object_slot), type_uint_},
+      {"object_row_offset", offsetof(SystemConstants, object_row_offset), type_int_},
   };
+  // UP-1.7: the object slot constants (last) only in the shaders that write
+  // it, so the others translate as before.
+  const size_t system_constant_count =
+      rex::countof(system_constants) -
+      (is_pixel_shader() && !edram_fragment_shader_interlock_ &&
+               GetSpirvShaderModification().pixel.object_slot_output
+           ? 0
+           : 2);
   id_vector_temp_.clear();
-  id_vector_temp_.reserve(rex::countof(system_constants));
-  for (size_t i = 0; i < rex::countof(system_constants); ++i) {
+  id_vector_temp_.reserve(system_constant_count);
+  for (size_t i = 0; i < system_constant_count; ++i) {
     id_vector_temp_.push_back(system_constants[i].type);
   }
   spv::Id type_system_constants = builder_->makeStructType(id_vector_temp_, "XeSystemConstants");
-  for (size_t i = 0; i < rex::countof(system_constants); ++i) {
+  for (size_t i = 0; i < system_constant_count; ++i) {
     const SystemConstant& system_constant = system_constants[i];
     builder_->addMemberName(type_system_constants, static_cast<unsigned int>(i),
                             system_constant.name);
@@ -418,6 +559,9 @@ void SpirvShaderTranslator::StartTranslation() {
       main_interface_.push_back(uniform_bool_loop_constants_);
     }
 
+    for (spv::Id& bindless_array : bindless_arrays_) {
+      bindless_array = spv::NoResult;
+    }
     // Common uniform buffer - fetch constants (32 x 6 uints packed in std140 as
     // 4-component vectors).
     id_vector_temp_.clear();
@@ -425,9 +569,22 @@ void SpirvShaderTranslator::StartTranslation() {
         type_uint4_, builder_->makeUintConstant(32 * 6 / 4), sizeof(uint32_t) * 4));
     builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
                             sizeof(uint32_t) * 4);
+    if (features_.bindless_textures) {
+      // PD-4: the draw's bindless indices follow the fetch constants.
+      id_vector_temp_.push_back(builder_->makeArrayType(
+          type_uint4_, builder_->makeUintConstant(kBindlessIndicesBytes / (sizeof(uint32_t) * 4)),
+          sizeof(uint32_t) * 4));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              sizeof(uint32_t) * 4);
+    }
     spv::Id type_fetch_constants = builder_->makeStructType(id_vector_temp_, "XeFetchConstants");
     builder_->addMemberName(type_fetch_constants, 0, "fetch_constants");
     builder_->addMemberDecoration(type_fetch_constants, 0, spv::DecorationOffset, 0);
+    if (features_.bindless_textures) {
+      builder_->addMemberName(type_fetch_constants, 1, "bindless_indices");
+      builder_->addMemberDecoration(type_fetch_constants, 1, spv::DecorationOffset,
+                                    int(kFetchConstantsBytes));
+    }
     builder_->addDecoration(type_fetch_constants, spv::DecorationBlock);
     uniform_fetch_constants_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassUniform, type_fetch_constants,
@@ -471,6 +628,22 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
+    }
+    texel_buffer_shared_memory_ = spv::NoResult;
+    if (features_.shared_memory_texel_buffer) {
+      builder_->addCapability(spv::CapabilitySampledBuffer);
+      texel_buffer_shared_memory_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassUniformConstant,
+          builder_->makeImageType(type_uint_, spv::DimBuffer, false, false, false, 1,
+                                  spv::ImageFormatUnknown),
+          "xe_shared_memory_texel_buffer");
+      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationBinding,
+                              int(kSharedMemoryTexelBufferBinding));
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(texel_buffer_shared_memory_);
+      }
     }
   }
 
@@ -676,6 +849,16 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // Close flow control within the last switch case.
     CloseExecConditionals();
     bool has_main_switch = !current_shader().label_addresses().empty();
+    // The rectangle-list vertex loop (below, after the main loop) continues
+    // it for the next guest vertex, so its edge into the continuation must be
+    // an operand of the program counter OpPhi, which is built first. That
+    // edge leaves from a block made now, whose id the OpPhi can name.
+    spv::Block* rectangle_next_vertex_block = nullptr;
+    if (rectangle_vertex_loop && has_main_switch) {
+      rectangle_next_vertex_block = new spv::Block(builder_->getUniqueId(), *function_main_);
+      main_switch_next_pc_phi_operands_.push_back(const_int_0_);
+      main_switch_next_pc_phi_operands_.push_back(rectangle_next_vertex_block->getId());
+    }
     // After the final exec (if it happened to be not exece, which would already
     // have a break branch), break from the switch if it exists, or from the
     // loop it doesn't.
@@ -953,9 +1136,10 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
                                                             var_main_registers_, id_vector_temp_));
         }
 
-        if (has_main_switch) {
-          main_switch_next_pc_phi_operands_.push_back(const_int_0_);
-          main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+        if (rectangle_next_vertex_block) {
+          builder_->createBranch(rectangle_next_vertex_block);
+          function_main_->addBlock(rectangle_next_vertex_block);
+          builder_->setBuildPoint(rectangle_next_vertex_block);
         }
         builder_->createBranch(main_loop_continue_);
       }
@@ -1259,9 +1443,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // set.
     size_t texture_binding_count = texture_bindings_.size();
     size_t sampler_binding_count = sampler_bindings_.size();
-    for (size_t i = 0; i < sampler_binding_count; ++i) {
-      builder_->addDecoration(sampler_bindings_[i].variable, spv::DecorationBinding,
-                              int(texture_binding_count + i));
+    if (!features_.bindless_textures) {
+      for (size_t i = 0; i < sampler_binding_count; ++i) {
+        builder_->addDecoration(sampler_bindings_[i].variable, spv::DecorationBinding,
+                                int(texture_binding_count + i));
+      }
     }
   }
 
@@ -1330,7 +1516,14 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
   new_case->addPredecessor(main_switch_header_);
   // The previous block may have already been terminated if was exece.
   if (!builder_->getBuildPoint()->isTerminated()) {
-    builder_->createBranch(new_case);
+    // Don't fall through directly into the next case block. An OpSwitch case
+    // fall-through inside the main loop makes the NVIDIA shader compiler emit
+    // a non-terminating loop (a device loss). Instead re-enter the loop with
+    // this label as the program counter, like an unconditional jump to it
+    // does (xenia-edge f145711a4a).
+    main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(int(cf_index)));
+    main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+    builder_->createBranch(main_loop_continue_);
   }
   function.addBlock(new_case);
   builder_->setBuildPoint(new_case);
@@ -1353,6 +1546,7 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstructio
 }
 
 void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartInstruction& instr) {
+  ++cf_loop_depth_;
   // loop il<idx>, L<idx> - loop with loop data il<idx>, end @ L<idx>
 
   // Loop control is outside execs - actually close the last exec.
@@ -1443,6 +1637,7 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartIns
 }
 
 void SpirvShaderTranslator::ProcessLoopEndInstruction(const ParsedLoopEndInstruction& instr) {
+  if (cf_loop_depth_) --cf_loop_depth_;
   // endloop il<idx>, L<idx> - end loop w/ data il<idx>, head @ L<idx>
 
   // Loop control is outside execs - actually close the last exec.
@@ -2962,8 +3157,11 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // (per-sample if supported).
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
+  const bool object_slot_output =
+      !edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output;
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
+      object_slot_output) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
@@ -4117,6 +4315,19 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
   spv::StorageClass storage_class = features_.spirv_version >= spv::Spv_1_3
                                         ? spv::StorageClassStorageBuffer
                                         : spv::StorageClassUniform;
+
+  if (features_.shared_memory_texel_buffer) {
+    // One fetch, no branches: the storage buffer switch below serializes the
+    // loads of every word (four dependent fetches on Turnip).
+    spv::Id image = builder_->createLoad(texel_buffer_shared_memory_, spv::NoPrecision);
+    SpirvBuilder::TextureParameters fetch_parameters = {};
+    fetch_parameters.sampler = image;
+    fetch_parameters.coords = address_dwords_int;
+    return builder_->createCompositeExtract(
+        builder_->createTextureCall(spv::NoPrecision, type_uint4_, false, true, false, false,
+                                    false, fetch_parameters, spv::ImageOperandsMaskNone),
+        type_uint_, 0);
+  }
 
   uint32_t binding_count_log2 = GetSharedMemoryStorageBufferCountLog2();
 

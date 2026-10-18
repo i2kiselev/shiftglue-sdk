@@ -40,6 +40,8 @@ enum class NativeGuestOutputBackend : uint32_t {
   kUnsupported = 0,
   kD3D12 = 1,
   kVulkan = 2,
+  // No device: the null backend's swaps (no image, device or context).
+  kNull = 3,
 };
 
 enum class NativeGuestOutputPhase : uint32_t {
@@ -49,8 +51,10 @@ enum class NativeGuestOutputPhase : uint32_t {
 
 // Which renderer produced the guest output of a kPresented notification.
 enum class NativeGuestOutputPresenter : uint32_t {
-  // The FH1 native executor, the only renderer.
+  // The FH1 native executor, the only drawing renderer.
   kNativeExecutor = 2,
+  // The null backend, which draws nothing.
+  kNull = 3,
 };
 
 struct NativeGuestOutputRenderContext {
@@ -194,6 +198,12 @@ class IGraphicsSystem {
   virtual bool HasNativeGuestOutputRenderer() const { return false; }
   // The draw resolution scale the renderer uses, 0 when unknown.
   virtual uint32_t draw_resolution_scale() const { return 0; }
+  // FH1: the guest memory of the screen's shadow mask texture, once the GPU
+  // backend has resolved it (the Vulkan FH1 executor), for a title hook that
+  // replaces the shadow passes with a lit mask; resolves counts its resolves.
+  virtual bool fh1_shadow_mask(uint32_t* base, uint32_t* length, uint32_t* resolves) const {
+    return false;
+  }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {
@@ -228,6 +238,14 @@ class IGraphicsSystem {
     }
     return SetupGuestGpu(function_dispatcher, kernel_state);
   }
+
+  // Stop and restart consuming the guest's command buffers (the app in the
+  // background); guest threads then wait on the GPU as on a stalled frame.
+  virtual void Pause() {}
+  virtual void Resume() {}
+  // The system is short of memory (Android's onTrimMemory): release caches
+  // the renderer can rebuild.
+  virtual void ReduceMemory() {}
 
   virtual void Shutdown() = 0;
 };

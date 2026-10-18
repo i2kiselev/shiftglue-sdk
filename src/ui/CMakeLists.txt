@@ -11,6 +11,7 @@ set(REXUI_CORE_SOURCES
     keybinds.cpp
     menu_item.cpp
     presenter.cpp
+    upscaler.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
     window.cpp
@@ -38,9 +39,12 @@ set(REXUI_VULKAN_SOURCES
     vulkan/single_layout_descriptor_set_pool.cpp
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
+    vulkan/vulkan_dlss_upscaler.cpp
+    vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
+    $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
@@ -71,6 +75,10 @@ if(WIN32)
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
+    )
+elseif(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
@@ -141,6 +149,18 @@ endif()
 if(REXUI_HAS_FIDELITYFX_RUNTIME)
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_RUNTIME=1)
 endif()
+# The FSR 2/3 provider: linked to the SDK built from source, or loading
+# AMD's runtime at run time (cmake/rexglue_ffx_api_headers.cmake).
+if(REXGLUE_USE_VULKAN AND REXGLUE_FFX_API_INCLUDE_DIR)
+    target_include_directories(rexui PRIVATE "${REXGLUE_FFX_API_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_FFX_API=1)
+endif()
+# The DLSS provider, when the build opted in (cmake/rexglue_dlss.cmake).
+if(REXGLUE_USE_VULKAN AND REXGLUE_DLSS_INCLUDE_DIR AND REXGLUE_DLSS_LIBRARY)
+    target_include_directories(rexui PRIVATE "${REXGLUE_DLSS_INCLUDE_DIR}")
+    target_compile_definitions(rexui PRIVATE REX_HAS_DLSS=1)
+    target_link_libraries(rexui PRIVATE "${REXGLUE_DLSS_LIBRARY}")
+endif()
 
 if(REXGLUE_USE_VULKAN)
     target_link_libraries(rexui PUBLIC
@@ -151,7 +171,13 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE)
+if(ANDROID)
+    # nativewindow: ANativeWindow_setBuffersDataSpace (HDR10 output).
+    target_link_libraries(rexui PUBLIC android nativewindow)
+    target_link_libraries(rexui PRIVATE adrenotools)
+    # Loaded from the native library folder at run time, not linked.
+    add_dependencies(rexui main_hook file_redirect_hook gsl_alloc_hook hook_impl)
+elseif(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every

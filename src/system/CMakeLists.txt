@@ -10,6 +10,8 @@ set(REXSYSTEM_SOURCES
     xthread.cpp
     xevent.cpp
     gpu_write_signal.cpp
+    d3d_census.cpp
+    d3d_draw.cpp
     xfile.cpp
     xmutant.cpp
     xsemaphore.cpp
@@ -55,6 +57,11 @@ add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)
 
 set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+# Exporting all symbols covers data as well, but a consumer must declare that
+# data dllimport to link it. REX_RUNTIME_DATA (rex/runtime_api.h) does so for
+# the targets linking rexruntime; rexruntime and the object libraries built
+# into it do not get this definition.
+target_compile_definitions(rexruntime INTERFACE REX_RUNTIME_IMPORTS=1)
 
 rex_target_pch(rexruntime
     <mutex>

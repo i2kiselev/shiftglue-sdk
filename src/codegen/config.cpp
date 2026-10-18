@@ -114,8 +114,71 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_argument_as_local"), "non_argument_as_local");
   MergeBool(cfg.nonVolatileRegistersAsLocalVariables, toml["non_volatile_as_local"].value_or(false),
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
+  MergeBool(cfg.nonVolatileFprsAsLocalVariables, toml["non_volatile_fprs_as_local"].value_or(true),
+            hasBool("non_volatile_fprs_as_local"), "non_volatile_fprs_as_local");
+  MergeBool(cfg.nonVolatileVectorsAsLocalVariables,
+            toml["non_volatile_vectors_as_local"].value_or(true),
+            hasBool("non_volatile_vectors_as_local"), "non_volatile_vectors_as_local");
+  MergeBool(cfg.nonVolatileReloadAfterCall, toml["non_volatile_reload_after_call"].value_or(false),
+            hasBool("non_volatile_reload_after_call"), "non_volatile_reload_after_call");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
+  MergeBool(cfg.abiPoisonChecks, toml["abi_poison_checks"].value_or(false),
+            hasBool("abi_poison_checks"), "abi_poison_checks");
+  MergeBool(cfg.interiorResume, toml["interior_resume"].value_or(true), hasBool("interior_resume"),
+            "interior_resume");
+  MergeBool(cfg.directCallsBypassThunk, toml["direct_calls_bypass_thunk"].value_or(false),
+            hasBool("direct_calls_bypass_thunk"), "direct_calls_bypass_thunk");
+  MergeBool(cfg.foldRodataLoads, toml["fold_rodata_loads"].value_or(false),
+            hasBool("fold_rodata_loads"), "fold_rodata_loads");
+  MergeBool(cfg.hostLocalRegisterSaves, toml["host_local_register_saves"].value_or(false),
+            hasBool("host_local_register_saves"), "host_local_register_saves");
+  if (auto keep = toml["host_local_register_saves_keep"].as_array()) {
+    for (const auto& elem : *keep) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostLocalRegisterSavesKeep.push_back(static_cast<uint32_t>(*val));
+    }
+  }
+  MergeBool(cfg.hostLocalLr, toml["host_local_lr"].value_or(false), hasBool("host_local_lr"),
+            "host_local_lr");
+  if (auto keep = toml["host_local_lr_keep"].as_array()) {
+    for (const auto& elem : *keep) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostLocalLrKeep.push_back(static_cast<uint32_t>(*val));
+    }
+  }
+  // NN-5.1 per-function specialisation lists (additive across includes).
+  auto addressList = [&](const char* key, std::vector<uint32_t>& list) {
+    if (auto arr = toml[key].as_array()) {
+      for (const auto& elem : *arr) {
+        if (auto val = elem.value<int64_t>())
+          list.push_back(static_cast<uint32_t>(*val));
+      }
+    }
+  };
+  addressList("register_locals_functions", cfg.registerLocalsFunctions);
+  addressList("fixed_fp_mode_functions", cfg.fixedFpModeFunctions);
+  addressList("single_precision_functions", cfg.singlePrecisionFunctions);
+  MergeBool(cfg.guestLineDirectives, toml["guest_line_directives"].value_or(false),
+            hasBool("guest_line_directives"), "guest_line_directives");
+  MergeBool(cfg.disassemblyComments, toml["disassembly_comments"].value_or(true),
+            hasBool("disassembly_comments"), "disassembly_comments");
+  MergeBool(cfg.callProbes, toml["call_probes"].value_or(false), hasBool("call_probes"),
+            "call_probes");
+  if (auto every = toml["reference_sample_every"].value<int64_t>())
+    cfg.referenceSampleEvery = static_cast<uint32_t>(*every);
+  if (auto references = toml["reference_functions"].as_array()) {
+    for (const auto& elem : *references) {
+      if (auto val = elem.value<int64_t>())
+        cfg.referenceFunctions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
+  if (auto overridden = toml["host_overridden_functions"].as_array()) {
+    for (const auto& elem : *overridden) {
+      if (auto val = elem.value<int64_t>())
+        cfg.hostOverriddenFunctions.push_back(static_cast<uint32_t>(*val));
+    }
+  }
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }
@@ -462,6 +525,38 @@ bool FinalizeConfig(RecompilerConfig& cfg) {
     }
     REXCODEGEN_TRACE("Loaded {} function configs ({} standalone, {} chunks)", cfg.functions.size(),
                      cfg.functions.size() - chunks_count, chunks_count);
+  }
+  if (!cfg.referenceFunctions.empty()) {
+    std::sort(cfg.referenceFunctions.begin(), cfg.referenceFunctions.end());
+    cfg.referenceFunctions.erase(
+        std::unique(cfg.referenceFunctions.begin(), cfg.referenceFunctions.end()),
+        cfg.referenceFunctions.end());
+  }
+  if (!cfg.hostOverriddenFunctions.empty()) {
+    std::sort(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end());
+    cfg.hostOverriddenFunctions.erase(
+        std::unique(cfg.hostOverriddenFunctions.begin(), cfg.hostOverriddenFunctions.end()),
+        cfg.hostOverriddenFunctions.end());
+  }
+  if (!cfg.hostLocalRegisterSavesKeep.empty()) {
+    std::sort(cfg.hostLocalRegisterSavesKeep.begin(), cfg.hostLocalRegisterSavesKeep.end());
+    cfg.hostLocalRegisterSavesKeep.erase(
+        std::unique(cfg.hostLocalRegisterSavesKeep.begin(), cfg.hostLocalRegisterSavesKeep.end()),
+        cfg.hostLocalRegisterSavesKeep.end());
+  }
+  if (!cfg.hostLocalLrKeep.empty()) {
+    std::sort(cfg.hostLocalLrKeep.begin(), cfg.hostLocalLrKeep.end());
+    cfg.hostLocalLrKeep.erase(std::unique(cfg.hostLocalLrKeep.begin(), cfg.hostLocalLrKeep.end()),
+                              cfg.hostLocalLrKeep.end());
+  }
+  for (auto* list : {&cfg.registerLocalsFunctions, &cfg.fixedFpModeFunctions,
+                     &cfg.singlePrecisionFunctions}) {
+    std::sort(list->begin(), list->end());
+    list->erase(std::unique(list->begin(), list->end()), list->end());
+  }
+  if (cfg.hostLocalLr && !cfg.hostLocalRegisterSaves) {
+    REXCODEGEN_WARN("host_local_lr needs host_local_register_saves; leaving the LR slot in memory");
+    cfg.hostLocalLr = false;
   }
   if (!cfg.exceptionHandlerFuncHints.empty()) {
     std::sort(cfg.exceptionHandlerFuncHints.begin(), cfg.exceptionHandlerFuncHints.end());

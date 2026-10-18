@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -25,10 +26,12 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
 #include <rex/stream.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
 #include <rex/ui/graphics_provider.h>
@@ -38,6 +41,15 @@
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"});
+REXCVAR_DEFINE_BOOL(swap_post_effect_scene_only, true, "GPU",
+                    "Vulkan: apply the swap post effect to the scene only, not to the HUD drawn "
+                    "over it (no effect where the frame has no scene)");
+REXCVAR_DEFINE_STRING(scene_lut_path, "", "GPU",
+                      "Vulkan: a .cube 3D colour LUT applied to the scene, not the HUD; empty "
+                      "for none");
+REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
+                     "Vulkan: how much of the scene LUT applies, in percent")
+    .range(0, 100);
 
 REXCVAR_DEFINE_STRING(gpu_pixel_shader_constant_override, "", "GPU",
                       "Replaces one float constant of one pixel shader in each of its draws: "
@@ -55,6 +67,9 @@ REXCVAR_DEFINE_DOUBLE(fh1_guest_vblank_hz, 0.0, "GPU",
                       "Guest vblank rate in Hz, read live (0 = twice "
                       "pinyon_shift_fh1_render_fps_limit)")
     .range(0.0, 2000.0);
+REXCVAR_DEFINE_BOOL(gpu_log_register_reads, false, "GPU",
+                    "Log the first guest read of each GPU register (a census of what the "
+                    "title polls, for deciding which reads need emulation)");
 REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_vblank_deadline_wait, true, "Pinyon Shift",
                     "Deliver FH1 guest vblanks from deadlines instead of 1 ms polling")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -253,6 +268,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t interval_ticks = 1;
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
+          if (chrono::Clock::guest_time_paused()) {
+            // Guest time stands still in the background: no vblank is due.
+            rex::thread::Sleep(std::chrono::milliseconds(20));
+            continue;
+          }
           const uint32_t current_render_fps_limit =
               REXCVAR_GET(pinyon_shift_fh1_render_fps_limit);
           const double current_vblank_hz = REXCVAR_GET(fh1_guest_vblank_hz);
@@ -300,7 +320,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           } else if (remaining_time > kVblankSpinTime) {
             std::this_thread::sleep_for(remaining_time - kVblankSpinTime);
           }
-          while (vsync_worker_running_ &&
+          while (vsync_worker_running_ && !chrono::Clock::guest_time_paused() &&
                  chrono::Clock::QueryGuestTickCount() < deadline_ticks) {
             std::this_thread::yield();
           }
@@ -359,7 +379,7 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread([[maybe_unused]] bool is_respons
   if (host_gpu_loss_reported_.test_and_set(std::memory_order_relaxed)) {
     return;
   }
-  rex::FatalError("Graphics device lost (probably due to an internal error)");
+  system::ReportHostGpuLoss();
 }
 
 uint32_t GraphicsSystem::ReadRegisterThunk(void* ppc_context, GraphicsSystem* gs, uint32_t addr) {
@@ -373,6 +393,14 @@ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, u
 
 uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+
+  if (REXCVAR_GET(gpu_log_register_reads)) {
+    static std::atomic<bool> seen[RegisterFile::kRegisterCount];
+    if (r < RegisterFile::kRegisterCount && !seen[r].exchange(true)) {
+      const auto* info = register_file_.GetRegisterInfo(r);
+      REXGPU_INFO("GPU: register.first_read {:04X} {}", r, info ? info->name : "?");
+    }
+  }
 
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
@@ -507,6 +535,11 @@ uint32_t GraphicsSystem::draw_resolution_scale() const {
   return command_processor_ ? command_processor_->draw_resolution_scale() : 0;
 }
 
+bool GraphicsSystem::fh1_shadow_mask(uint32_t* base, uint32_t* length,
+                                     uint32_t* resolves) const {
+  return command_processor_ && command_processor_->fh1_shadow_mask(base, length, resolves);
+}
+
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
   // A requested frame replay runs once the title's shader storage is ready.
@@ -548,6 +581,16 @@ void GraphicsSystem::Pause() {
 void GraphicsSystem::Resume() {
   paused_ = false;
   command_processor_->Resume();
+}
+
+void GraphicsSystem::ReduceMemory() {
+  // The texture cache runs on the GPU commands thread: it reads the request
+  // there at the next completed submission, or at once if the app is in the
+  // background with the thread paused.
+  TextureCache::RequestMemoryReduction();
+  if (paused_) {
+    command_processor_->ReduceMemoryWhilePaused();
+  }
 }
 
 bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {
