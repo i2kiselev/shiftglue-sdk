@@ -561,6 +561,11 @@ class VulkanPresenter final : public Presenter {
     // Stays on the Vulkan swapchain for the rest of the session once DXGI
     // presentation has failed.
     bool dxgi_swapchain_failed = false;
+    // The HWND presented to, and its size to restore while it is shrunk to get
+    // a stalled present recomposed (0 otherwise).
+    void* hwnd = nullptr;
+    int32_t stall_restore_width = 0;
+    int32_t stall_restore_height = 0;
 #endif
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;

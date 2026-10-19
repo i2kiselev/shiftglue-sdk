@@ -154,6 +154,34 @@ VkPresentModeKHR RequestedPresentMode(const std::string& mode) {
   }
   return VK_PRESENT_MODE_MAX_ENUM_KHR;
 }
+
+#if REX_PLATFORM_WIN32
+// After an alt-tab drops a tearing window from independent flip back to
+// composition, Nvidia can block every present for a second with nothing
+// reaching the screen, until the desktop recomposes the window (a focus change
+// or a resize). A stalled present shrinks the window by a pixel and the next one
+// restores it: both in one go are merged before the desktop sees them.
+void RecomposeWindowIfPresentStalled(HWND hwnd, std::chrono::steady_clock::duration present_time,
+                                     int32_t& restore_width, int32_t& restore_height) {
+  // Asynchronous, as the window's thread may be waiting to paint.
+  constexpr UINT kFlags =
+      SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER;
+  if (restore_width) {
+    SetWindowPos(hwnd, nullptr, 0, 0, restore_width, restore_height, kFlags);
+    restore_width = 0;
+    return;
+  }
+  RECT rect;
+  if (!hwnd || present_time < std::chrono::milliseconds(250) || !GetWindowRect(hwnd, &rect)) {
+    return;
+  }
+  REXLOG_WARN("VulkanPresenter: A present took {} ms, resizing the window to get it recomposed",
+              std::chrono::duration_cast<std::chrono::milliseconds>(present_time).count());
+  restore_width = rect.right - rect.left;
+  restore_height = rect.bottom - rect.top;
+  SetWindowPos(hwnd, nullptr, 0, 0, restore_width, restore_height - 1, kFlags);
+}
+#endif
 }  // namespace
 
 REXCVAR_DEFINE_BOOL(vulkan_present_wait, false, "UI/Vulkan",
@@ -1534,6 +1562,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
 
   bool presenting_via_dxgi = false;
 #if REX_PLATFORM_WIN32
+  paint_context_.hwnd = new_surface.GetType() == Surface::kTypeIndex_Win32Hwnd
+                            ? static_cast<const Win32HwndSurface&>(new_surface).hwnd()
+                            : nullptr;
   // HDR output needs the Vulkan swapchain's color spaces, and Resize keeps the
   // present mode the DXGI swapchain was made for.
   if (paint_context_.dxgi_swapchain &&
@@ -3784,10 +3815,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
 #if REX_PLATFORM_WIN32
   if (dxgi_swapchain) {
+    const auto present_start = std::chrono::steady_clock::now();
+    const bool presented = dxgi_swapchain->Present();
+    RecomposeWindowIfPresentStalled(static_cast<HWND>(paint_context_.hwnd),
+                                    std::chrono::steady_clock::now() - present_start,
+                                    paint_context_.stall_restore_width,
+                                    paint_context_.stall_restore_height);
     // A failure reconnects, and if the DXGI swapchain can't be rebuilt, the
     // Vulkan swapchain takes over.
-    return dxgi_swapchain->Present() ? PaintResult::kPresented
-                                     : PaintResult::kNotPresentedConnectionOutdated;
+    return presented ? PaintResult::kPresented : PaintResult::kNotPresentedConnectionOutdated;
   }
 #endif
 
@@ -3812,11 +3848,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     present_info.pNext = &present_id_info;
   }
   VkResult present_result;
+#if REX_PLATFORM_WIN32
+  const auto present_start = std::chrono::steady_clock::now();
+#endif
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+#if REX_PLATFORM_WIN32
+  RecomposeWindowIfPresentStalled(static_cast<HWND>(paint_context_.hwnd),
+                                  std::chrono::steady_clock::now() - present_start,
+                                  paint_context_.stall_restore_width,
+                                  paint_context_.stall_restore_height);
+#endif
   if (present_id > 1 && (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
     // At most one present in flight: the previous one must have reached the
     // display before the next frame is painted.
