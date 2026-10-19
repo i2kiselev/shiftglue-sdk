@@ -643,7 +643,7 @@ void Fh1NativeExecutor::Shutdown() {
   }
   initialized_ = false;
   StopSpecializeThread();
-  ReleaseRetiredImages(true);
+  ReleaseRetired(true);
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
@@ -673,8 +673,6 @@ void Fh1NativeExecutor::Shutdown() {
   };
   destroy_buffer(transfer_words_, transfer_words_memory_);
   transfer_words_size_ = 0;
-  for (auto& [buffer, memory] : retired_buffers_) destroy_buffer(buffer, memory);
-  retired_buffers_.clear();
   pending_readbacks_.clear();
   destroy_buffer(readback_buffer_, readback_memory_);
   readback_mapped_ = nullptr;
@@ -1124,8 +1122,8 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
   Count("surface_grown");
 }
 
-void Fh1NativeExecutor::ReleaseRetiredImages(bool all) {
-  if (retired_images_.empty()) return;
+void Fh1NativeExecutor::ReleaseRetired(bool all) {
+  if (retired_images_.empty() && retired_buffers_.empty()) return;
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   const auto& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -1144,6 +1142,12 @@ void Fh1NativeExecutor::ReleaseRetiredImages(bool all) {
     if (retired.memory) dfn.vkFreeMemory(device, retired.memory, nullptr);
   }
   retired_images_.resize(kept);
+  std::erase_if(retired_buffers_, [&](const RetiredBuffer& retired) {
+    if (!all && retired.submission > completed) return false;
+    dfn.vkDestroyBuffer(device, retired.buffer, nullptr);
+    dfn.vkFreeMemory(device, retired.memory, nullptr);
+    return true;
+  });
 }
 
 void Fh1NativeExecutor::ClaimTiles(uint32_t base, uint32_t length, uint32_t packed_key,
@@ -1880,7 +1884,8 @@ bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
                             dest.samples * sizeof(uint32_t);
   if (transfer_words_ && transfer_words_size_ >= size) return true;
   if (transfer_words_) {
-    retired_buffers_.emplace_back(transfer_words_, transfer_words_memory_);
+    retired_buffers_.push_back(
+        {command_processor_.GetCurrentSubmission(), transfer_words_, transfer_words_memory_});
     transfer_words_ = VK_NULL_HANDLE;
     transfer_words_memory_ = VK_NULL_HANDLE;
   }
@@ -3807,7 +3812,7 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   FinishCameraFrame();
   AdvanceJitter();
   if (!initialized_) return;
-  ReleaseRetiredImages(false);
+  ReleaseRetired(false);
   UpdateCoarseShading();
   GpuDrain();
   if (async_readbacks_) CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());

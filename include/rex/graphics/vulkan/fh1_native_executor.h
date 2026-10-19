@@ -347,7 +347,7 @@ class Fh1NativeExecutor {
   // Guest rows a claim of tiles [base, base + length) needs in a surface.
   uint32_t ClaimRows(const SurfaceKey& key, uint32_t base, uint32_t length) const;
   // Destroys images replaced by growth once their submissions completed.
-  void ReleaseRetiredImages(bool all);
+  void ReleaseRetired(bool all);
   Surface* FindSurface(uint32_t packed_key);
   void DestroySurface(Surface& surface);
   // Drops surfaces nothing has looked up for a while that own no tiles, such
@@ -652,7 +652,12 @@ class Fh1NativeExecutor {
   VkDeviceMemory transfer_words_memory_ = VK_NULL_HANDLE;
   VkDeviceSize transfer_words_size_ = 0;
   // Outgrown buffers may still be in use by submitted commands.
-  std::vector<std::pair<VkBuffer, VkDeviceMemory>> retired_buffers_;
+  struct RetiredBuffer {
+    uint64_t submission = 0;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+  };
+  std::vector<RetiredBuffer> retired_buffers_;
   struct RetiredImage {
     uint64_t submission = 0;
     VkImage image = VK_NULL_HANDLE;
