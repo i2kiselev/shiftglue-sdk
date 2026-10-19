@@ -417,8 +417,13 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
     }
     // Try to recover from the connection becoming outdated in the previous
-    // paint.
-    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+    // paint. A forced paint also retries an unconnected surface: on Windows
+    // the restore of a minimized window still reports no client area, and a
+    // restore to the same size sends no resize, so the exposure that follows
+    // is the state change to reconnect at.
+    if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated ||
+        (force_paint && surface_paint_connection_state_ ==
+                            SurfacePaintConnectionState::kUnconnectedRetryAtStateChange)) {
       UpdateSurfacePaintConnectionFromUIThread(nullptr, false);
     }
     // If still paintable or recovered successfully, paint.
@@ -1382,7 +1387,7 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
-          if (!is_reconnect) {
+          if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
           break;
