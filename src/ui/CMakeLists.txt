@@ -47,6 +47,7 @@ set(REXUI_VULKAN_SOURCES
     $<$<BOOL:${ANDROID}>:vulkan/android_gpu_driver.cpp>
     vulkan/vulkan_mem_alloc.cpp
     vulkan/vulkan_presenter.cpp
+    vulkan/fm4_vulkan_presenter.cpp
     vulkan/vulkan_provider.cpp
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp

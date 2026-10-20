@@ -317,9 +317,6 @@ class Fh1NativeExecutor {
     // once (race load, thumbnails), so it is waited for even when async.
     bool wait;
   };
-  // Copies the pending read-backs into guest memory, in order, up to the
-  // first whose submission is after `completed_submission`.
-  void CompleteResolveReadbacks(uint64_t completed_submission);
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
@@ -347,12 +344,9 @@ class Fh1NativeExecutor {
   // Guest rows a claim of tiles [base, base + length) needs in a surface.
   uint32_t ClaimRows(const SurfaceKey& key, uint32_t base, uint32_t length) const;
   // Destroys images replaced by growth once their submissions completed.
-  void ReleaseRetired(bool all);
+  void ReleaseRetiredImages(bool all);
   Surface* FindSurface(uint32_t packed_key);
   void DestroySurface(Surface& surface);
-  // Drops surfaces nothing has looked up for a while that own no tiles, such
-  // as another screen's targets.
-  void ReleaseIdleSurfaces();
   // Layout, stage and access transition (a barrier pushed to the command
   // processor).
   void Transition(Surface& surface, VkImageLayout layout, VkPipelineStageFlags stage,
@@ -376,36 +370,6 @@ class Fh1NativeExecutor {
                                 bool stencil_written);
   void ClaimOverwrittenDepthTiles(const SurfaceKey& key, const std::array<int32_t, 4>& rect,
                                   bool stencil_overwritten);
-  // Whether the stencil `owner` left in a tile is meaningless to `key`, so a
-  // depth overwrite may drop it (fh1_scrambled_stencil_claims).
-  bool StencilScrambled(const SurfaceKey& key, uint32_t owner);
-  // Whether a draw replaces its color targets (all channels, no blending), as
-  // the title's clears do.
-  bool DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const;
-  // Whether the draw may replace everything it covers in its targets, so that
-  // its rectangles are worth deriving and its claims are not reused.
-  bool MayOverwrite(const Fh1DrawInfo& draw, uint32_t used_bits) const;
-  bool ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t length);
-  // Tiles a clear sets to one EDRAM word are owned by a record of that word
-  // instead of a surface; the next claim clears the claimant to it.
-  static constexpr uint32_t kClearOwner = UINT32_C(1) << 31;
-  static constexpr uint32_t kClearWordsMax = 64;
-  static bool IsClearOwner(uint32_t owner) {
-    return owner != kNoOwner && (owner & kClearOwner);
-  }
-  // The owner standing for tiles holding `word`, or kNoOwner when every
-  // record is held.
-  uint32_t ClearOwner(uint32_t word);
-  // Per draw target bit, the EDRAM word an overwriting draw (after a
-  // successful depth_overwrite_.Derive) leaves in every sample, when known.
-  uint32_t DeriveClearWords(const Fh1DrawInfo& draw, uint32_t used_bits, bool stencil_overwritten,
-                            uint32_t* words_out);
-  // Hands the whole tiles the derived rectangles cover to the record of
-  // `word`; false when they do not cover whole tiles within `length`, or the
-  // stencil the draw keeps is not known to be zero (`stencil_kept`).
-  bool AbsorbClear(const SurfaceKey& key, uint32_t length, uint32_t word, bool stencil_kept);
-  // Before a resolve reads tiles a record owns: claims them for `key`.
-  void MaterializeClears(const SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
   void ClaimTileRect(const SurfaceKey& key, uint32_t column_first, uint32_t row_first,
                      uint32_t column_end, uint32_t row_end);
   void TransferTiles(Surface& dest, const TileRun& run);
@@ -453,10 +417,6 @@ class Fh1NativeExecutor {
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
-  void DumpScaledResolveRanges();
-  // Copies a buffer range to fh1_resolve_dump_dir/name, waiting for the GPU.
-  void DumpBufferRange(VkBuffer source, VkDeviceSize offset, VkDeviceSize length,
-                       const std::string& name);
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);
@@ -677,7 +637,6 @@ class Fh1NativeExecutor {
   VkDeviceSize readback_used_ = 0;
   const uint8_t* readback_mapped_ = nullptr;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
-  uint64_t readback_sequence_ = 0;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
   bool pending_targets_valid_ = false;
@@ -734,14 +693,6 @@ class Fh1NativeExecutor {
   uint64_t frame_ = 0;
   // fh1_scaled_msaa_single_sample at a scale above 1x.
   bool single_sample_msaa_ = false;
-  bool color_overwrite_claims_ = true;
-  bool scrambled_stencil_claims_ = true;
-  bool surfaceless_clears_ = true;
-  bool async_readbacks_ = false;
-  // The words of the clear records, by owner index.
-  std::vector<uint32_t> clear_words_;
-  // The prepared draw left some of its targets as clear words.
-  bool draw_absorbed_ = false;
   bool two_sample_msaa_ = false;
   // The device exports stencil from shaders: depth transfers take one pass.
   bool stencil_export_ = false;
@@ -808,6 +759,84 @@ class Fh1NativeExecutor {
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;
+  // Tile passes per source -> destination surface pair while profiling.
+  std::map<std::string, uint64_t> transfer_volume_;
+
+  // FM4's additions, defined in fm4_native_executor.cpp so that upstream's
+  // files merge with few conflicts.
+  void LoadFm4Options();
+  bool color_overwrite_claims_ = true;
+  bool scrambled_stencil_claims_ = true;
+  bool surfaceless_clears_ = true;
+  bool async_readbacks_ = false;
+
+  // Drops surfaces nothing has looked up for a while that own no tiles, such
+  // as another screen's targets.
+  void ReleaseIdleSurfaces();
+  // Destroys outgrown buffers once their submissions completed.
+  void ReleaseRetiredBuffers(bool all);
+
+  // Whether the stencil `owner` left in a tile is meaningless to `key`, so a
+  // depth overwrite may drop it (fh1_scrambled_stencil_claims).
+  bool StencilScrambled(const SurfaceKey& key, uint32_t owner);
+  // Whether a draw replaces its color targets (all channels, no blending), as
+  // the title's clears do.
+  bool DrawOverwritesColor(const Fh1DrawInfo& draw, uint32_t used_bits) const;
+  // Whether the draw may replace everything it covers in its targets, so that
+  // its rectangles are worth deriving and its claims are not reused.
+  bool MayOverwrite(const Fh1DrawInfo& draw, uint32_t used_bits) const;
+  bool ClaimColorOverwriteTiles(const SurfaceKey& key, uint32_t length);
+  // Tiles a clear sets to one EDRAM word are owned by a record of that word
+  // instead of a surface; the next claim clears the claimant to it.
+  static constexpr uint32_t kClearOwner = UINT32_C(1) << 31;
+  static constexpr uint32_t kClearWordsMax = 64;
+  static bool IsClearOwner(uint32_t owner) {
+    return owner != kNoOwner && (owner & kClearOwner);
+  }
+  // The owner standing for tiles holding `word`, or kNoOwner when every
+  // record is held.
+  uint32_t ClearOwner(uint32_t word);
+  // Per draw target bit, the EDRAM word an overwriting draw (after a
+  // successful depth_overwrite_.Derive) leaves in every sample, when known.
+  uint32_t DeriveClearWords(const Fh1DrawInfo& draw, uint32_t used_bits, bool stencil_overwritten,
+                            uint32_t* words_out);
+  // Hands the whole tiles the derived rectangles cover to the record of
+  // `word`; false when they do not cover whole tiles within `length`, or the
+  // stencil the draw keeps is not known to be zero (`stencil_kept`).
+  bool AbsorbClear(const SurfaceKey& key, uint32_t length, uint32_t word, bool stencil_kept);
+  // Before a resolve reads tiles a record owns: claims them for `key`.
+  void MaterializeClears(const SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+  // A transfer from a clear record: clears the rectangles to its word.
+  void ClearClaimedTiles(Surface& dest, uint32_t clear_owner, const Rect* rects,
+                         uint32_t rect_count, uint32_t tile_count);
+  // Claims the tiles of the plan's sources that clear records hold, so that
+  // the copy reads surfaces only.
+  void MaterializeResolveClears(CopyPlan& plan);
+  // The words of the clear records, by owner index.
+  std::vector<uint32_t> clear_words_;
+  // The prepared draw left some of its targets as clear words.
+  bool draw_absorbed_ = false;
+
+  // Copies the pending read-backs into guest memory, in order, up to the
+  // first whose submission is after `completed_submission`.
+  void CompleteResolveReadbacks(uint64_t completed_submission);
+  uint64_t readback_sequence_ = 0;
+
+  // fh1_resolve_dump_dir: dumps the resolve's output in the frames asked for.
+  void DumpResolveOnRequest(uint32_t address, uint32_t length);
+  void DumpScaledResolveRanges();
+  // Copies a buffer range to fh1_resolve_dump_dir/name, waiting for the GPU.
+  void DumpBufferRange(VkBuffer source, VkDeviceSize offset, VkDeviceSize length,
+                       const std::string& name);
+  // fh1_resolve_dump_frame < 0: the frame a trigger file asked to dump.
+  uint64_t dump_trigger_checked_frame_ = UINT64_MAX;
+  uint64_t dump_trigger_frame_ = UINT64_MAX;
+
+  // fh1_native_gpu_profile: each kind of resolve once, and the surfaces.
+  void LogProfiledResolve(const CopyPlan& plan);
+  void LogSurfaces();
+  // Resolve kinds already reported, so each is logged once.
+  std::map<std::string, const char*> reported_resolve_skips_;
 
   // fh1_slow_frame_log: frames well above the median of the recent ones.
   class RecentMedian {
@@ -825,6 +854,8 @@ class Fh1NativeExecutor {
     return median > 0.0f && value > median * 1.5f && value > median + 4.0f;
   }
   void LogSlowFrame();
+  // The frame here is the one before its swap, as frame_ in OnSwap.
+  void LogSlowGpuFrame(uint64_t frame, const std::array<uint64_t, kGpuPhases>& ticks);
   bool slow_frame_log_ = false;
   std::chrono::steady_clock::time_point slow_frame_last_swap_{};
   RecentMedian slow_frame_intervals_;
@@ -833,14 +864,6 @@ class Fh1NativeExecutor {
   uint64_t slow_frame_resolves_ = 0;
   std::unordered_map<const char*, uint64_t> slow_frame_stats_;
   std::string slow_frame_previous_;
-
-  // Tile passes per source -> destination surface pair while profiling.
-  std::map<std::string, uint64_t> transfer_volume_;
-  // Resolve kinds already reported as skipped, so each is logged once.
-  std::map<std::string, const char*> reported_resolve_skips_;
-  // fh1_resolve_dump_frame < 0: the frame a trigger file asked to dump.
-  uint64_t dump_trigger_checked_frame_ = UINT64_MAX;
-  uint64_t dump_trigger_frame_ = UINT64_MAX;
 };
 
 }  // namespace rex::graphics::vulkan

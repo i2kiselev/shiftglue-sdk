@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -566,6 +567,8 @@ class VulkanPresenter final : public Presenter {
     void* hwnd = nullptr;
     int32_t stall_restore_width = 0;
     int32_t stall_restore_height = 0;
+    // After a present that began at `present_start`.
+    void RecomposeWindowIfPresentStalled(std::chrono::steady_clock::time_point present_start);
 #endif
 
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
@@ -612,6 +615,14 @@ class VulkanPresenter final : public Presenter {
                                                VK_COLOR_COMPONENT_A_BIT,
       VkPipelineLayout layout = VK_NULL_HANDLE);
   bool CreateHdrSwapchainImages(VkFormat swapchain_format);
+#if REX_PLATFORM_WIN32
+  // vulkan_present_via_dxgi (fm4_vulkan_presenter.cpp): connects painting to a
+  // DXGI swapchain; false to paint to the Vulkan swapchain.
+  bool ConnectDxgiSwapchain(Surface& surface, uint32_t width, uint32_t height,
+                            bool present_mode_changed, VkFormat& format_out);
+  // Presents what the last paint submission drew into the DXGI swapchain.
+  PaintResult PresentDxgi();
+#endif
 
   // present_upscaler_profile: the timestamp slot of this upscale, or
   // UINT32_MAX.
