@@ -8,6 +8,8 @@
  */
 #include <rex/graphics/pipeline/texture/replacement.h>
 
+#include <rex/graphics/pipeline/texture/fm4_runtime_replacement.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -219,6 +221,10 @@ void ScanIfNeeded(State& state) {
 }  // namespace
 
 const Format* FindFormat(xenos::TextureFormat format) {
+  // The same bytes; only the host's filtering precision differs (FM4's prompt icons).
+  if (format == xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16) {
+    format = xenos::TextureFormat::k_8_8_8_8;
+  }
   for (const auto& entry : kFormats) {
     if (entry.guest == format) return &entry;
   }
@@ -266,13 +272,19 @@ LookupResult Find(const Source& source, const texture_util::TextureGuestLayout& 
                   SharedMemory& shared_memory, Lookup& lookup) {
   const std::string dump_dir = REXCVAR_GET(texture_dump_dir);
   auto& state = GetState();
+  bool only_runtime = false;
   {
     std::lock_guard lock(state.mutex);
     ScanIfNeeded(state);
-    if (dump_dir.empty() && state.files.empty()) return LookupResult::kNotEligible;
+    only_runtime = dump_dir.empty() && state.files.empty();
   }
+  if (only_runtime && !HasRuntimeReplacements()) return LookupResult::kNotEligible;
   if (!IsEligible(source)) return LookupResult::kNotEligible;
   const Format* format = FindFormat(source.format);
+  // Run-time images cover a few textures; the rest are not worth hashing.
+  if (only_runtime && !RuntimeReplacementMayMatch(format->guest, source.width, source.height)) {
+    return LookupResult::kNotEligible;
+  }
   std::vector<uint8_t> base(layout.base.level_data_extent_bytes);
   if (base.empty() ||
       !shared_memory.CopyCpuRange(source.base_page << 12, {base.data(), base.size()})) {
@@ -298,8 +310,15 @@ LookupResult Find(const Source& source, const texture_util::TextureGuestLayout& 
     }
   }
 
+  lookup.hash = hash;
   std::shared_ptr<const Image> image;
-  {
+  if (const auto runtime = FindRuntimeReplacement(hash)) {
+    if (const Format* runtime_format = FindFormat(runtime->format)) {
+      image = std::make_shared<const Image>(
+          Image{runtime_format, runtime->width, runtime->height, runtime->levels, runtime->data});
+    }
+  }
+  if (!image) {
     std::lock_guard lock(state.mutex);
     const auto file = state.files.find(hash);
     if (file == state.files.end()) return LookupResult::kNone;

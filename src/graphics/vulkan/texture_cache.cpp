@@ -673,6 +673,7 @@ void VulkanTextureCache::BeginFrame() {
     command_processor_.ClearCaches();
     REXGPU_INFO("Texture replacements: reloading");
   }
+  Fm4ApplyRuntimeReplacements();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 
@@ -2085,6 +2086,7 @@ bool VulkanTextureCache::TryLoadTextureReplacement(VulkanTexture& texture) {
       block_format = VK_FORMAT_BC5_UNORM_BLOCK;
       break;
     case xenos::TextureFormat::k_8_8_8_8:
+    case xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16:
       block_format = VK_FORMAT_R8G8B8A8_UNORM;
       break;
     default:
@@ -2094,8 +2096,13 @@ bool VulkanTextureCache::TryLoadTextureReplacement(VulkanTexture& texture) {
     return false;
   }
   texture_replacement::Lookup lookup;
-  switch (texture_replacement::Find(source, texture.guest_layout(), shared_memory(), lookup)) {
+  const auto result =
+      texture_replacement::Find(source, texture.guest_layout(), shared_memory(), lookup);
+  texture.set_fm4_replacement_hash(lookup.hash);
+  switch (result) {
     case texture_replacement::LookupResult::kNotEligible:
+      // A run-time replacement removed since the last load.
+      UseGuestImage(texture);
       return false;
     case texture_replacement::LookupResult::kNone:
       UseGuestImage(texture);

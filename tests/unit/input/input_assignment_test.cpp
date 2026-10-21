@@ -45,9 +45,10 @@ std::vector<DeviceId> For(const DeviceAssignment& a, uint32_t user) {
 /// Exercises assignment with no SDL, window, or OS behind it.
 class FakeDriver final : public InputDriver {
  public:
-  FakeDriver() : InputDriver(nullptr, 0) {}
+  explicit FakeDriver(bool keyboard = false) : InputDriver(nullptr, 0), keyboard_(keyboard) {}
 
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
+  bool is_keyboard_and_mouse() const override { return keyboard_; }
 
   void Add(uint64_t id, bool synthetic = false) {
     DeviceInfo info;
@@ -110,6 +111,7 @@ class FakeDriver final : public InputDriver {
   }
 
  private:
+  bool keyboard_;
   std::vector<DeviceInfo> devices_;
   std::map<DeviceId, X_INPUT_STATE> states_;
   std::map<DeviceId, X_INPUT_KEYSTROKE> keystrokes_;
@@ -235,4 +237,61 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+namespace {
+
+struct KeyboardAndPad {
+  FakeDriver* keyboard = nullptr;
+  FakeDriver* pad = nullptr;
+  std::unique_ptr<InputSystem> system;
+};
+
+KeyboardAndPad KeyboardAndPadSystem() {
+  KeyboardAndPad out;
+  auto keyboard = std::make_unique<FakeDriver>(true);
+  auto pad = std::make_unique<FakeDriver>();
+  out.keyboard = keyboard.get();
+  out.pad = pad.get();
+  out.keyboard->Add(1, true);
+  out.pad->Add(2);
+  out.system = std::make_unique<InputSystem>(nullptr);
+  out.system->AddDriver(std::move(keyboard));
+  out.system->AddDriver(std::move(pad));
+  out.system->SetDeviceAssignment(std::make_unique<SharedAssignment>());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("The keyboard state filter sees only the keyboard", "[input][fm4_mnk_bind]") {
+  auto setup = KeyboardAndPadSystem();
+  setup.keyboard->SetButtons(1, X_INPUT_GAMEPAD_A);
+  setup.pad->SetButtons(2, X_INPUT_GAMEPAD_B);
+  int calls = 0;
+  setup.system->SetKeyboardStateFilter([&](uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+    ++calls;
+    CHECK(user == 0);
+    CHECK(static_cast<uint16_t>(pad.buttons) == X_INPUT_GAMEPAD_A);
+    pad.right_trigger = 0x80;
+  });
+  X_INPUT_STATE state = {};
+  REQUIRE(setup.system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(calls == 1);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == (X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_B));
+  CHECK(state.gamepad.right_trigger == 0x80);
+}
+
+TEST_CASE("The active device tracker sees the keyboard before the filter",
+          "[input][fm4_mnk_bind]") {
+  auto setup = KeyboardAndPadSystem();
+  setup.keyboard->SetButtons(1, X_INPUT_GAMEPAD_A);
+  setup.system->SetKeyboardStateFilter(
+      [](uint32_t, rex::input::X_INPUT_GAMEPAD& pad) { pad = {}; });
+  X_INPUT_STATE state = {};
+  REQUIRE(setup.system->GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == 0);
+  const auto active = setup.system->ActiveDevice(0);
+  REQUIRE(active);
+  CHECK(active->id == static_cast<DeviceId>(1));
 }

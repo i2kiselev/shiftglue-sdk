@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <rex/input/input_driver.h>
+#include <rex/input/mnk/mnk_bind.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
@@ -77,6 +78,8 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Keys held across a change of keybind overrides (FM4's context switch).
+  HeldKeyMask held_keys_;
   // Preserve a button transition until at least one guest state poll observes
   // it. Without this, a short host key tap may begin and end between polls.
   uint16_t latched_buttons_ = 0;

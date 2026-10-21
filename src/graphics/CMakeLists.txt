@@ -32,6 +32,7 @@ set(REXGPU_XENOS_SOURCES
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/texture/replacement.cpp
+    pipeline/texture/fm4_cache_runtime_replacement.cpp
     cube_lut.cpp
     pipeline/shader/interpreter.cpp
 

@@ -49,6 +49,12 @@ class InputSystem : public system::IInputSystem {
   /// Replaces any previous assignment. Call before the guest starts polling.
   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
 
+  /// Edits each keyboard-and-mouse state the title reads (not host UI reads),
+  /// after the active-device tracker has seen it and before it is merged with
+  /// the pads (FM4's smoothed keyboard driving).
+  void SetKeyboardStateFilter(std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& gamepad)>
+                                  filter);
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   /// The user's merged physical pads for host-drawn UI: live even while the
@@ -105,6 +111,7 @@ class InputSystem : public system::IInputSystem {
   std::vector<InputDriver*> device_owners_;
 
   std::function<bool()> active_callback_;
+  std::function<void(uint32_t, X_INPUT_GAMEPAD&)> keyboard_state_filter_;
 
   // DualSense feedback, per guest user.
   std::array<dualsense::TriggerModel, kMaxGuestUsers> trigger_models_;

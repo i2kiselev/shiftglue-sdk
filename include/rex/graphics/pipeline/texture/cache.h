@@ -176,6 +176,10 @@ class TextureCache {
   }
 
  protected:
+  // Registers or removes the fm4_runtime_replacement_probe image and reloads
+  // the textures whose run-time replacement changed. At the start of a frame.
+  void Fm4ApplyRuntimeReplacements();
+
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -315,6 +319,12 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // FM4 run-time replacements: the hash of the base level when a lookup last
+    // computed it (0: not hashed), and a reload at the next use.
+    uint64_t fm4_replacement_hash() const { return fm4_replacement_hash_; }
+    void set_fm4_replacement_hash(uint64_t hash) { fm4_replacement_hash_ = hash; }
+    void Fm4MarkOutdated(const std::unique_lock<std::recursive_mutex>& global_lock);
+
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
     explicit Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage = true);
@@ -342,6 +352,7 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    uint64_t fm4_replacement_hash_ = 0;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
