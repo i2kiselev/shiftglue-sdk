@@ -38,6 +38,8 @@ add_executable(unit_tests
     graphics/vulkan_shader_overrides_test.cpp
     graphics/cube_lut_test.cpp
     graphics/fm4_runtime_replacement_test.cpp
+    graphics/pixel_shader_constant_override_test.cpp
+    graphics/wrap_seam_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -46,6 +48,8 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/vulkan/shader_overrides.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pixel_shader_constant_override.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/wrap_seam.cpp
 )
 
 target_include_directories(unit_tests PRIVATE

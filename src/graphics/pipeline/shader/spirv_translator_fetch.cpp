@@ -997,6 +997,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       rex::bit_scan_forward(coordinates_needed_components, &coordinate_component_index);
       coordinates[coordinate_component_index] = coordinates_operand;
     }
+    // A wrapping angle at r0.z (gpu_wrap_seam_*): the copy that varies less over the quad, so
+    // the coordinate and the gradients taken from it skip the wrap. Coarse derivatives give
+    // every pixel of the quad the same choice; u2 - 0.5 is u away from the wrap.
+    const InstructionOperand& coordinates_source = instr.operands[0];
+    if (main_wrap_seam_u2_ != spv::NoResult && instr.dimension == xenos::FetchOpDimension::k2D &&
+        coordinates_source.storage_source == InstructionStorageSource::kRegister &&
+        coordinates_source.storage_index == 0 &&
+        coordinates_source.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
+        !coordinates_source.is_negated && !coordinates_source.is_absolute_value &&
+        coordinates_source.GetComponent(0) == SwizzleSource::kZ) {
+      builder_->addCapability(spv::CapabilityDerivativeControl);
+      spv::Id u = coordinates[0];
+      spv::Id u2_shifted = builder_->createNoContractionBinOp(
+          spv::OpFSub, type_float_, main_wrap_seam_u2_, builder_->makeFloatConstant(0.5f));
+      spv::Id u_varies_less = builder_->createBinOp(
+          spv::OpFOrdLessThanEqual, type_bool_,
+          builder_->createUnaryOp(spv::OpFwidthCoarse, type_float_, u),
+          builder_->createUnaryOp(spv::OpFwidthCoarse, type_float_, main_wrap_seam_u2_));
+      coordinates[0] = builder_->createTriOp(spv::OpSelect, type_float_, u_varies_less, u,
+                                             u2_shifted);
+    }
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
         uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);

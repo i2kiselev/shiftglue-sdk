@@ -52,9 +52,21 @@ REXCVAR_DEFINE_INT32(scene_lut_strength, 100, "GPU",
     .range(0, 100);
 
 REXCVAR_DEFINE_STRING(gpu_pixel_shader_constant_override, "", "GPU",
-                      "Replaces one float constant of one pixel shader in each of its draws: "
-                      "<shader hash>:c<constant>=x,y,z,w (hexadecimal hash, constant 0-255), "
-                      "or empty for none");
+                      "Replaces float constants of pixel shaders in each of their draws: "
+                      "entries separated by ';', each <shader hash>:c<constant>=x,y,z,w or "
+                      "<shader hash>:c<constant>.<components>=<one value per component> "
+                      "(hexadecimal hash, constant 0-255, components a subset of xyzw in "
+                      "order), or empty for none");
+
+REXCVAR_DEFINE_STRING(gpu_wrap_seam_vertex_shaders, "", "GPU",
+                      "Vertex shaders whose interpolator 0 z is an angle wrapping from 1 to 0: "
+                      "comma-separated hexadecimal hashes");
+REXCVAR_DEFINE_STRING(gpu_wrap_seam_pixel_shaders, "", "GPU",
+                      "Pixel shaders whose fetches at r0.z read that angle: comma-separated "
+                      "hexadecimal hashes");
+REXCVAR_DEFINE_BOOL(gpu_wrap_seam_fix, false, "GPU",
+                    "Removes the line a wrapping angle draws across the triangles it wraps "
+                    "on, for the gpu_wrap_seam_* shaders bound together");
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -85,21 +97,23 @@ constexpr double Fh1GuestVblankHzForRenderLimit(uint32_t render_fps_limit,
 static_assert(Fh1GuestVblankHzForRenderLimit(0, 144.0) == 288.0);
 static_assert(Fh1GuestVblankHzForRenderLimit(60, 144.0) == 120.0);
 
-rex::graphics::CommandProcessor::PixelShaderConstantOverride ParsePixelShaderConstantOverride(
-    const std::string& text) {
-  rex::graphics::CommandProcessor::PixelShaderConstantOverride parsed;
-  unsigned long long hash = 0;
-  uint32_t constant = 0;
-  if (!text.empty() &&
-      (std::sscanf(text.c_str(), "%llx:c%u=%f,%f,%f,%f", &hash, &constant, &parsed.value[0],
-                   &parsed.value[1], &parsed.value[2], &parsed.value[3]) != 6 ||
-       constant > 255)) {
+std::vector<rex::graphics::PixelShaderConstantOverride> ParsePixelShaderConstantOverride(
+    std::string_view text) {
+  auto parsed = rex::graphics::ParsePixelShaderConstantOverrides(text);
+  if (!parsed) {
     REXGPU_WARN("gpu_pixel_shader_constant_override: cannot read \"{}\"", text);
     return {};
   }
-  parsed.shader_hash = hash;
-  parsed.constant = constant;
-  return parsed;
+  return std::move(*parsed);
+}
+
+std::unordered_set<uint64_t> ParseWrapSeamShaders(const char* name, std::string_view text) {
+  auto parsed = rex::graphics::ParseShaderHashList(text);
+  if (!parsed) {
+    REXGPU_WARN("{}: cannot read \"{}\"", name, text);
+    return {};
+  }
+  return std::move(*parsed);
 }
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
@@ -229,15 +243,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     }
   });
 
-  command_processor_->SetPixelShaderConstantOverride(
+  command_processor_->SetPixelShaderConstantOverrides(
       ParsePixelShaderConstantOverride(REXCVAR_GET(gpu_pixel_shader_constant_override)));
   cvar::RegisterChangeCallback(
       "gpu_pixel_shader_constant_override", [this](std::string_view, std::string_view value) {
         if (command_processor_) {
-          command_processor_->SetPixelShaderConstantOverride(
-              ParsePixelShaderConstantOverride(std::string(value)));
+          command_processor_->SetPixelShaderConstantOverrides(
+              ParsePixelShaderConstantOverride(value));
         }
       });
+
+  const auto set_wrap_seam = [this]() {
+    if (command_processor_) {
+      command_processor_->SetWrapSeam(
+          {ParseWrapSeamShaders("gpu_wrap_seam_vertex_shaders",
+                                REXCVAR_GET(gpu_wrap_seam_vertex_shaders)),
+           ParseWrapSeamShaders("gpu_wrap_seam_pixel_shaders",
+                                REXCVAR_GET(gpu_wrap_seam_pixel_shaders))},
+          REXCVAR_GET(gpu_wrap_seam_fix));
+    }
+  };
+  set_wrap_seam();
+  for (const char* name :
+       {"gpu_wrap_seam_vertex_shaders", "gpu_wrap_seam_pixel_shaders", "gpu_wrap_seam_fix"}) {
+    cvar::RegisterChangeCallback(name, [set_wrap_seam](std::string_view, std::string_view) {
+      set_wrap_seam();
+    });
+  }
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF

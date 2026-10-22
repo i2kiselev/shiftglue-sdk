@@ -714,6 +714,34 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
            shader_storage_file_);
   }
 
+  // The wrap seam fix's variants of the stored pipelines (gpu_wrap_seam_*), whichever way the
+  // switch is set, so that turning it on compiles nothing in play. Derived, so not stored.
+  std::vector<PipelineDescription> wrap_seam_descriptions;
+  for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
+    SpirvShaderTranslator::Modification vertex(stored.description.vertex_shader_modification);
+    SpirvShaderTranslator::Modification pixel(stored.description.pixel_shader_modification);
+    const WrapSeamBits bits =
+        SelectWrapSeamBits(command_processor_.wrap_seam_shaders(), true,
+                           stored.description.vertex_shader_hash,
+                           stored.description.pixel_shader_hash,
+                           vertex.vertex.output_point_parameters || pixel.pixel.param_gen_point);
+    if (!bits.vertex || vertex.vertex.wrap_seam_u2) {
+      continue;
+    }
+    vertex.vertex.wrap_seam_u2 = 1;
+    pixel.pixel.wrap_seam_u2 = uint32_t(bits.pixel);
+    PipelineDescription& description = wrap_seam_descriptions.emplace_back(stored.description);
+    description.vertex_shader_modification = vertex.value;
+    shader_translations_needed.emplace(description.vertex_shader_hash, vertex.value);
+    if (description.pixel_shader_hash) {
+      description.pixel_shader_modification = pixel.value;
+      shader_translations_needed.emplace(description.pixel_shader_hash, pixel.value);
+    }
+  }
+  if (!wrap_seam_descriptions.empty()) {
+    REXGPU_INFO("wrap seam: {} pipeline variants warmed", wrap_seam_descriptions.size());
+  }
+
   // Translate shader modifications needed for stored pipelines.
   StopTranslationThread();
   for (const std::pair<uint64_t, uint64_t>& translation_needed : shader_translations_needed) {
@@ -742,11 +770,18 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   LoadVkPipelineCache();
 
   // Create the pipelines.
-  std::vector<PipelineCreationArguments> pipeline_creations;
-  pipeline_creations.reserve(pipeline_stored_descriptions.size());
+  std::vector<PipelineDescription> pipeline_descriptions;
+  pipeline_descriptions.reserve(pipeline_stored_descriptions.size() +
+                                wrap_seam_descriptions.size());
   for (const PipelineStoredDescription& pipeline_stored_description :
        pipeline_stored_descriptions) {
-    const PipelineDescription& pipeline_description = pipeline_stored_description.description;
+    pipeline_descriptions.push_back(pipeline_stored_description.description);
+  }
+  pipeline_descriptions.insert(pipeline_descriptions.end(), wrap_seam_descriptions.begin(),
+                               wrap_seam_descriptions.end());
+  std::vector<PipelineCreationArguments> pipeline_creations;
+  pipeline_creations.reserve(pipeline_descriptions.size());
+  for (const PipelineDescription& pipeline_description : pipeline_descriptions) {
 
     auto find_it = pipelines_.find(pipeline_description);
     if (find_it != pipelines_.end()) {

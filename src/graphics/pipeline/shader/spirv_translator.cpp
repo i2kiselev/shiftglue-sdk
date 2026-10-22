@@ -263,9 +263,12 @@ void SpirvShaderTranslator::Reset() {
   input_front_facing_ = spv::NoResult;
   input_sample_id_ = spv::NoResult;
   input_sample_mask_ = spv::NoResult;
+  input_wrap_seam_u2_ = spv::NoResult;
+  main_wrap_seam_u2_ = spv::NoResult;
   std::fill(input_output_interpolators_.begin(), input_output_interpolators_.end(), spv::NoResult);
   output_point_coordinates_ = spv::NoResult;
   output_point_size_ = spv::NoResult;
+  output_wrap_seam_u2_ = spv::NoResult;
   output_per_vertex_member_count_ = 0;
   output_per_vertex_member_clip_distance_ = UINT32_MAX;
   output_per_vertex_member_cull_distance_ = UINT32_MAX;
@@ -1973,6 +1976,17 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     }
   }
 
+  // At the location after the interpolators and the point parameters, as the pixel shader's
+  // input.
+  if (shader_modification.vertex.wrap_seam_u2) {
+    output_wrap_seam_u2_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
+                                                    type_float_, "xe_out_wrap_seam_u2");
+    builder_->addDecoration(output_wrap_seam_u2_, spv::DecorationLocation, int(output_location));
+    builder_->addDecoration(output_wrap_seam_u2_, spv::DecorationInvariant);
+    main_interface_.push_back(output_wrap_seam_u2_);
+    ++output_location;
+  }
+
   // Create the gl_PerVertex output for used system outputs.
   uint32_t clip_distance_count = shader_modification.GetVertexClipDistanceCount();
   uint32_t cull_distance_count = shader_modification.GetVertexCullDistanceCount();
@@ -2696,6 +2710,20 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
 
+  // The wrapping angle's second copy, frac(z + 0.5), continuous where z wraps.
+  if (output_wrap_seam_u2_ != spv::NoResult) {
+    spv::Id u2 = const_float_0_;
+    if (input_output_interpolators_[0] != spv::NoResult) {
+      spv::Id u = builder_->createCompositeExtract(
+          builder_->createLoad(input_output_interpolators_[0], spv::NoPrecision), type_float_, 2);
+      u2 = builder_->createUnaryBuiltinCall(
+          type_float_, ext_inst_glsl_std_450_, GLSLstd450Fract,
+          builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, u,
+                                             builder_->makeFloatConstant(0.5f)));
+    }
+    builder_->createStore(u2, output_wrap_seam_u2_);
+  }
+
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeIntConstant(kOutputPerVertexMemberPosition));
   spv::Id position_ptr =
@@ -3142,6 +3170,18 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
       ++input_location;
     }
+
+    // The vertex shader's wrap_seam_u2 output, sampled like interpolator 0.
+    if (shader_modification.pixel.wrap_seam_u2) {
+      input_wrap_seam_u2_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                     type_float_, "xe_in_wrap_seam_u2");
+      builder_->addDecoration(input_wrap_seam_u2_, spv::DecorationLocation, int(input_location));
+      if (shader_modification.pixel.interpolators_centroid & 1) {
+        builder_->addDecoration(input_wrap_seam_u2_, spv::DecorationCentroid);
+      }
+      main_interface_.push_back(input_wrap_seam_u2_);
+      ++input_location;
+    }
   }
 
   bool float24_depth_conversion = IsWritingFloat24Depth();
@@ -3248,6 +3288,10 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 }
 
 void SpirvShaderTranslator::StartFragmentShaderInMain() {
+  if (input_wrap_seam_u2_ != spv::NoResult) {
+    main_wrap_seam_u2_ = builder_->createLoad(input_wrap_seam_u2_, spv::NoPrecision);
+  }
+
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return

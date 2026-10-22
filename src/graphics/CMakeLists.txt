@@ -34,7 +34,9 @@ set(REXGPU_XENOS_SOURCES
     pipeline/texture/replacement.cpp
     pipeline/texture/fm4_cache_runtime_replacement.cpp
     cube_lut.cpp
+    pixel_shader_constant_override.cpp
     pipeline/shader/interpreter.cpp
+    pipeline/shader/wrap_seam.cpp
 
     # Null backend (gpu_backend=null): packets without a device
     null/graphics_system.cpp

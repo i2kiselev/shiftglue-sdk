@@ -424,9 +424,19 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
 }
 #endif  // REX_HAS_VULKAN
 
-void CommandProcessor::SetPixelShaderConstantOverride(
-    const PixelShaderConstantOverride& constant_override) {
-  CallInThread([this, constant_override]() { pixel_shader_constant_override_ = constant_override; });
+void CommandProcessor::SetPixelShaderConstantOverrides(
+    std::vector<PixelShaderConstantOverride> overrides) {
+  CallInThread([this, overrides = std::move(overrides)]() mutable {
+    pixel_shader_constant_overrides_ = std::move(overrides);
+  });
+}
+
+void CommandProcessor::SetWrapSeam(WrapSeamShaders shaders, bool fix) {
+  CallInThread([this, shaders = std::move(shaders), fix]() mutable {
+    wrap_seam_shaders_ = std::move(shaders);
+    wrap_seam_fix_ = fix;
+    ++wrap_seam_generation_;
+  });
 }
 
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
@@ -3378,17 +3388,24 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         const uint32_t null_fetch_register =
             XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + null_fetch.second * 6;
         const uint32_t saved_fetch_word = register_file_->values[null_fetch_register];
-        const bool override_constant =
-            pixel_shader_constant_override_.shader_hash && active_pixel_shader_ &&
-            active_pixel_shader_->ucode_data_hash() == pixel_shader_constant_override_.shader_hash;
-        const uint32_t override_register =
-            XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * pixel_shader_constant_override_.constant;
-        std::array<uint32_t, 4> saved_constant;
-        if (override_constant) {
-          for (uint32_t i = 0; i < 4; ++i) {
-            saved_constant[i] = register_file_->values[override_register + i];
-            WriteRegister(override_register + i,
-                          std::bit_cast<uint32_t>(pixel_shader_constant_override_.value[i]));
+        // Saved in application order and restored in reverse, so two entries on one constant
+        // restore the game's value.
+        std::vector<std::pair<uint32_t, std::array<uint32_t, 4>>> saved_constants;
+        if (active_pixel_shader_) {
+          for (const PixelShaderConstantOverride& entry : pixel_shader_constant_overrides_) {
+            if (entry.shader_hash != active_pixel_shader_->ucode_data_hash()) {
+              continue;
+            }
+            const uint32_t override_register = XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * entry.constant;
+            std::array<uint32_t, 4> constant;
+            std::copy_n(&register_file_->values[override_register], 4, constant.begin());
+            saved_constants.emplace_back(override_register, constant);
+            ApplyConstantOverride(entry, constant);
+            for (uint32_t i = 0; i < 4; ++i) {
+              if (entry.component_mask & (1u << i)) {
+                WriteRegister(override_register + i, constant[i]);
+              }
+            }
           }
         }
         const auto& [vs_constant_hash, vs_constant_index, vs_constant_value] = vs_constant;
@@ -3414,9 +3431,9 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         if (draw_index == null_fetch.first) {
           WriteRegister(null_fetch_register, saved_fetch_word);
         }
-        if (override_constant) {
+        for (auto saved = saved_constants.rbegin(); saved != saved_constants.rend(); ++saved) {
           for (uint32_t i = 0; i < 4; ++i) {
-            WriteRegister(override_register + i, saved_constant[i]);
+            WriteRegister(saved->first + i, saved->second[i]);
           }
         }
         if (override_vs_constant) {

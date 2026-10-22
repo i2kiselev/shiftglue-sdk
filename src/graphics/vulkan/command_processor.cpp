@@ -6063,7 +6063,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
         translation_memo.interpolator_mask == interpolator_mask &&
         translation_memo.ps_param_gen_pos == ps_param_gen_pos &&
         translation_memo.depth_control == normalized_depth_control.value &&
-        translation_memo.object_slot == object_slot) {
+        translation_memo.object_slot == object_slot &&
+        translation_memo.wrap_seam_generation == wrap_seam_generation()) {
       vertex_shader_modification = translation_memo.vertex_modification;
       pixel_shader_modification = translation_memo.pixel_modification;
       vertex_shader_translation = translation_memo.vertex_translation;
@@ -6080,6 +6081,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       if (object_slot) {
         pixel_shader_modification.pixel.object_slot_output = 1;
       }
+      const WrapSeamBits wrap_seam =
+          SelectWrapSeamBits(wrap_seam_shaders(), wrap_seam_fix(), vertex_shader->ucode_data_hash(),
+                             pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                             vertex_shader_modification.vertex.output_point_parameters ||
+                                 pixel_shader_modification.pixel.param_gen_point);
+      vertex_shader_modification.vertex.wrap_seam_u2 = uint32_t(wrap_seam.vertex);
+      pixel_shader_modification.pixel.wrap_seam_u2 = uint32_t(wrap_seam.pixel);
 
       // Translate the shaders now to obtain the sampler bindings.
       vertex_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
@@ -6116,6 +6124,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       }
       translation_memo.state_epoch = memo_translation ? memo_state : 0;
       translation_memo.object_slot = object_slot;
+      translation_memo.wrap_seam_generation = wrap_seam_generation();
       translation_memo.vertex_shader = vertex_shader;
       translation_memo.pixel_shader = pixel_shader;
       translation_memo.host_vertex_shader_type =

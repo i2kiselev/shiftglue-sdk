@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // Write frac(interpolator 0 z + 0.5) as one more output (gpu_wrap_seam_*).
+      uint32_t wrap_seam_u2 : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -93,6 +95,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // winning, for a temporal upscaler's per-object motion. Host render
       // targets only.
       uint32_t object_slot_output : 1;
+      // Fetches at r0.z take the vertex shader's wrap_seam_u2 copy where it varies less
+      // (gpu_wrap_seam_*).
+      uint32_t wrap_seam_u2 : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -984,6 +989,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id input_sample_id_;
   // PS, only when needed - int[1].
   spv::Id input_sample_mask_;
+  // PS, with Modification::pixel.wrap_seam_u2 - float.
+  spv::Id input_wrap_seam_u2_;
+  // Its value, loaded at the start of main.
+  spv::Id main_wrap_seam_u2_;
 
   // VS output or PS input, only the ones that are needed (spv::NoResult for the
   // unneeded interpolators), indexed by the guest interpolator index - float4.
@@ -1001,6 +1010,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id output_point_coordinates_;
   // VS, only when needed - float.
   spv::Id output_point_size_;
+  // VS, with Modification::vertex.wrap_seam_u2 - float.
+  spv::Id output_wrap_seam_u2_;
 
   enum OutputPerVertexMember : unsigned int {
     kOutputPerVertexMemberPosition,

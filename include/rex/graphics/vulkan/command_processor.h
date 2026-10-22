@@ -1514,6 +1514,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t depth_control = 0;
     // UP-1.7: whether the pixel shader writes the object slot.
     bool object_slot = false;
+    uint32_t wrap_seam_generation = 0;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
     VulkanShader::VulkanTranslation* vertex_translation = nullptr;
