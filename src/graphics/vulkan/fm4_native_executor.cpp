@@ -591,6 +591,7 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
 }
 
 void Fh1NativeExecutor::FlushResolveReadbacks() {
+  ApplyCompletedDeferredReadbacks();
   if (pending_readbacks_.empty()) return;
   if (async_readbacks_ && !REXCVAR_GET(fh1_async_readbacks_hold) &&
       std::none_of(pending_readbacks_.begin(), pending_readbacks_.end(),
@@ -600,6 +601,8 @@ void Fh1NativeExecutor::FlushResolveReadbacks() {
   }
   command_processor_.Fh1AwaitAllQueueOperations();
   CompleteResolveReadbacks(UINT64_MAX);
+  // Everything has completed now, the deferred copies included.
+  ApplyCompletedDeferredReadbacks();
   Count("resolve_readback_flush");
 }
 

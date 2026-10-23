@@ -42,8 +42,11 @@
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
+#include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/system/d3d_census.h>
 #include <rex/system/d3d_draw.h>
+#include <rex/system/d3d_program.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -66,6 +69,16 @@ REXCVAR_DEFINE_INT32(gpu_trace_bins_vblank, -1, "GPU",
                      "resolves (-1: off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+REXCVAR_DECLARE(bool, gpu_async_fence_probe);
+REXCVAR_DEFINE_BOOL(gpu_async_fence_completion, false, "GPU",
+                    "CS-0.4: publish guest fences and interrupts after GPU completion without a CPU wait")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(gpu_true_fence_completion, false, "GPU",
+                    "CS-0.4 probe: submit and await host GPU work before guest fence writes, "
+                    "scratch writebacks, command-stream interrupts and WAIT_FOR_IDLE")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
 // FH1's race polls through WAIT_REG_MEM about 1.5 ms per frame on the GPU
 // commands thread, its bottleneck; yielding first ends those waits sooner
 // (NP-9.3: race frames 16.76-16.92 against 17.05-17.23 ms mean over three
@@ -108,6 +121,18 @@ REXCVAR_DEFINE_BOOL(gpu_record_merge_constant_runs, true, "GPU",
                     "With gpu_record_thread, the decoder extends the last recorded float "
                     "constant run over a gap of up to 16 registers (their current values) "
                     "instead of recording another run, so the recorder handles fewer runs")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(gpu_d3d_program, 0, "GPU",
+                     "NA-2.4 (issue #753): draw the command buffers the game marks as pilot "
+                     "lists from an owned draw program: the backend keeps each draw's derived "
+                     "state (shaders, primitive processing, translations, pipeline, viewport) "
+                     "and reuses it while the draw's state hash, shaders and draw words hold "
+                     "(0: off; 1: shadow, derive as usual and compare with the program; 2: "
+                     "performance, draw from the program; 3: baseline, record and count but "
+                     "derive as usual, for A/B runs; 4: timed only, the lists bracketed and "
+                     "timed but no program looked up, the reference for the complete cost). "
+                     "Read at each swap; Vulkan")
+    .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(gpu_template_stats, false, "GPU",
                     "Diagnostics (DR-4.2): with gpu_record_thread, compare every draw's "
@@ -383,6 +408,7 @@ void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cach
                                                uint32_t title_id, bool blocking) {}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   if (!pending_any_ && system::XThread::IsInThread(worker_thread_.get())) {
     fn();
   } else {
@@ -393,9 +419,25 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
 }
 
 void CommandProcessor::CallInWorkerThread(std::function<void()> fn) {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   std::lock_guard<std::mutex> lock(pending_mutex_);
   pending_fns_.push({std::move(fn), true});
   pending_any_ = true;
+}
+
+void CommandProcessor::RestoreFrameDumpRegisters(std::span<const uint32_t> registers) {
+  assert_true(registers.size() == RegisterFile::kRegisterCount);
+  for (uint32_t i = 0; i < registers.size(); ++i) {
+    if (!IsPerDrawRegister(i) &&
+        !(i >= XE_GPU_REG_SHADER_CONSTANT_000_X && i <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31)) {
+      state_hash_ ^= StateHashTerm(i, register_file_->values[i]) ^ StateHashTerm(i, registers[i]);
+    }
+  }
+  ++state_epoch_;
+  ++render_state_epoch_;
+  std::memcpy(register_file_->values, registers.data(), registers.size_bytes());
+  active_vertex_shader_ = nullptr;
+  active_pixel_shader_ = nullptr;
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -448,6 +490,8 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kGpu);
+  if (session_probe::Enabled()) session_probe::SetHostRole(3);
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
@@ -498,6 +542,9 @@ void CommandProcessor::WorkerThreadMain() {
       const auto idle_start = std::chrono::steady_clock::now();
       uint32_t loop_count = 0;
       do {
+        if (cs_scheduler::InActor()) {
+          cs_scheduler::Point(0,cs_scheduler::PointKind::kWait,true,1000000);
+        } else {
         // If we spin around too much, revert to a "low-power" state.
         if (loop_count > uint32_t(REXCVAR_GET(gpu_idle_spin_count))) {
           const int wait_time_ms = 5;
@@ -507,6 +554,7 @@ void CommandProcessor::WorkerThreadMain() {
 
         rex::thread::MaybeYield();
         loop_count++;
+        }
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && !pending_any_ &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
@@ -579,6 +627,7 @@ void CommandProcessor::StopRecordThread() {
 }
 
 void CommandProcessor::RecordThreadMain() {
+  if (session_probe::Enabled()) session_probe::SetHostRole(4);
   // The thread's CPU time is a system call (GetThreadTimes cost 2 % of the
   // recorder when read around every batch), and it does not advance while the
   // thread waits, so read it before waiting and at most once a millisecond.
@@ -1411,7 +1460,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      AwaitGuestGpuCompletionIfRequested();
+#endif
+      auto complete = [this, mem_addr, value]() {
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+        if (REXCVAR_GET(gpu_async_fence_probe)) system::SignalGpuWrite();
+#endif
+      };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      PublishGuestCompletion(std::move(complete));
+#else
+      complete();
+#endif
     }
   } else {
     switch (index) {
@@ -1736,6 +1798,20 @@ void CommandProcessor::MakeCoherent() {
 
 void CommandProcessor::PrepareForWait() {}
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+void CommandProcessor::AwaitGuestGpuCompletionIfRequested() {
+  if (REXCVAR_GET(gpu_true_fence_completion) && !AwaitGuestGpuCompletion()) {
+    rex::FatalError("CS-0.4 could not await host GPU completion; refusing an early guest signal");
+  }
+}
+
+void CommandProcessor::PublishGuestCompletion(std::function<void()> completion) {
+  if (REXCVAR_GET(gpu_async_fence_completion))
+    rex::FatalError("CS-0.4 async completion is only implemented for Vulkan");
+  completion();
+}
+
+#endif
 void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
@@ -1797,6 +1873,22 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       if (d3d_census_decoder::Active()) d3d_census_decoder::IbEnd(depth);
     }
   } census_guard{trace_ib_depth_};
+  // NA-2.4: a pilot list's draws run from the backend's program for it.
+  struct ProgramGuard {
+    CommandProcessor* processor = nullptr;
+    ~ProgramGuard() {
+      if (!processor) return;
+      processor->RecordCall([p = processor]() { p->DrawProgramEnd(); });
+      processor->d3d_program_depth_ = 0;
+    }
+  } program_guard;
+  if (d3d_program_mode_ && trace_ib_depth_ >= 2 && !d3d_program_depth_ &&
+      system::d3d_program::IsList(ptr)) {
+    d3d_program_depth_ = trace_ib_depth_;
+    program_guard.processor = this;
+    const uint64_t key = uint64_t(ptr & 0x1FFFFFFFu) << 32 | count;
+    RecordCall([this, key]() { DrawProgramBegin(key); });
+  }
 
   for (uint32_t level = 0; level < replay_probe.active; ++level) {
     replay_probe.levels[level].nested.emplace_back(ptr, count);
@@ -2167,14 +2259,37 @@ bool CommandProcessor::ExecuteHostPackets(const uint32_t* dwords, uint32_t count
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (cs_scheduler::Enabled()) cs_scheduler::Call(reader->read_offset());
   const uint32_t packet_offset = reader->read_offset();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (session_probe::Enabled() || (cs_scheduler::Enabled() && cs_scheduler::Mode() != 3)) {
+    uint32_t words = 1;
+    if (packet && (packet_type == 0 || packet_type == 3)) words += ((packet >> 16) & 0x3FFF) + 1;
+    else if (packet_type == 1) words += 2;
+    memory::RingBuffer copy = *reader;
+    copy.set_read_offset(packet_offset);
+    auto range = copy.BeginRead(size_t(words) * 4);
+    if (range.first_length + range.second_length != size_t(words) * 4)
+      rex::FatalError("CS-0.1 cannot hash a truncated PM4 packet");
+    session_pm4_hash_ = session_probe::Digest(range.first, range.first_length, session_pm4_hash_);
+    session_pm4_hash_ = session_probe::Digest(range.second, range.second_length, session_pm4_hash_);
+    session_pm4_words_ += words;
+    if (packet_type == 3 && ((packet >> 8) & 0x7F) == PM4_XE_SWAP) {
+      session_probe::Scalar(session_probe::Kind::kPm4Frame, session_pm4_frame_, session_pm4_hash_);
+      session_probe::Scalar(session_probe::Kind::kPm4Words, session_pm4_frame_++, session_pm4_words_);
+      session_probe::Flush();
+      session_pm4_hash_ = UINT64_C(14695981039346656037);
+      session_pm4_words_ = 0;
+    }
+  }
+#endif
   if (packet == 0) {
     return true;
   }
   if (d3d_census_decoder::Active()) {
-    d3d_census_decoder::Packet(packet_offset);
+    d3d_census_decoder::Packet(packet_offset, packet);
   }
   if (packet_recorder_) {
     uint32_t dword_count = 1;
@@ -2303,6 +2418,10 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     if (d3d_draw_) D3dDrawSwap();
     D3dListSwap();
     D3dShaderCacheSwap();
+    d3d_program_mode_ =
+        SupportsDrawPrograms() ? uint32_t(std::max(REXCVAR_GET(gpu_d3d_program), 0)) : 0;
+    system::d3d_program::SetMode(d3d_program_mode_);
+    system::d3d_program::Swap();
   }
   const int32_t trace_bins_vblank = REXCVAR_GET(gpu_trace_bins_vblank);
   const bool trace_bins = trace_bins_vblank >= 0 && trace_swaps_ == uint32_t(trace_bins_vblank);
@@ -2500,6 +2619,12 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       assert_true(count == 1);
       uint32_t value = reader->ReadAndSwap<uint32_t>();
       REXGPU_INFO("GPU wait for idle = {:08X}", value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      if (REXCVAR_GET(gpu_true_fence_completion)) {
+        RecordCall([this]() { AwaitGuestGpuCompletionIfRequested(); });
+        PublishRecordBatch();
+      }
+#endif
       result = true;
       break;
     }
@@ -2572,17 +2697,28 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
-  RecordCall([this, cpu_mask]() {
+  RecordCall([this, cpu_mask, frame = counter_]() {
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuInterrupt, 0, cpu_mask);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    AwaitGuestGpuCompletionIfRequested();
+#endif
     if (record_split_) {
       FlushCpuVisibleResults();
     }
-    for (int n = 0; n < 6; n++) {
-      if (cpu_mask & (1 << n)) {
-        if (graphics_system_) {
-          graphics_system_->DispatchInterruptCallback(1, n);
+    auto complete = [this, cpu_mask]() {
+      for (int n = 0; n < 6; n++) {
+        if (cpu_mask & (1 << n)) {
+          if (graphics_system_) {
+            graphics_system_->DispatchInterruptCallback(1, n);
+          }
         }
       }
-    }
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
   });
   PublishRecordBatch();
   return true;
@@ -2772,6 +2908,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           !wait_word_armed.exchange(true, std::memory_order_relaxed)) {
         memory_->EnablePhysicalMemoryAccessCallbacks(poll_reg_addr & 0x1FFFFFFC, 4, false, false,
                                                      true);
+      }
+      if (cs_scheduler::InActor()) {
+        cs_scheduler::Point(poll_reg_addr,cs_scheduler::PointKind::kWait,true,100000);
+        continue;
       }
       // Wait.
       if (wait >= 0x100) {
@@ -2989,13 +3129,38 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   if (!record_split_) {
-    memory::store(memory_->TranslatePhysical(address), data_value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    AwaitGuestGpuCompletionIfRequested();
+#endif
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
+    auto complete = [this, address, data_value]() {
+      memory::store(memory_->TranslatePhysical(address), data_value);
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+      if (REXCVAR_GET(gpu_async_fence_probe)) system::SignalGpuWrite();
+#endif
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
     return true;
   }
   RecordCall([this, address, data_value]() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    AwaitGuestGpuCompletionIfRequested();
+#endif
+    if (session_probe::Enabled()) session_probe::Scalar(session_probe::Kind::kGpuFence, address, data_value);
     FlushCpuVisibleResults();
-    memory::store(memory_->TranslatePhysical(address), data_value);
-    system::SignalGpuWrite();
+    auto complete = [this, address, data_value]() {
+      memory::store(memory_->TranslatePhysical(address), data_value);
+      system::SignalGpuWrite();
+    };
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    PublishGuestCompletion(std::move(complete));
+#else
+    complete();
+#endif
   });
   PublishRecordBatch();
   return true;
@@ -3482,7 +3647,8 @@ bool CommandProcessor::D3dCensusDraw(memory::RingBuffer* reader, uint32_t count)
         decode_regs().Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy;
     // Drawn for the census: a draw, not an EDRAM copy, of the first tile (or
     // of no tiling pass), the draws the untiled Android path keeps.
-    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy);
+    d3d_census_decoder::Draw(TilingPassOfSelect() <= 0 && !copy,
+                             TilingPassOfSelect() <= 0 && copy);
     if (copy && d3d_skip_visible_ >= 3 && d3d_census_decoder::Visible()) {
       static uint64_t visible_copies = 0;
       const uint64_t copies = ++visible_copies;

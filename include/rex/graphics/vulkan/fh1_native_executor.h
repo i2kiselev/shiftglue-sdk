@@ -7,9 +7,11 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -20,10 +22,12 @@
 #include <rex/graphics/fh1_edram_surfaces.h>
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/fh1_executor_counters.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
+#include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/thread.h>
 #include <rex/ui/vulkan/api.h>
@@ -108,6 +112,9 @@ class Fh1NativeExecutor {
   VkExtent2D draw_shading_rate() const { return draw_shading_rate_; }
   // Enters dynamic rendering with the bound surfaces (after all barriers).
   void BeginDrawRendering();
+  // Local one-frame shader identities and the actual bound render surfaces.
+  void DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                          const VulkanShader::VulkanTranslation* pixel);
   // After BindTargets: the draw has no depth, stencil or color target to use.
   bool BoundNothing() const { return bound_bits_ == 0; }
   void CountDrawSkippedWithoutEffect() { Count("draw_skipped_without_effect"); }
@@ -121,6 +128,10 @@ class Fh1NativeExecutor {
   // matters at this scale; it applies when the executor is created again.
   bool IsSingleSampleMsaaOutdated() const;
   void OnSwap(uint64_t frame);
+  void BeginInspection();
+  void InspectTextures(uint32_t mask);
+  bool inspection_active() const { return inspection_ != nullptr; }
+  const Fh1VulkanExecutorConfig& config() const { return config_; }
   // present_hdr: before PrepareTargets, notes the scene's 2_10_10_10 target
   // and, at the first HUD draw over it (through its 2_10_10_10_AS_10_10_10_10
   // view), copies it, so the swap can tell the HUD from the scene.
@@ -175,6 +186,7 @@ class Fh1NativeExecutor {
   // each pixel's depth with its slot's matrix.
   static constexpr uint32_t kMaxObjectSlots = 256;
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
+  bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
   // or an object's own (DrawObjectMatrixRegister).
@@ -221,6 +233,19 @@ class Fh1NativeExecutor {
     if (token == UINT64_MAX || uint32_t(token) == UINT32_MAX) return;
     GpuEnd(GpuPhase(kGpuPhases + uint32_t(token >> 32)), uint32_t(token));
   }
+  // fh1_visibility_census: an occlusion query around each draw of a sampled
+  // frame, to count draws that pass no samples (the item-2 ceiling).
+  uint32_t VisBegin(const Fh1DrawInfo& draw, reg::RB_DEPTHCONTROL depth,
+                    uint32_t vertex_count);
+  // fh1_visibility_census_no_depth: census frames draw without the depth
+  // test, so draws that still pass no samples are off screen (or discard).
+  bool VisNoDepth() const;
+  bool VisActive() const { return vis_query_pool_ != VK_NULL_HANDLE; }
+  // fh1_visibility_oracle_skip (item-2 ceiling, renders wrong): the draw
+  // with this key (and ordinal in the frame) passed no samples at its last
+  // census, so it is dropped before its derivation.
+  bool VisOracleSkip(uint64_t key);
+  void VisEnd(uint32_t query);
 
  private:
   using SurfaceKey = Fh1SurfaceKey;
@@ -276,6 +301,23 @@ class Fh1NativeExecutor {
     // Held by a clear record (MaterializeClears).
     bool cleared = false;
   };
+  void FinishInspection(uint64_t frame);
+  void DestroyInspector();
+  Fh1InspectionImage QueueInspectionImage(Surface& surface, Rect rect);
+  struct CopyPlan;
+  void InspectResolve(const CopyPlan& plan, uint32_t untile_band);
+  std::shared_ptr<Fh1FrameInspection> inspection_;
+  uint64_t inspection_generation_ = 0;
+  std::map<uint32_t, uint32_t> inspection_draws_;
+  std::map<uint64_t, Fh1InspectionTexture> inspection_textures_;
+  struct InspectionReadback {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+  };
+  std::vector<InspectionReadback> inspection_readbacks_;
+  VkDescriptorSetLayout inspection_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout inspection_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline inspection_pipelines_[2] = {};
   struct CopyPlan : Fh1ResolvePlan {
     std::vector<SourceRect> sources;
   };
@@ -316,6 +358,13 @@ class Fh1NativeExecutor {
     // The first run of a range that is new: the guest may process it at
     // once (race load, thumbnails), so it is waited for even when async.
     bool wait;
+  };
+  struct DeferredReadback {
+    uint32_t address;
+    uint32_t length;
+    // In deferred_readback_buffer_.
+    VkDeviceSize offset;
+    uint64_t submission;
   };
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
@@ -417,6 +466,11 @@ class Fh1NativeExecutor {
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
+  // Small resolves the CPU reads every frame (the auto exposure's luminance,
+  // #548): copied into a ring and written to guest memory once their
+  // submission has completed, a frame or two late, never waiting for the GPU.
+  void QueueDeferredReadback(uint32_t address, uint32_t length);
+  void ApplyCompletedDeferredReadbacks();
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);
@@ -636,6 +690,12 @@ class Fh1NativeExecutor {
   VkDeviceSize readback_size_ = 0;
   VkDeviceSize readback_used_ = 0;
   const uint8_t* readback_mapped_ = nullptr;
+  static constexpr VkDeviceSize kDeferredReadbackSize = 64 * 1024;
+  std::deque<DeferredReadback> deferred_readbacks_;
+  VkBuffer deferred_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory deferred_readback_memory_ = VK_NULL_HANDLE;
+  const uint8_t* deferred_readback_mapped_ = nullptr;
+  VkDeviceSize deferred_readback_next_ = 0;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
@@ -643,6 +703,9 @@ class Fh1NativeExecutor {
   uint32_t pending_used_bits_ = 0;
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t bound_bits_ = 0;
+  std::ofstream shader_discovery_draws_;
+  bool shader_discovery_started_ = false;
+  std::set<std::string> shader_discovery_written_;
   // DrawRenderingId(bound_bits_), set by BindTargets for BeginDrawRendering.
   uint64_t bound_rendering_id_ = 0;
   // fh1_coarse_shading, parsed at swaps, and the rate of each draw rendering.
@@ -756,6 +819,43 @@ class Fh1NativeExecutor {
   std::map<std::pair<uint32_t, std::string>, uint64_t> gpu_label_enders_;
   void GpuMarkRendering(uint32_t label);
   uint32_t GpuLabel(const std::string& label);
+  static constexpr uint32_t kVisQueries = 16384;
+  struct VisDraw {
+    uint64_t key;
+    uint32_t label;
+    uint32_t vertices;
+    uint32_t kind;
+  };
+  // By label and kind (0 depth tested and written with early depth, 1 the
+  // same with late depth (the pixel shader kills or writes depth, or alpha
+  // decides coverage), 2 tested only, 3 not tested): draws, draws with no
+  // samples, draws under 64 samples, vertices, vertices of draws with no
+  // samples.
+  static constexpr uint32_t kVisKinds = 4;
+  struct VisTotals {
+    uint64_t v[kVisKinds][5] = {};
+  };
+  void VisDrain();
+  void VisMarkRendering();
+  VkQueryPool vis_query_pool_ = VK_NULL_HANDLE;
+  bool vis_frame_ = false;
+  bool vis_reset_ = false;
+  bool vis_pending_ = false;
+  uint64_t vis_submission_ = 0;
+  uint32_t vis_retries_ = 0;
+  uint32_t vis_label_ = UINT32_MAX;
+  uint32_t vis_frames_ = 0;
+  uint32_t vis_skipped_ = 0;
+  std::vector<VisDraw> vis_draws_;
+  std::vector<std::string> vis_labels_;
+  std::unordered_map<std::string, uint32_t> vis_label_ids_;
+  std::vector<VisTotals> vis_totals_;
+  uint64_t vis_key_ = 0;
+  std::unordered_map<uint64_t, uint32_t> vis_ordinals_;
+  // Bit 0: no samples at the last census; bit 1: late depth.
+  std::unordered_map<uint64_t, uint8_t> vis_oracle_;
+  uint64_t vis_oracle_skips_ = 0;
+  uint64_t vis_oracle_draws_ = 0;
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;

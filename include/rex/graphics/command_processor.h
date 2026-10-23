@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,7 @@
 #include <rex/graphics/pipeline/shader/wrap_seam.h>
 #include <rex/graphics/pixel_shader_constant_override.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
@@ -179,6 +181,10 @@ class CommandProcessor {
   // Replays a frame dump requested at startup (fh1_frame_replay); called on
   // the command processor thread once shader storage is initialized.
   virtual void RunRequestedFrameReplay() {}
+  // Restore a full dump register file without triggering MMIO write effects.
+  virtual void RestoreFrameDumpRegisters(std::span<const uint32_t> registers);
+  virtual std::shared_ptr<Fh1FrameInspector> frame_inspector() const { return {}; }
+  virtual bool OpenInspectionDump(const std::filesystem::path&, Fh1InspectionView) { return false; }
 
   bool is_paused() const { return paused_; }
   void Pause();
@@ -334,6 +340,13 @@ class CommandProcessor {
   // (writes guest memory, raises an interrupt, swaps, advances the ring read
   // pointer): results the CPU may read from then on must be in guest memory.
   virtual void FlushCpuVisibleResults() {}
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  // CS-0.4: run on the recorder, before publishing a guest completion.
+  virtual bool AwaitGuestGpuCompletion() { return false; }
+  void AwaitGuestGpuCompletionIfRequested();
+  // The default backend publishes immediately. Vulkan can retire on a worker.
+  virtual void PublishGuestCompletion(std::function<void()> completion);
+#endif
   virtual void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
@@ -715,6 +728,18 @@ class CommandProcessor {
   bool D3dShaderCacheLoad(xenos::ShaderType shader_type, uint32_t addr, uint32_t size_dwords,
                           const uint32_t* ucode, uint64_t& hash);
   void D3dShaderCacheSwap();
+  // NA-2.4 owned draw programs (gpu_d3d_program, read at each swap: 0 off,
+  // 1-4 the cvar's modes): the decoder brackets each run of a list the
+  // game marked (system/d3d_program.h) with these calls, in order with the
+  // list's draws, so the backend knows which draws a program covers. The key
+  // is the buffer's (physical address << 32 | dwords).
+  virtual bool SupportsDrawPrograms() const { return false; }
+  virtual void DrawProgramBegin(uint64_t key) { (void)key; }
+  virtual void DrawProgramEnd() {}
+  uint32_t d3d_program_mode_ = 0;
+  // The depth of the pilot buffer being decoded (0: none); lists it calls
+  // are part of its program.
+  uint32_t d3d_program_depth_ = 0;
   // Runs a nested buffer from its compiled form; false to decode it.
   bool D3dListExecute(uint32_t ptr, uint32_t count);
   // Verify: the buffer at this depth was modelled; it is decoded now and
@@ -772,6 +797,13 @@ class CommandProcessor {
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
   uint32_t gamma_ramp_rw_component_ = 0;
+  // CS-0.1, decoder-owned: headers (including IB links), payloads and nested
+  // packets in decode order; reset on each XE_SWAP.
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  uint64_t session_pm4_hash_ = UINT64_C(14695981039346656037);
+  uint64_t session_pm4_words_ = 0;
+  uint64_t session_pm4_frame_ = 0;
+#endif
 };
 
 }  // namespace rex::graphics

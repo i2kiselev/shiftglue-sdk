@@ -189,6 +189,36 @@ REXCVAR_DEFINE_BOOL(fh1_log_scaled_textures, false, "GPU",
 
 namespace rex::graphics {
 
+void TextureCache::InspectActiveTextures(
+    uint32_t mask, std::map<uint64_t, Fh1InspectionTexture>& out) const {
+  for (uint32_t slot = 0; slot < 32 && out.size() < 512; ++slot) {
+    if (!(mask & (1u << slot))) continue;
+    const auto* binding = GetValidTextureBinding(slot);
+    if (!binding) continue;
+    const auto& key = binding->key;
+    const uint64_t identity = TextureKey::Hasher()(key);
+    if (out.contains(identity)) continue;
+    Fh1InspectionTexture item;
+    item.address = key.base_page << 12;
+    item.width = key.GetWidth();
+    item.height = key.GetHeight();
+    item.format = uint32_t(key.format);
+    const auto layout = key.GetGuestLayout();
+    // Same byte domain as texture replacement names. Resolve-backed textures
+    // have no stable CPU payload; do not present their stale RAM as a hash.
+    const auto* texture = binding->texture ? binding->texture : binding->texture_signed;
+    if (key.base_page && !key.scaled_resolve && texture &&
+        layout.base.level_data_extent_bytes && layout.base.level_data_extent_bytes <= (16u << 20)) {
+      std::vector<uint8_t> data(layout.base.level_data_extent_bytes);
+      if (shared_memory_.CopyCpuRange(item.address, data)) {
+        item.hash = XXH3_64bits(data.data(), data.size());
+        item.hash_valid = true;
+      }
+    }
+    out.emplace(identity, item);
+  }
+}
+
 // critical_region_census (NN-3.10): this file's global lock acquisitions.
 constexpr auto kTextureCacheLockSource = rex::thread::LockSource::kTextureCache;
 
@@ -820,7 +850,11 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     const BindingMemo* memo = nullptr;
     const BindingMemo& memo_slot = binding_memos_[BindingMemoSlot(fetch_words)];
     if (memo_slot.epoch == binding_memo_epoch_ &&
-        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words))) {
+        !std::memcmp(memo_slot.fetch_words, fetch_words, sizeof(memo_slot.fetch_words)) &&
+        (!IsDrawResolutionScaled() ||
+         ((!memo_slot.texture || !memo_slot.texture->outdated_mask()) &&
+          (!memo_slot.texture_signed || !memo_slot.texture_signed->outdated_mask())))) {
+      // Scaled resolve ownership can change without changing the fetch words.
       memo = &memo_slot;
     }
     if (memo) {
@@ -1278,15 +1312,23 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   bool kept_unscaled = false;
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    const uint32_t base_extent = scaled_resolve_guest_layout.base.level_data_extent_bytes;
-    const uint32_t mips_extent = scaled_resolve_guest_layout.mips_total_extent_bytes;
-    // The base decides when there is one: a texture the CPU loaded over an old render target
-    // can leave a resolved page at the end of its mip extent that its data never reaches,
-    // and sampling the whole texture from the scaled buffer then shows that target's bytes.
+    const auto layout = key.GetGuestLayout();
+    const uint32_t base_size = layout.base.level_data_extent_bytes;
+    const uint32_t mips_size = layout.mips_total_extent_bytes;
+    const FormatInfo* format = FormatInfo::Get(key.format);
+    const bool compressed = format->block_width > 1 || format->block_height > 1;
+    // A compressed asset can reuse part of an old resolve allocation. One
+    // leftover GPU page must not redirect its CPU base and mips to that buffer.
+    const bool base_scaled =
+        base_size && IsRangeScaledResolved(key.base_page << 12, base_size, compressed);
     const bool mips_scaled =
-        mips_extent && IsRangeScaledResolved(key.mip_page << 12, mips_extent);
-    if (base_extent ? IsRangeScaledResolved(key.base_page << 12, base_extent) : mips_scaled) {
+        mips_size && IsRangeScaledResolved(key.mip_page << 12, mips_size, compressed);
+    // Otherwise the base decides when there is one: a texture the CPU loaded over an old render
+    // target can leave a resolved page at the end of its mip extent that its data never reaches,
+    // and sampling the whole texture from the scaled buffer then shows that target's bytes.
+    if (compressed ? (base_size || mips_size) && (!base_size || base_scaled) &&
+                         (!mips_size || mips_scaled)
+                   : (base_size ? base_scaled : mips_scaled)) {
       key.scaled_resolve = 1;
     } else {
       kept_unscaled = mips_scaled;
@@ -1555,10 +1597,9 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 }
 
 void TextureCache::ResetOutdatedTextureBindings() {
-  // Only a binding whose texture is outdated needs its load rechecked: the
-  // others, and the memo's derivations (fetch words to key to texture, which
-  // an outdated texture keeps), stay valid. A texture outdated after the flag
-  // was taken sets it again, so the next draw rechecks it.
+  // Only a binding whose texture is outdated needs its load rechecked. The
+  // memo re-derives outdated entries at scale, where ownership may have changed.
+  // A texture outdated after the flag was taken sets it again for the next draw.
   auto outdated = [](const Texture* texture) {
     return texture != nullptr && texture->outdated_mask() != 0;
   };

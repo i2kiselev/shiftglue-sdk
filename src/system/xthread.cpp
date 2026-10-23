@@ -39,6 +39,8 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
+#include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 #include <rex/thread.h>
 #include <rex/vec128.h>
 
@@ -47,6 +49,10 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
+
+REXCVAR_DEFINE_BOOL(cs_ctx_addresses, false, "Diagnostics",
+                    "Log thread context ranges for the CS-0.2 sampled traffic ceiling")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // Off on Android too until a device measures it (AP-7.0): on the 8-core
 // emulator the raised priority alone (its cores are alike, so nothing is
@@ -225,6 +231,9 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
       guest_thread_(guest_thread),
       main_thread_(main_thread),
       apc_lock_old_irql_(0) {
+  if (session_probe::Enabled()) thread_id_ = uint32_t(session_probe::Scalar(
+      session_probe::Kind::kThreadId, (uint64_t(start_address) << 32) | start_context,
+      thread_id_, true));
   creation_params_.stack_size = stack_size;
   creation_params_.xapi_thread_startup = xapi_thread_startup;
   creation_params_.start_address = start_address;
@@ -249,6 +258,9 @@ XThread::XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_t
 }
 
 XThread::~XThread() {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_join_) cs_scheduler::MapWait(thread_.get(),nullptr);
+#endif
   if (main_fiber_) {
     main_fiber_->Destroy();
     main_fiber_ = nullptr;
@@ -488,6 +500,7 @@ void XThread::FreeStack() {
 }
 
 X_STATUS XThread::Create() {
+  cs_scheduler::Actor scheduled(cs_scheduler::kMain);
   // Thread kernel object.
   if (!CreateNative<X_KTHREAD>()) {
     REXSYS_WARN("Unable to allocate thread object");
@@ -519,6 +532,13 @@ X_STATUS XThread::Create() {
     tls_slots = tls_header->slot_count;
     tls_extended_size = tls_header->data_size;
   }
+  if (session_probe::Enabled()) {
+    const auto layout = session_probe::Scalar(session_probe::Kind::kThreadTls, thread_id_,
+        (uint64_t(tls_slots) << 32) | tls_extended_size, true);
+    tls_slots = uint32_t(layout >> 32); tls_extended_size = uint32_t(layout);
+    session_probe::Require(tls_slots <= (1u << 18) && tls_extended_size <= (1u << 20),
+                            "capture incomplete: replay TLS extent");
+  }
 
   // Allocate both the slots and the extended data.
   // Some TLS is compiled with the binary (declspec(thread)) vars. The game
@@ -534,11 +554,13 @@ X_STATUS XThread::Create() {
 
   // Zero all of TLS.
   memory()->Fill(tls_static_address_, tls_total_size_, 0);
-  if (tls_extended_size) {
+  if (tls_extended_size && !(session_probe::Enabled() && session_probe::Replaying())) {
     // If game has extended data, copy in the default values.
     assert_not_zero(tls_header->raw_data_address);
     memory()->Copy(tls_static_address_, tls_header->raw_data_address, tls_header->raw_data_size);
   }
+  if (session_probe::Enabled()) session_probe::Bytes(session_probe::Kind::kThreadTlsData,
+      thread_id_, memory()->TranslateVirtual(tls_static_address_), tls_total_size_);
 
   // Allocate thread state block from heap.
   // https://web.archive.org/web/20170704035330/https://www.microsoft.com/msj/archive/S2CE.aspx
@@ -569,6 +591,8 @@ X_STATUS XThread::Create() {
                      stack_limit_, stack_base_);
 
   uint8_t cpu_index = GetFakeCpuNumber(static_cast<uint8_t>(creation_params_.creation_flags >> 24));
+  if (session_probe::Enabled()) cpu_index = uint8_t(session_probe::Scalar(
+      session_probe::Kind::kThreadCpu, thread_id_, cpu_index, true));
 
   // Initialize the KTHREAD object.
   InitializeGuestObject();
@@ -607,8 +631,14 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_CREATED();
 
     // Execute user code.
+    if (REXCVAR_GET(cs_ctx_addresses)) {
+      REXLOG_INFO("CS_CTX tid={} guest={:08X} ctx={:X} size={}",
+                  rex::thread::current_thread_system_id(), creation_params_.start_address,
+                  reinterpret_cast<uintptr_t>(thread_state_->context()), sizeof(PPCContext));
+    }
+    session_probe::SetThreadTag(thread_id_, creation_params_.start_address);
     current_xthread_tls_ = this;
-    running_ = true;
+    if (!cs_scheduler::Enabled()) running_ = true;
     Execute();
     running_ = false;
     current_xthread_tls_ = nullptr;
@@ -620,6 +650,12 @@ X_STATUS XThread::Create() {
     ReleaseHandle();
   });
 
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (thread_ && cs_scheduler::Enabled()) {
+    verification_join_=rex::thread::Event::CreateManualResetEvent(false);
+    cs_scheduler::MapWait(thread_.get(),verification_join_.get());
+  }
+#endif
   if (!thread_) {
     // TODO(benvanik): translate error?
     REXSYS_ERROR("CreateThread failed");
@@ -662,6 +698,7 @@ X_STATUS XThread::Create() {
 }
 
 X_STATUS XThread::Exit(int exit_code) {
+  cs_scheduler::Actor exit_schedule(UINT64_C(0x8000000000010000) | thread_id_);
   // This may only be called on the thread itself.
   assert_true(XThread::GetCurrentThread() == this);
   // Keep the object alive until Thread::Exit() transitions the host thread
@@ -707,9 +744,13 @@ X_STATUS XThread::Exit(int exit_code) {
   PROFILE_THREAD_EXIT();
 
   running_ = false;
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+  if (verification_join_) verification_join_->Set();
+#endif
   ReleaseHandle();
 
   // NOTE: this does not return!
+  cs_scheduler::Detach();
   rex::thread::Thread::Exit(exit_code);
   return X_STATUS_SUCCESS;
 }
@@ -731,9 +772,14 @@ X_STATUS XThread::Terminate(int exit_code) {
     auto self = retain_object(this);
     FreeStack();
     ReleaseHandle();
+    cs_scheduler::Detach();
     rex::thread::Thread::Exit(exit_code);
   } else {
+#if defined(REXGLUE_ENABLE_CS_PROBES)
+    cs_scheduler::Terminate(thread_id_,[&] { thread_->Terminate(exit_code); });
+#else
     thread_->Terminate(exit_code);
+#endif
     FreeStack();
     ReleaseHandle();
   }
@@ -742,6 +788,8 @@ X_STATUS XThread::Terminate(int exit_code) {
 }
 
 void XThread::Execute() {
+  cs_scheduler::Actor scheduled(thread_id_);
+  if (cs_scheduler::Enabled()) running_ = true;
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
 
@@ -969,6 +1017,12 @@ void XThread::DeliverAPCs() {
     uint32_t apc_ptr = mem->HostToGuestVirtual(apc);
     bool needs_freeing = apc->kernel_routine != XAPC::kDummyKernelRoutine;
 
+    if (session_probe::Enabled()) {
+      session_probe::Scalar(session_probe::Kind::kApcDelivery, apc->kernel_routine,
+          (uint64_t(apc->normal_routine) << 32) | apc->normal_context);
+      session_probe::Scalar(session_probe::Kind::kApcDelivery, apc_ptr,
+          (uint64_t(apc->arg1) << 32) | apc->arg2);
+    }
     util::XeRemoveEntryList(&apc->list_entry, mem);
     apc->enqueued = 0;
 
@@ -1179,6 +1233,17 @@ uint32_t XThread::suspend_count() {
 X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   auto guest_thread = guest_object<X_KTHREAD>();
   uint32_t unused_host_suspend_count = 0;
+  if (cs_scheduler::Enabled()) {
+    const uint32_t previous=guest_thread->suspend_count;
+    if(out_suspend_count) *out_suspend_count=previous;
+    if(previous) guest_thread->suspend_count=previous-1;
+    if(previous==1) {
+      cs_scheduler::Resume(thread_id_);
+      // Initial CREATE_SUSPENDED still uses the native startup barrier.
+      if(!running_) thread_->Resume(&unused_host_suspend_count);
+    }
+    return X_STATUS_SUCCESS;
+  }
 
 #if REX_PLATFORM_WIN32
   uint8_t previous_suspend_count =
@@ -1230,6 +1295,11 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
   uint32_t unused_host_suspend_count = 0;
   // Wrapped to 0 - treat as not suspended.
   if (guest_thread->suspend_count == 0) {
+    cs_scheduler::Resume(thread_id_);
+    return X_STATUS_SUCCESS;
+  }
+  if (cs_scheduler::Enabled()) {
+    cs_scheduler::Suspend(thread_id_);
     return X_STATUS_SUCCESS;
   }
   return thread_->Suspend(&unused_host_suspend_count) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL;
@@ -1247,6 +1317,8 @@ uint32_t XThread::SelfSuspend() {
 #endif
 
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
+  session_probe::SyncBoundary trace((UINT64_C(0xD) << 60) |
+      (uint64_t(alertable) << 32) | processor_mode, interval);
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
@@ -1262,15 +1334,18 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   }
   timeout_ms = chrono::Clock::ScaleGuestDurationMillis(timeout_ms);
   CheckTitleTermination();
+  if (trace.expected && *trace.expected == X_STATUS_SUCCESS)
+    return trace.Finish(X_STATUS_SUCCESS);
   if (alertable) {
-    auto result = rex::thread::AlertableSleep(std::chrono::milliseconds(timeout_ms));
+    auto result = rex::thread::AlertableSleep(trace.expected ? std::chrono::milliseconds::max()
+        : std::chrono::milliseconds(timeout_ms));
     CheckTitleTermination();
     switch (result) {
       default:
       case rex::thread::SleepResult::kSuccess:
-        return X_STATUS_SUCCESS;
+        return trace.Finish(X_STATUS_SUCCESS);
       case rex::thread::SleepResult::kAlerted:
-        return X_STATUS_USER_APC;
+        return trace.Finish(X_STATUS_USER_APC);
     }
   } else {
     if (timeout_ms == 0) {
@@ -1285,7 +1360,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
     CheckTitleTermination();
   }
 
-  return X_STATUS_SUCCESS;
+  return trace.Finish(X_STATUS_SUCCESS);
 }
 
 struct ThreadSavedState {
@@ -1696,7 +1771,11 @@ void XHostThread::Execute() {
                handle(), thread_name_, thread_->system_id());
 
   // Let the kernel know we are starting.
-  kernel_state_->OnThreadExecute(this);
+  {
+    cs_scheduler::Actor scheduled(UINT64_C(0x8000000000010000) | thread_id_);
+    if (cs_scheduler::Enabled()) running_ = true;
+    kernel_state_->OnThreadExecute(this);
+  }
 
   int ret = host_fn_();
 

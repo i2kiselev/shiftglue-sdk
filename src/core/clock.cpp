@@ -18,6 +18,8 @@
 #include <rex/cvar.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
+#include <rex/session_probe.h>
+#include <rex/cs_scheduler.h>
 
 REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
@@ -103,6 +105,10 @@ void RecomputeGuestTickScalar() {
 // Update the guest timer for all threads.
 // Return a copy of the value so locking is reduced.
 uint64_t UpdateGuestClock() {
+  if (cs_scheduler::Enabled()) {
+    const auto ns=cs_scheduler::ClockRead(__builtin_return_address(0));
+    return ns/1000000000*guest_tick_frequency_ + ns%1000000000*guest_tick_frequency_/1000000000;
+  }
   uint64_t host_tick_count = Clock::QueryHostTickCount();
 
   if (REXCVAR_GET(clock_no_scaling)) {
@@ -122,6 +128,7 @@ uint64_t UpdateGuestClock() {
 
 // Offset of the current guest system file time relative to the guest base time.
 inline uint64_t QueryGuestSystemTimeOffset() {
+  if (cs_scheduler::Enabled()) return cs_scheduler::ClockRead(__builtin_return_address(0)) / 100;
   if (REXCVAR_GET(clock_no_scaling)) {
     return Clock::QueryHostSystemTime() - guest_system_time_base_;
   }
@@ -195,7 +202,7 @@ std::pair<uint64_t, uint64_t> Clock::guest_tick_ratio() {
 }
 
 uint64_t Clock::guest_tick_frequency() {
-  return guest_tick_frequency_;
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kPerformanceFrequency, session_probe::Site(__builtin_return_address(0)), guest_tick_frequency_, true) : guest_tick_frequency_;
 }
 
 void Clock::set_guest_tick_frequency(uint64_t frequency) {
@@ -204,7 +211,8 @@ void Clock::set_guest_tick_frequency(uint64_t frequency) {
 }
 
 uint64_t Clock::guest_system_time_base() {
-  return guest_system_time_base_;
+  if (cs_scheduler::Enabled()) return cs_scheduler::Epoch();
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kHostEpoch, 0, guest_system_time_base_, true) : guest_system_time_base_;
 }
 
 void Clock::set_guest_system_time_base(uint64_t time_base) {
@@ -213,21 +221,28 @@ void Clock::set_guest_system_time_base(uint64_t time_base) {
 
 uint64_t Clock::QueryGuestTickCount() {
   auto guest_tick_count = UpdateGuestClock();
+  if (session_probe::Enabled())
+    return session_probe::Scalar(session_probe::Kind::kTimebase, session_probe::Site(__builtin_return_address(0)), guest_tick_count, true);
   return guest_tick_count;
 }
 
 uint64_t Clock::QueryGuestSystemTime() {
+  if (cs_scheduler::Enabled()) return cs_scheduler::Epoch() +
+      cs_scheduler::ClockRead(__builtin_return_address(0)) / 100;
   if (REXCVAR_GET(clock_no_scaling)) {
-    return Clock::QueryHostSystemTime();
+    const auto now = Clock::QueryHostSystemTime();
+    return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, session_probe::Site(__builtin_return_address(0)), now, true) : now;
   }
 
   auto guest_system_time_offset = QueryGuestSystemTimeOffset();
-  return guest_system_time_base_ + guest_system_time_offset;
+  const auto now = guest_system_time_base_ + guest_system_time_offset;
+  return session_probe::Enabled() ? session_probe::Scalar(session_probe::Kind::kSystemTime, session_probe::Site(__builtin_return_address(0)), now, true) : now;
 }
 
 uint32_t Clock::QueryGuestUptimeMillis() {
-  return static_cast<uint32_t>(std::min<uint64_t>(QueryGuestSystemTimeOffset() / 10000,
+  const auto value = static_cast<uint32_t>(std::min<uint64_t>(QueryGuestSystemTimeOffset() / 10000,
                                                   std::numeric_limits<uint32_t>::max()));
+  return session_probe::Enabled() ? uint32_t(session_probe::Scalar(session_probe::Kind::kUptime, session_probe::Site(__builtin_return_address(0)), value, true)) : value;
 }
 
 void Clock::SetGuestSystemTime(uint64_t system_time) {

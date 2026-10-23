@@ -44,7 +44,25 @@
 #include <rex/ui/surface_win.h>
 #endif
 #if REX_PLATFORM_MAC
+#include <CoreGraphics/CoreGraphics.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <rex/ui/surface_mac.h>
+
+namespace {
+void SyncMacMetalLayerDrawableSize(const void* metal_layer, const VkExtent2D& extent) {
+  if (!metal_layer || !extent.width || !extent.height) return;
+  id layer = static_cast<id>(const_cast<void*>(metal_layer));
+  const CGSize size = reinterpret_cast<CGSize (*)(id, SEL)>(objc_msgSend)(
+      layer, sel_registerName("drawableSize"));
+  if (size.width == extent.width && size.height == extent.height) return;
+  // SDL can update the view to 1x1 after swapchain creation on fullscreen
+  // changes. Restore the extent before MoltenVK acquires its next drawable.
+  reinterpret_cast<void (*)(id, SEL, CGSize)>(objc_msgSend)(
+      layer, sel_registerName("setDrawableSize:"),
+      CGSizeMake(CGFloat(extent.width), CGFloat(extent.height)));
+}
+}  // namespace
 #endif
 
 REXCVAR_DEFINE_BOOL(present_upscaler_profile, false, "UI/Presenter",
@@ -263,15 +281,7 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
-  // Destroy the swapchain after its images are not used for drawing anymore.
-  // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
-  // fence clearly indicating when it's safe to destroy a swapchain, so we
-  // assume that its lifetime is tracked internally in the WSI. This is also
-  // done before destroying the semaphore awaited by vkQueuePresentKHR, hoping
-  // that it will prevent the destruction during the semaphore wait in
-  // vkQueuePresentKHR execution (or between the vkQueueSubmit semaphore signal
-  // and the vkQueuePresentKHR semaphore wait).
-  // This will await completion of all paint submissions also.
+  // Retirement drains drawing and presentation before releasing their objects.
   paint_context_.DestroySwapchainAndVulkanSurface();
 
   // Await completion of the usage of everything before destroying anything
@@ -1192,6 +1202,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.pLayer = metal_surface.layer();
         vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+        paint_context_.mac_metal_layer = metal_surface.layer();
       } break;
 #endif
       default:
@@ -1773,6 +1784,10 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   bool hdr_offered = false;
   bool hdr_pq = false;
   bool hdr_pq_dataspace = false;
+#if REX_PLATFORM_ANDROID
+  // Log the display even when Vulkan offers HDR10 directly or lacks metadata.
+  const AndroidDisplayHdr& display_hdr = GetAndroidDisplayHdr();
+#endif
   if (vulkan_device->vulkan_instance()->extensions().ext_EXT_swapchain_colorspace) {
     const VkSurfaceFormatKHR* hdr_format = nullptr;
     for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
@@ -1795,7 +1810,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 #if REX_PLATFORM_ANDROID
     // Android 13 lists no HDR10 color space even for an HDR10 display; the
     // window still composes BT.2020 PQ buffers, as video players use.
-    if (!hdr_format && GetAndroidDisplayHdr().hdr10) {
+    if (!hdr_format && display_hdr.hdr10) {
       for (const VkSurfaceFormatKHR& surface_format : surface_formats) {
         if (surface_format.format == kHdrPqFormat &&
             surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
@@ -2018,9 +2033,28 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
 }
 
 VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
-  // Framebuffers without a swapchain are the DXGI swapchain's.
-  if (swapchain != VK_NULL_HANDLE || !swapchain_framebuffers.empty()) {
+  // Framebuffers without a swapchain are the DXGI swapchain's: only drawing to await.
+  if (swapchain == VK_NULL_HANDLE && !swapchain_framebuffers.empty()) {
     submission_tracker.AwaitAllSubmissionsCompletion();
+  }
+  if (swapchain != VK_NULL_HANDLE) {
+    REXLOG_INFO("VulkanPresenter: Retiring swapchain: waiting for drawing");
+    const bool drawing_complete = submission_tracker.AwaitAllSubmissionsCompletion();
+    REXLOG_INFO("VulkanPresenter: Retirement drawing complete={}; waiting for presentation queue",
+                drawing_complete);
+    // Draw fences don't cover vkQueuePresentKHR's semaphore waits.
+    // shortcut: queue idle is the unextended WSI fallback; use maintenance
+    // present fences when that extension is enabled.
+    assert_true(present_queue_family != UINT32_MAX);
+    const VulkanDevice::Queue::Acquisition queue =
+        vulkan_device->AcquireQueue(present_queue_family, 0);
+    const VkResult result = vulkan_device->functions().vkQueueWaitIdle(queue.queue());
+    if (result != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Present queue drain failed during retirement: {}",
+                   int32_t(result));
+    } else {
+      REXLOG_INFO("VulkanPresenter: Retirement presentation queue drained");
+    }
   }
   const VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -2049,6 +2083,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
 }
 
 void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+#if REX_PLATFORM_MAC
+  mac_metal_layer = nullptr;
+#endif
   VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
   if (old_swapchain != VK_NULL_HANDLE) {
     vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
@@ -2238,6 +2275,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   // vkResetCommandPool resets from both initial and recording states, still
   // safe to return early from this function in case of an error.
 
+#if REX_PLATFORM_MAC
+  SyncMacMetalLayerDrawableSize(paint_context_.mac_metal_layer, paint_context_.swapchain_extent);
+#endif
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
   VkResult acquire_result = VK_SUCCESS;
@@ -2249,11 +2289,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   } else
 #endif
   {
+    // Keep pumping window events even if an occluded surface stops making
+    // progress; this may run on the UI thread or the submission worker.
     acquire_result =
-        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                  VK_NULL_HANDLE, &swapchain_image_index);
+        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_C(50000000),
+                                  acquire_semaphore, VK_NULL_HANDLE, &swapchain_image_index);
   }
   switch (acquire_result) {
+    case VK_TIMEOUT:
+    case VK_NOT_READY:
+      return PaintResult::kNotPresented;
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
       break;
@@ -3022,7 +3067,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     dfn.vkCmdBeginRenderPass(draw_command_buffer, &swapchain_render_pass_begin_info,
                              VK_SUBPASS_CONTENTS_INLINE);
   }
-  if (swapchain_image_clear_needed) {
+  const uint32_t hdr_test_pattern =
+      uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+  const bool hdr_calibration = paint_context_.swapchain_hdr && hdr_test_pattern != 0;
+  if (swapchain_image_clear_needed || hdr_calibration) {
+    // Patterns replace the guest, including its HUD mask. Only the host UI
+    // drawn below may cover them, even on a menu frame whose guest mask is 1.
+    swapchain_image_clear_attachment.clearValue.color.float32[3] = hdr_calibration ? 0.0f : 1.0f;
     VkClearRect swapchain_image_clear_rectangle;
     swapchain_image_clear_rectangle.rect.offset.x = 0;
     swapchain_image_clear_rectangle.rect.offset.y = 0;
@@ -3163,10 +3214,24 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // Mostly the largest channel: a red brake light (luminance 0.21) expands
     // nearly as a white one; deep colored surfaces stay below the knee.
     hdr_constants.max_channel_weight = 0.75f;
+    hdr_constants.pattern = hdr_test_pattern;
+    // Compare returns before drawing patterns in the shader; calibration must
+    // cover both halves without changing the player's compare setting.
     hdr_constants.compare_x =
-        REXCVAR_GET(present_hdr_compare) ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
-    hdr_constants.pattern = uint32_t(std::clamp(REXCVAR_GET(present_hdr_test_pattern), 0, 3));
+        REXCVAR_GET(present_hdr_compare) && !hdr_constants.pattern
+            ? float(paint_context_.swapchain_extent.width / 2) : -1.0f;
     hdr_constants.pattern_value = float(peak_nits / 80.0);
+    static thread_local HdrOutputConstants logged_pattern = {};
+    if (hdr_constants.pattern &&
+        (hdr_constants.pattern != logged_pattern.pattern ||
+         hdr_constants.paper_white_scale != logged_pattern.paper_white_scale ||
+         hdr_constants.pattern_value != logged_pattern.pattern_value ||
+         hdr_constants.gamma != logged_pattern.gamma)) {
+      REXLOG_INFO("VulkanPresenter: HDR calibration pattern {}, paper white {} nits, "
+                  "peak {} nits, gamma {}; compare suspended; levels are signal values",
+                  hdr_constants.pattern, paper_white_nits, peak_nits, hdr_constants.gamma);
+    }
+    logged_pattern = hdr_constants;
     hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
                                  (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
@@ -3240,7 +3305,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       }
     }
     if (submit_result != VK_SUCCESS) {
-      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+      REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers: {}", int32_t(submit_result));
       fence_acqusition.SubmissionFailedOrDropped();
       ui_fence_acquisition.SubmissionFailedOrDropped();
       if (ui_setup_command_buffer_index != SIZE_MAX) {
@@ -3251,6 +3316,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // buffers.
         paint_context_.ui_setup_command_buffers[ui_setup_command_buffer_index]
             .last_usage_submission_index = 0;
+      }
+      if (submit_result == VK_ERROR_DEVICE_LOST) {
+        return PaintResult::kGpuLostResponsible;
       }
       // The image is in an acquired state - but now, it will be in it forever.
       // To avoid that, recreate the swapchain - don't return just

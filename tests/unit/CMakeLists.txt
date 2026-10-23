@@ -25,8 +25,10 @@ add_executable(unit_tests
     input/input_assignment_test.cpp
     input/joystick_mapping_test.cpp
     input/wheel_test.cpp
+    input/wheel_mapping_test.cpp
     input/dualsense_test.cpp
     input/fm4_mnk_bind_test.cpp
+    input/xinputd_ffb_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
@@ -40,6 +42,8 @@ add_executable(unit_tests
     graphics/fm4_runtime_replacement_test.cpp
     graphics/pixel_shader_constant_override_test.cpp
     graphics/wrap_seam_test.cpp
+    graphics/texture_cache_test.cpp
+    graphics/fh1_edram_resolve_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -50,11 +54,21 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/cube_lut.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pixel_shader_constant_override.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/shader/wrap_seam.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fh1_edram_resolve.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
 )
 
 target_include_directories(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/thirdparty/renderdoc
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
@@ -95,6 +109,22 @@ endif()
 
 # Discover tests
 include(Catch)
+if(UNIX AND NOT APPLE)
+    # Compile the production backend into the executable so --wrap intercepts
+    # its mmap calls as well as the test's calls (not calls inside rexruntime).
+    add_executable(memory_posix_tests
+        core/memory_posix_test.cpp
+        ${PROJECT_SOURCE_DIR}/src/core/memory_posix.cpp
+    )
+    target_link_libraries(memory_posix_tests PRIVATE rexruntime Catch2::Catch2WithMain)
+    target_link_options(memory_posix_tests PRIVATE -Wl,--wrap=mmap)
+    set_target_properties(memory_posix_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON
+    )
+    catch_discover_tests(memory_posix_tests TEST_PREFIX "unit." PROPERTIES LABELS "unit" TIMEOUT 60)
+endif()
 catch_discover_tests(unit_tests
     TEST_PREFIX "unit."
     PROPERTIES

@@ -48,6 +48,11 @@ struct Fh1ResolvePlan {
   std::string kind;  // For statistics.
 };
 
+// The resolve shader's pack: dest_info bits 0:2, with bit 26 as its bit 3.
+constexpr uint32_t Fh1ResolvePack(uint32_t dest_info) {
+  return (dest_info & 7u) | ((dest_info >> 23u) & 8u);
+}
+
 // Same rectangle derivation as draw_util::GetResolveInfo, in surface pixels
 // relative to the base in the color or depth info register.
 bool Fh1ResolveRectangle(const RegisterFile& regs, const memory::Memory& memory, int32_t& x0,

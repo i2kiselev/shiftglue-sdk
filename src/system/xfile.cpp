@@ -18,6 +18,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
 #include <rex/thread/mutex.h>
+#include <rex/session_probe.h>
 
 #include <span>
 
@@ -112,6 +113,12 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint
 X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                              uint64_t byte_offset, uint32_t* out_bytes_read, uint32_t apc_context,
                              bool notify_completion) {
+  const bool tracing = session_probe::ExternalEnabled();
+  const uint64_t trace_key = (uint64_t(handle()) << 32) | buffer_guest_address;
+  if (tracing) {
+    session_probe::Scalar(session_probe::Kind::kIoReadRequest, trace_key, buffer_length);
+    session_probe::Scalar(session_probe::Kind::kIoReadRequest, trace_key ^ 1, byte_offset);
+  }
   if (byte_offset == uint64_t(-1)) {
     // Read from current position.
     byte_offset = position_;
@@ -119,6 +126,18 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
 
   size_t bytes_read = 0;
   X_STATUS result = X_STATUS_SUCCESS;
+  bool result_captured = false;
+  auto capture_result = [&](uint8_t* data) {
+    if (!tracing) return;
+    const auto packed = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key,
+        (uint64_t(result) << 32) | uint32_t(bytes_read), true);
+    result = X_STATUS(packed >> 32); bytes_read = uint32_t(packed);
+    session_probe::Require(bytes_read <= buffer_length && (!bytes_read || data),
+        "capture incomplete: replay read range");
+    byte_offset = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key ^ 1, byte_offset, true);
+    if (bytes_read) session_probe::Bytes(session_probe::Kind::kIoReadData, trace_key, data, uint32_t(bytes_read));
+    result_captured = true;
+  };
   // Zero length means success for a valid file object according to Windows
   // tests.
   if (buffer_length) {
@@ -155,14 +174,13 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
                                         memory::PageAccess::kReadWrite) {
           result = X_STATUS_ACCESS_VIOLATION;
         } else {
-          result = file_->ReadSync(
-              std::span<uint8_t>(
-                  buffer_physical_heap
-                      ? memory()->TranslatePhysical(
-                            buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
-                      : memory()->TranslateVirtual(buffer_guest_address),
-                  buffer_length),
-              size_t(byte_offset), &bytes_read);
+          auto* read_buffer = buffer_physical_heap
+              ? memory()->TranslatePhysical(buffer_physical_heap->GetPhysicalAddress(buffer_guest_address))
+              : memory()->TranslateVirtual(buffer_guest_address);
+          if (!(tracing && session_probe::Replaying()))
+            result = file_->ReadSync(std::span<uint8_t>(read_buffer, buffer_length),
+                size_t(byte_offset), &bytes_read);
+          capture_result(read_buffer);
           if (XSUCCEEDED(result)) {
             if (buffer_physical_heap) {
               buffer_physical_heap->TriggerCallbacks(
@@ -180,6 +198,8 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
     }
   }
 
+  if (!result_captured) capture_result(nullptr);
+  if (tracing) position_ = session_probe::Scalar(session_probe::Kind::kIoRead, trace_key ^ 2, position_, true);
   if (out_bytes_read) {
     *out_bytes_read = uint32_t(bytes_read);
   }
@@ -266,6 +286,15 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
   X_STATUS result = file_->WriteSync(
       std::span<const uint8_t>(memory()->TranslateVirtual(buffer_guest_address), buffer_length),
       size_t(byte_offset), &bytes_written);
+  if (session_probe::ExternalEnabled()) {
+    session_probe::Scalar(session_probe::Kind::kIoWrite, (uint64_t(handle()) << 32) | buffer_guest_address, byte_offset);
+    session_probe::Scalar(session_probe::Kind::kIoData, buffer_length,
+        session_probe::Digest(memory()->TranslateVirtual(buffer_guest_address), buffer_length));
+    const auto packed = session_probe::Scalar(session_probe::Kind::kIoWrite, handle(),
+        (uint64_t(result) << 32) | uint32_t(bytes_written), true);
+    result = X_STATUS(packed >> 32); bytes_written = uint32_t(packed);
+    session_probe::Require(bytes_written <= buffer_length, "capture incomplete: replay write range");
+  }
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
   }

@@ -25,6 +25,11 @@ add_library(rexcore OBJECT
 )
 add_library(rex::core ALIAS rexcore)
 
+if(REXGLUE_ENABLE_CS_PROBES)
+    target_sources(rexcore PRIVATE session_probe.cpp cs_scheduler.cpp)
+    target_compile_definitions(rexcore PUBLIC REXGLUE_ENABLE_CS_PROBES=1)
+endif()
+
 if(APPLE)
     # Apple's libc++ still gates std::jthread/std::stop_token behind the
     # experimental-library feature flag. Only timer_queue.cpp uses them, and

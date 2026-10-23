@@ -49,6 +49,7 @@
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/shader_overrides.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -124,6 +125,10 @@ REXCVAR_DEFINE_STRING(vulkan_shader_override_dir, "", "GPU/Vulkan",
                       "Directory of shader_<guest hash>_<modification>_<translated SPIR-V "
                       "hash>.spv replacements, checked before the built-in ones (for writing "
                       "new overrides)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_override_dirs, "", "GPU/Vulkan",
+                      "Semicolon-separated shader replacement directories, first valid exact "
+                      "identity wins, ahead of vulkan_shader_override_dir and built-in edits")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
@@ -1277,6 +1282,8 @@ void VulkanPipelineCache::Shutdown() {
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         inspection_overdraw_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_only_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_float24_truncate_fragment_shader_);
@@ -1683,7 +1690,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       }
       creation_arguments.specialize_texture_signs = true;
       creation_arguments.texture_signs = key.texture_signs;
-      if (specialized_storage_file_) {
+      if (specialized_storage_file_ && !description.inspection_view) {
         assert_not_null(storage_write_thread_);
         pipeline_storage_file_flush_needed_ = true;
         {
@@ -1826,7 +1833,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       creation_queue_.push(creation_arguments_real);
     }
     creation_request_cond_.notify_one();
-    if (pipeline_storage_file_) {
+    if (pipeline_storage_file_ && !description.inspection_view) {
       pipeline_storage_file_flush_needed_ = true;
       {
         std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -1872,7 +1879,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
     pipeline.second.is_placeholder.store(false, std::memory_order_release);
   }
 
-  if (pipeline_storage_file_) {
+  if (pipeline_storage_file_ && !description.inspection_view) {
     assert_not_null(storage_write_thread_);
     pipeline_storage_file_flush_needed_ = true;
     {
@@ -2115,26 +2122,21 @@ void VulkanPipelineCache::ApplyShaderOverride(VulkanShader::VulkanTranslation& t
   const uint64_t translated_hash = XXH3_64bits(translated.data(), translated.size());
   std::vector<uint8_t> replacement;
   std::string source;
-  const std::string& dir = REXCVAR_GET(vulkan_shader_override_dir);
-  if (!dir.empty()) {
-    const std::filesystem::path path =
-        rex::to_path(dir) / fmt::format("shader_{:016X}_{:016X}_{:016X}.spv",
-                                        shader.ucode_data_hash(), translation.modification(),
-                                        translated_hash);
-    if (FILE* file = filesystem::OpenFile(path, "rb")) {
-      std::fseek(file, 0, SEEK_END);
-      const long size = std::ftell(file);
-      std::fseek(file, 0, SEEK_SET);
-      if (size > 0) {
-        replacement.resize(size_t(size));
-        if (std::fread(replacement.data(), 1, replacement.size(), file) != replacement.size()) {
-          replacement.clear();
-        }
-      }
-      std::fclose(file);
-      source = rex::path_to_utf8(path);
-    }
+  std::vector<std::filesystem::path> roots;
+  const auto& dirs = REXCVAR_GET(vulkan_shader_override_dirs);
+  for (size_t start = 0; start < dirs.size();) {
+    const auto end = dirs.find(';', start);
+    const auto dir = dirs.substr(start, end == std::string::npos ? end : end - start);
+    if (!dir.empty()) roots.push_back(rex::to_path(dir));
+    if (end == std::string::npos) break;
+    start = end + 1;
   }
+  if (const auto& dir = REXCVAR_GET(vulkan_shader_override_dir); !dir.empty()) {
+    roots.push_back(rex::to_path(dir));
+  }
+  replacement = LoadVulkanShaderOverride(
+      roots, shader.ucode_data_hash(), translation.modification(), translated, source,
+      [](const std::string& warning) { REXGPU_WARN("Vulkan shader override {}", warning); });
   if (replacement.empty()) {
     for (const VulkanShaderOverride& entry : GetBuiltInVulkanShaderOverrides()) {
       if (entry.type != shader.type() || entry.ucode_data_hash != shader.ucode_data_hash() ||
@@ -2508,6 +2510,40 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     }
   }
 
+  const auto inspection = command_processor_.inspection_view();
+  if (inspection == Fh1InspectionView::kWireframe && primitive_polygonal &&
+      device_properties.fillModeNonSolid) {
+    description_out.polygon_mode = PipelinePolygonMode::kLine;
+    description_out.inspection_view = uint32_t(Fh1InspectionView::kWireframe);
+  }
+  if (inspection == Fh1InspectionView::kOverdraw && device_properties.independentBlend) {
+    bool blend_supported = true;
+    const auto& key = description_out.render_pass_key;
+    const xenos::ColorRenderTargetFormat formats[] = {
+        key.color_0_view_format, key.color_1_view_format,
+        key.color_2_view_format, key.color_3_view_format};
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!(key.depth_and_color_used & (1u << (i + 1)))) continue;
+      VkFormatProperties format_properties;
+      const auto* gpu = command_processor_.GetVulkanDevice();
+      gpu->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+          gpu->physical_device(), render_target_cache_.GetColorVulkanFormat(formats[i]),
+          &format_properties);
+      blend_supported &= bool(format_properties.optimalTilingFeatures &
+                              VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
+    }
+    if (blend_supported) {
+      description_out.inspection_view = uint32_t(Fh1InspectionView::kOverdraw);
+      description_out.depth_write_enable = 0;
+      description_out.depth_compare_op = xenos::CompareFunction::kAlways;
+      description_out.stencil_test_enable = 0;
+      for (auto& target : description_out.render_targets) {
+        target.src_color_blend_factor = target.dst_color_blend_factor = PipelineBlendFactor::kOne;
+        target.src_alpha_blend_factor = target.dst_alpha_blend_factor = PipelineBlendFactor::kOne;
+        target.color_blend_op = target.alpha_blend_op = xenos::BlendOp::kAdd;
+      }
+    }
+  }
   return true;
 }
 
@@ -4228,6 +4264,23 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   }
   if (shader_stage_fragment.module == VK_NULL_HANDLE) {
     --shader_stage_count;
+  }
+  if (description.inspection_view == uint32_t(Fh1InspectionView::kOverdraw)) {
+    std::lock_guard lock(inspection_shader_mutex_);
+    if (!inspection_overdraw_shader_) {
+      std::vector<uint32_t> spirv;
+      std::string error;
+      if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_FRAGMENT_BIT,
+          "#version 450\nlayout(location=0) out vec4 c[4];\n"
+          "void main(){for(int i=0;i<4;++i)c[i]=vec4(0.03125,0.0,0.0,0.03125);}\n",
+          spirv, error)) return false;
+      inspection_overdraw_shader_ = ui::vulkan::util::CreateShaderModule(
+          vulkan_device, spirv.data(), spirv.size() * sizeof(uint32_t));
+    }
+    if (!inspection_overdraw_shader_) return false;
+    if (shader_stage_fragment.module == VK_NULL_HANDLE) ++shader_stage_count;
+    shader_stage_fragment.module = inspection_overdraw_shader_;
+    shader_stage_fragment.pSpecializationInfo = nullptr;
   }
 
   VkPipelineVertexInputStateCreateInfo vertex_input_state = {};

@@ -9,16 +9,49 @@
 include_guard(GLOBAL)
 
 option(REXGLUE_FIDELITYFX_RUNTIME
-    "Build AMD's FidelityFX library (FSR 2 and 3) from source beside the game on Linux and macOS"
+    "Stage AMD's FidelityFX library (FSR 2 and 3) beside the game: built from source on Linux and macOS, AMD's signed DLL on Windows"
     ON)
 
-# The FidelityFX library the FSR provider loads, built from source by
-# thirdparty/fidelityfx-vk (a separate CMake project) and staged in
-# upscalers/fidelityfx/<version>/ beside the executable. Windows uses AMD's
-# signed runtime and Android packages its own build (tools/pinyon_android.py).
+# Copies files into upscalers/<subdirectory>/ beside the executable whenever
+# they change, not only when the executable relinks.
+function(_rexglue_stage_upscaler_files target_name subdirectory)
+    set(_destination "$<TARGET_FILE_DIR:${target_name}>/upscalers/${subdirectory}")
+    string(MAKE_C_IDENTIFIER "${subdirectory}" _name)
+    set(_stamp "${CMAKE_CURRENT_BINARY_DIR}/${target_name}-stage-${_name}.stamp")
+    add_custom_command(OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${_destination}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ARGN} "${_destination}"
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS ${ARGN}
+        VERBATIM)
+    add_custom_target(${target_name}-stage-${_name} DEPENDS ${_stamp})
+    add_dependencies(${target_name} ${target_name}-stage-${_name})
+endfunction()
+
+# NVIDIA's DLSS runtime and licence (cmake/rexglue_dlss.cmake).
+function(_rexglue_stage_dlss_runtime target_name)
+    if(REXGLUE_DLSS_RUNTIME_DIR AND REXGLUE_DLSS_INCLUDE_DIR)
+        _rexglue_stage_upscaler_files(${target_name} "dlss/${REXGLUE_DLSS_VERSION}"
+            "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlss.dll"
+            "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt")
+    endif()
+endfunction()
+
+# The FidelityFX library the FSR provider loads, staged in
+# upscalers/fidelityfx/<version>/ beside the executable: on Windows AMD's
+# signed runtime (cmake/rexglue_ffx_api_headers.cmake), on Linux and macOS
+# built from source by thirdparty/fidelityfx-vk (a separate CMake project).
+# Android packages its own build (tools/pinyon_android.py).
 function(_rexglue_stage_fidelityfx_runtime target_name)
     set(_source "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../thirdparty/fidelityfx-vk")
-    if(NOT REXGLUE_FIDELITYFX_RUNTIME OR WIN32 OR ANDROID OR NOT REXGLUE_USE_VULKAN
+    if(WIN32)
+        if(REXGLUE_FIDELITYFX_RUNTIME AND REXGLUE_USE_VULKAN AND REXGLUE_FFX_RUNTIME_DLL)
+            _rexglue_stage_upscaler_files(${target_name} "fidelityfx/1.1.4"
+                "${REXGLUE_FFX_RUNTIME_DLL}" "${_source}/LICENSE.txt")
+        endif()
+        return()
+    endif()
+    if(NOT REXGLUE_FIDELITYFX_RUNTIME OR ANDROID OR NOT REXGLUE_USE_VULKAN
        OR NOT REXGLUE_FFX_API_INCLUDE_DIR OR NOT EXISTS "${_source}/CMakeLists.txt"
        OR TARGET rexglue_fidelityfx_runtime)
         return()
@@ -27,17 +60,29 @@ function(_rexglue_stage_fidelityfx_runtime target_name)
     set(_binary "${CMAKE_BINARY_DIR}/fidelityfx-vk")
     set(_arguments
         -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
-        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
-    if(CMAKE_MAKE_PROGRAM)
-        list(APPEND _arguments -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
-    endif()
+        "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
+        "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
+    # ExternalProject does not inherit the toolchain; compiler paths alone
+    # make clang probe the host's GCC and linker instead of the pinned sysroot.
+    foreach(_variable
+        CMAKE_TOOLCHAIN_FILE CMAKE_MAKE_PROGRAM CMAKE_AR CMAKE_RANLIB
+        CMAKE_SYSROOT CMAKE_SYSROOT_COMPILE CMAKE_SYSROOT_LINK
+        CMAKE_C_COMPILER_TARGET CMAKE_CXX_COMPILER_TARGET
+        CMAKE_C_COMPILER_EXTERNAL_TOOLCHAIN CMAKE_CXX_COMPILER_EXTERNAL_TOOLCHAIN
+        CMAKE_C_FLAGS CMAKE_C_FLAGS_RELEASE CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_EXE_LINKER_FLAGS CMAKE_EXE_LINKER_FLAGS_RELEASE
+        CMAKE_SHARED_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS_RELEASE
+        CMAKE_MODULE_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS_RELEASE
+        CMAKE_OSX_SYSROOT CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
+        CMAKE_TRY_COMPILE_PLATFORM_VARIABLES ${CMAKE_TRY_COMPILE_PLATFORM_VARIABLES})
+        if(DEFINED ${_variable})
+            string(REPLACE ";" "|" _value "${${_variable}}")
+            list(APPEND _arguments "-D${_variable}:STRING=${_value}")
+        endif()
+    endforeach()
     set(_depends "")
     if(APPLE)
         set(_library_name libamd_fidelityfx_vk.dylib)
-        list(APPEND _arguments
-            -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
         # The loader the game stages in vulkan/lib (install name
         # @rpath/libvulkan.1.dylib, found through the library's rpath).
         foreach(_loader Vulkan::Loader rex::vulkan-loader)
@@ -56,6 +101,7 @@ function(_rexglue_stage_fidelityfx_runtime target_name)
     ExternalProject_Add(rexglue_fidelityfx_runtime
         SOURCE_DIR "${_source}"
         BINARY_DIR "${_binary}"
+        LIST_SEPARATOR "|"
         CMAKE_ARGS ${_arguments}
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target amd_fidelityfx_vk
         BUILD_BYPRODUCTS "${_binary}/ffx-api/${_library_name}"
@@ -284,6 +330,7 @@ function(rexglue_configure_target target_name)
         _rexglue_stage_macos_vulkan_runtime(${target_name})
     endif()
     _rexglue_stage_fidelityfx_runtime(${target_name})
+    _rexglue_stage_dlss_runtime(${target_name})
 endfunction()
 
 #==========================================================

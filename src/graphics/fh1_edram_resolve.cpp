@@ -115,6 +115,11 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
     plan.kind = "depth" + std::to_string(uint32_t(plan.depth_info.depth_format));
   } else {
     switch (xenos::TextureFormat(dest_info.copy_dest_format)) {
+      // The livery editor resolves its single-channel masks from RGBA8.
+      case xenos::TextureFormat::k_8:
+        pack = 8;
+        bpb_log2 = 0;
+        break;
       case xenos::TextureFormat::k_8_8_8_8:
         pack = 0;
         break;
@@ -160,13 +165,13 @@ bool Fh1PlanResolve(const RegisterFile& regs, const memory::Memory& memory,
   }
   if (plan.skip) return true;
   const int32_t exp_bias = plan.copying_depth ? 0 : int32_t(dest_info.copy_dest_exp_bias);
-  plan.dest_info = pack | (uint32_t(dest_info.copy_dest_endian) << 3) |
+  plan.dest_info = (pack & 7u) | (uint32_t(dest_info.copy_dest_endian) << 3) |
                    (uint32_t(!plan.copying_depth && dest_info.copy_dest_swap) << 6) |
                    (uint32_t(flags.depth_float24_round) << 7) |
                    ((uint32_t(exp_bias) & 0xFF) << 8) | (bpb_log2 << 16) |
                    (uint32_t(flags.gamma_as_unorm16) << 18) |
                    (uint32_t(!flags.fixed16_truncated) << 19) |
-                   (uint32_t(dest_info.copy_dest_number) << 23);
+                   (uint32_t(dest_info.copy_dest_number) << 23) | ((pack >> 3) << 26);
   plan.dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   plan.dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch;
   plan.sample_select = uint32_t(plan.info.copy_dest_coordinate_info.copy_sample_select);

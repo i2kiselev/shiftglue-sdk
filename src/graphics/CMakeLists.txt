@@ -66,15 +66,18 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/deferred_command_buffer.cpp
     vulkan/fh1_frame_dump.cpp
     vulkan/fh1_native_executor.cpp
+    vulkan/fh1_inspector.cpp
     vulkan/fh1_camera.cpp
     vulkan/fm4_native_executor.cpp
     vulkan/command_processor.cpp
+    vulkan/vulkan_draw_program.cpp
     vulkan/scene_post.cpp
     vulkan/pipeline_cache.cpp
     vulkan/primitive_processor.cpp
     vulkan/render_target_cache.cpp
     vulkan/shader.cpp
     vulkan/shader_overrides.cpp
+    vulkan/shader_override_files.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
 )
@@ -132,6 +135,10 @@ if(REXGLUE_USE_D3D12)
         ${REXGPU_XENOS_D3D12_SOURCES})
 endif()
 
+option(REXGPU_FH1_ORDERED_CENSUS "Compile the experimental ordered draw census" OFF)
+if(REXGPU_FH1_ORDERED_CENSUS)
+    list(APPEND REXGPU_XENOS_SOURCES fh1_frame_order.cpp)
+endif()
 add_library(rexgpu-fh1 SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-fh1 ALIAS rexgpu-fh1)
 if(REXGLUE_USE_D3D12)
@@ -159,6 +166,9 @@ foreach(rexgpu_fh1_target IN ITEMS rexgpu-fh1 rexgpu-fh1-producer)
     # gives its users; the plugin does not link rexui, so it must set it too
     # to see the Presenter the runtime built.
     target_compile_definitions(${rexgpu_fh1_target} PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+    if(REXGPU_FH1_ORDERED_CENSUS)
+        target_compile_definitions(${rexgpu_fh1_target} PRIVATE REXGPU_FH1_ORDERED_CENSUS=1)
+    endif()
     rex_target_pch(${rexgpu_fh1_target}
         <mutex>
         <unordered_map>
@@ -225,6 +235,7 @@ if(REXGLUE_USE_VULKAN)
         target_link_libraries(${rexgpu_fh1_target} PRIVATE
             Vulkan::Headers
             glslang::SPIRV
+            SPIRV-Tools-static
             GPUOpen::VulkanMemoryAllocator
             glslang
             MachineIndependent

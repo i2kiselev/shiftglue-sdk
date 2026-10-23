@@ -13,9 +13,12 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/shared_memory.h>
+#include <rex/graphics/vulkan/shader_override_files.h>
 #include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -24,6 +27,13 @@
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
 
+
+REXCVAR_DEFINE_STRING(vulkan_shader_discovery_dir, "", "GPU/Vulkan",
+                      "Local output directory for one frame's translated shaders and draws.jsonl")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(vulkan_shader_discovery_frame, 0, "GPU/Vulkan",
+                     "Swap count to discover shaders on (0 disables discovery)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "Above 1x resolution scale, keep the guest's 2x and 4x MSAA surfaces as "
@@ -70,6 +80,23 @@ REXCVAR_DEFINE_INT32(fh1_native_stats_frames, 600, "GPU",
                      "Frames between the FH1 native executor's periodic stats and GPU profile "
                      "logs (Vulkan); shorter windows separate heavy stretches of play")
     .range(1, 100000);
+REXCVAR_DEFINE_INT32(fh1_visibility_census, 0, "GPU",
+                     "Diagnostics: every N frames, an occlusion query around each draw, logging "
+                     "by rendering how many draws pass no samples (FH1 native executor, Vulkan); "
+                     "0 off")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_visibility_census_no_depth, false, "GPU",
+                    "Diagnostics: census frames of fh1_visibility_census draw without the depth "
+                    "test, so the draws that pass no samples are the ones off screen")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_visibility_oracle_skip, false, "GPU",
+                    "Diagnostics (renders wrong): with fh1_visibility_census, drop each draw "
+                    "outside census frames that passed no samples at its last census, before "
+                    "its derivation, for the ceiling of culling hidden draws");
+REXCVAR_DEFINE_BOOL(fh1_visibility_oracle_late_only, false, "GPU",
+                    "Diagnostics: fh1_visibility_oracle_skip drops only draws with late depth "
+                    "(the pixel shader kills or writes depth, or alpha decides coverage)");
 REXCVAR_DEFINE_BOOL(fh1_fold_clears, true, "GPU",
                     "Record EDRAM clears inside the next draw rendering on the surface (or as "
                     "its load op) instead of in a rendering of their own: on tiled GPUs each "
@@ -94,6 +121,10 @@ REXCVAR_DEFINE_STRING(fh1_debug_skip_transfers, "", "GPU",
                       "<source>=<destination> descriptions (wrong image if they are needed)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_texture_reload_probe);
+REXCVAR_DEFINE_BOOL(fh1_readback_small_float_resolves, true, "GPU",
+                    "Read completed 32_FLOAT resolves of 4 KB or less back to guest RAM for "
+                    "the title's CPU auto exposure")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(fh1_resolve_two_textures, true, "GPU",
                     "Resolves write up to two textures over their destination directly (such as "
                     "a depth texture and an 8_8_8_8 one reading the same words), not one")
@@ -455,6 +486,17 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
       REXGPU_WARN("FH1 native executor (Vulkan): no timestamp query pool for the GPU profile");
     }
   }
+  if (REXCVAR_GET(fh1_visibility_census) > 0) {
+    VkQueryPoolCreateInfo query_pool_info = {};
+    query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    query_pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
+    query_pool_info.queryCount = kVisQueries;
+    if (dfn.vkCreateQueryPool(device, &query_pool_info, nullptr, &vis_query_pool_) !=
+        VK_SUCCESS) {
+      vis_query_pool_ = VK_NULL_HANDLE;
+      REXGPU_WARN("FH1 native executor (Vulkan): no occlusion query pool for the census");
+    }
+  }
 
   auto create_set_layout = [&](const VkDescriptorSetLayoutBinding* bindings, uint32_t count,
                                VkDescriptorSetLayout& layout_out) {
@@ -517,6 +559,11 @@ bool Fh1NativeExecutor::Initialize(const Fh1VulkanExecutorConfig& config) {
   }
   tiles_.Reset();
   initialized_ = true;
+#if !defined(__ANDROID__)
+  const auto& properties = command_processor_.GetVulkanDevice()->properties();
+  command_processor_.frame_inspector()->SetCapabilities(
+      {bool(properties.fillModeNonSolid), bool(properties.independentBlend), true});
+#endif
   REXGPU_INFO("FH1 native executor enabled: native (Vulkan)");
   return true;
 }
@@ -528,6 +575,12 @@ void Fh1NativeExecutor::Shutdown() {
                                                   nullptr);
     gpu_query_pool_ = VK_NULL_HANDLE;
   }
+  if (vis_query_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(), vis_query_pool_,
+                                                  nullptr);
+    vis_query_pool_ = VK_NULL_HANDLE;
+  }
   if (initialized_) LogStats(frame_);
   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
   if (!vulkan_device) return;
@@ -537,6 +590,7 @@ void Fh1NativeExecutor::Shutdown() {
     command_processor_.Fh1AwaitAllQueueOperations();
   }
   initialized_ = false;
+  DestroyInspector();
   StopSpecializeThread();
   ReleaseRetiredImages(true);
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
@@ -570,6 +624,10 @@ void Fh1NativeExecutor::Shutdown() {
   transfer_words_size_ = 0;
   pending_readbacks_.clear();
   destroy_buffer(readback_buffer_, readback_memory_);
+  deferred_readbacks_.clear();
+  destroy_buffer(deferred_readback_buffer_, deferred_readback_memory_);
+  deferred_readback_mapped_ = nullptr;
+  deferred_readback_next_ = 0;
   readback_mapped_ = nullptr;
   readback_size_ = 0;
   readback_used_ = 0;
@@ -2362,6 +2420,58 @@ uint64_t Fh1NativeExecutor::DrawRenderingId(uint32_t used_bits) const {
   return id | 1;
 }
 
+void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation* vertex,
+                                          const VulkanShader::VulkanTranslation* pixel) {
+  const auto& dir = REXCVAR_GET(vulkan_shader_discovery_dir);
+  if (dir.empty() || REXCVAR_GET(vulkan_shader_discovery_frame) <= 0) return;
+  if (frame_ != uint64_t(REXCVAR_GET(vulkan_shader_discovery_frame))) {
+    if (shader_discovery_draws_.is_open()) shader_discovery_draws_.close();
+    return;
+  }
+  const auto root = rex::to_path(dir);
+  if (!shader_discovery_started_) {
+    shader_discovery_started_ = true;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (!error) shader_discovery_draws_.open(root / "draws.jsonl", std::ios::trunc);
+    if (!shader_discovery_draws_) REXGPU_WARN("Cannot write shader discovery to {}", dir);
+  }
+  if (!shader_discovery_draws_) return;
+  auto capture = [&](const VulkanShader::VulkanTranslation* translation) {
+    if (!translation || !translation->is_valid()) return std::string();
+    const auto& bytes = translation->replaced_binary().empty()
+                            ? translation->translated_binary() : translation->replaced_binary();
+    const auto name = VulkanShaderOverrideFilename(translation->shader().ucode_data_hash(),
+                                                    translation->modification(), bytes);
+    if (shader_discovery_written_.insert(name).second) {
+      std::ofstream out(root / name, std::ios::binary);
+      if (!out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size())) {
+        REXGPU_WARN("Cannot write discovered shader {}", name);
+        return std::string();
+      }
+    }
+    return name;
+  };
+  const auto vs = capture(vertex), ps = capture(pixel);
+  shader_discovery_draws_ << fmt::format(
+      "{{\"frame\":{},\"vertex\":\"{}\",\"pixel\":\"{}\",\"hud\":{},\"surfaces\":[",
+      frame_, vs, ps, hud_draw_);
+  bool first = true;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!(bound_bits_ & (1u << i))) continue;
+    const auto& key = pending_keys_[i];
+    const auto* surface = FindSurface(key.Pack());
+    if (!surface) continue;
+    shader_discovery_draws_ << fmt::format(
+        "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
+        "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
+        first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
+        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
+    first = false;
+  }
+  shader_discovery_draws_ << "]}\n";
+}
+
 void Fh1NativeExecutor::BeginDrawRendering() {
   // Pending clears of the draw's surfaces are folded into its rendering.
   Surface* bound[1 + xenos::kMaxColorRenderTargets] = {};
@@ -2464,12 +2574,18 @@ void Fh1NativeExecutor::BeginDrawRendering() {
     if (label.empty()) label = "none";
     GpuMarkRendering(GpuLabel(label));
   }
+  if (vis_frame_) VisMarkRendering();
   command_processor_.SubmitBarriersAndBeginFh1Rendering(info, id);
   if (clears) FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, false);
 }
 
 void Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
   if (!initialized_) return;
+  if (inspection_) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (bound_bits_ & (1u << i)) ++inspection_draws_[pending_keys_[i].Pack()];
+    }
+  }
   pending_targets_valid_ = false;
   if (draw.occlusion_query_active) Count("draw_in_occlusion_query");
   ++draws_;
@@ -2892,6 +3008,66 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
   Count("resolve_readback_one_off");
 }
 
+void Fh1NativeExecutor::QueueDeferredReadback(uint32_t address, uint32_t length) {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (length > kDeferredReadbackSize) return;
+  if (!deferred_readback_buffer_) {
+    void* mapped = nullptr;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, kDeferredReadbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, deferred_readback_buffer_,
+            deferred_readback_memory_) ||
+        dfn.vkMapMemory(device, deferred_readback_memory_, 0, VK_WHOLE_SIZE, 0, &mapped) !=
+            VK_SUCCESS) {
+      return Skip("resolve_readback_deferred_buffer");
+    }
+    deferred_readback_mapped_ = static_cast<const uint8_t*>(mapped);
+  }
+  const VkDeviceSize size = (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
+  if (deferred_readback_next_ + size > kDeferredReadbackSize) deferred_readback_next_ = 0;
+  const VkDeviceSize offset = deferred_readback_next_;
+  // The ring is far larger than the copies in flight; if the GPU is that far
+  // behind, this frame's copy is dropped rather than waited for.
+  ApplyCompletedDeferredReadbacks();
+  for (const DeferredReadback& pending : deferred_readbacks_) {
+    if (pending.offset < offset + size && offset < pending.offset + pending.length) {
+      Count("resolve_readback_deferred_dropped");
+      return;
+    }
+  }
+  deferred_readback_next_ = offset + size;
+  config_.memory->Use(VulkanSharedMemory::Usage::kRead);
+  command_processor_.SubmitBarriers(true);
+  const VkBufferCopy region = {address, offset, length};
+  command_processor_.deferred_command_buffer().CmdVkCopyBuffer(
+      config_.memory->buffer(), deferred_readback_buffer_, 1, &region);
+  deferred_readbacks_.push_back(
+      {address, length, offset, command_processor_.GetCurrentSubmission()});
+  Count("resolve_readback_deferred");
+}
+
+void Fh1NativeExecutor::ApplyCompletedDeferredReadbacks() {
+  if (deferred_readbacks_.empty()) return;
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  if (deferred_readbacks_.front().submission > completed) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  VkMappedMemoryRange range = {};
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.memory = deferred_readback_memory_;
+  range.size = VK_WHOLE_SIZE;
+  vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &range);
+  // In order: a later resolve over the same bytes wins, as on the GPU.
+  while (!deferred_readbacks_.empty() && deferred_readbacks_.front().submission <= completed) {
+    const DeferredReadback& pending = deferred_readbacks_.front();
+    config_.memory->CopyReadbackToGuest(pending.address,
+                                        deferred_readback_mapped_ + pending.offset,
+                                        pending.length);
+    deferred_readbacks_.pop_front();
+  }
+}
+
 namespace {
 // Once per kind: which guest copy (source and destination formats, samples)
 // the backend lacks, so a device report names it.
@@ -2957,6 +3133,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     return false;
   }
   bool succeeded = true;
+  if (inspection_ && plan.copy) InspectResolve(plan, untile_band);
   const int32_t x0 = plan.x0, y0 = plan.y0, x1 = plan.x1, y1 = plan.y1;
   const Rect rect = {x0, y0, x1, y1};
   const uint32_t msaa = plan.msaa;
@@ -3013,7 +3190,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     // written directly as well, and stay current. Depth (the 24_8 word) goes
     // to 24_8 or 24_8_FLOAT textures, converted as their loads do.
     direct_resolve_targets_.clear();
-    const uint32_t pack = plan.dest_info & 7u;
+    const uint32_t pack = Fh1ResolvePack(plan.dest_info);
     uint32_t direct_resolve_conversion = 0;
     if (REXCVAR_GET(fh1_resolve_to_textures) && (pack <= 2 || pack == 4)) {
       const xenos::TextureFormat formats[2] = {
@@ -3118,13 +3295,14 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     }
     // One-off captures the CPU reads also need the guest layout at scale:
     // resolved again unscaled into the guest memory copy, from each guest
-    // pixel's first host pixel, and read back. So are small resolves, without
-    // the readback: the 32x32 scene luminance the auto exposure samples is
+    // pixel's first host pixel, and read back. Small resolves also need an
+    // unscaled copy: the 32x32 scene luminance the auto exposure samples is
     // also read at guest size, and stale there it pins the exposure at its
     // daytime limit, overexposing the screen until about noon (#444).
     constexpr uint32_t kUnscaledCopyMaxLength = 4096;
     const bool one_off =
         scale_ > 1 && written_address && IsOneOffResolve(extent_start, extent_length);
+    bool unscaled_copy_complete = scale_ == 1 && complete;
     if (scale_ > 1 && written_address &&
         (one_off || extent_length <= kUnscaledCopyMaxLength)) {
       config_.memory->RequestRange(extent_start, extent_length);
@@ -3145,6 +3323,15 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
             range, true);
       }
       if (unscaled_complete && one_off) QueueResolveReadback(extent_start, extent_length);
+      unscaled_copy_complete = complete && unscaled_complete;
+    }
+    // GPU validity tracking preserves this resolve, but CPU exposure reads
+    // still need its bytes in guest RAM (seen at lr 830A4880 on Apple silicon).
+    if (written_address && unscaled_copy_complete && extent_length &&
+        extent_length <= kUnscaledCopyMaxLength &&
+        plan.info.copy_dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT &&
+        REXCVAR_GET(fh1_readback_small_float_resolves)) {
+      QueueDeferredReadback(extent_start, extent_length);
     }
     // Invalidates textures over the range (and marks it scaled at scale).
     config_.textures->MarkRangeAsResolved(extent_start, extent_length,
@@ -3251,6 +3438,8 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
 }
 
 void Fh1NativeExecutor::OnSwap(uint64_t frame) {
+  if (inspection_) FinishInspection(frame);
+  BeginInspection();
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
   hud_scene_base_ = UINT32_MAX;
@@ -3259,11 +3448,28 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   FinishCameraFrame();
   AdvanceJitter();
   if (!initialized_) return;
+  ApplyCompletedDeferredReadbacks();
   ReleaseRetiredImages(false);
   UpdateCoarseShading();
   GpuDrain();
   if (async_readbacks_) CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());
   if (frame_ == dump_trigger_frame_) command_processor_.SetDebugLogDrawsFrame(false);
+  if (vis_query_pool_ != VK_NULL_HANDLE) {
+    if (vis_frame_) {
+      vis_frame_ = false;
+      vis_pending_ = vis_reset_;
+      vis_submission_ = command_processor_.GetCurrentSubmission();
+      vis_retries_ = 0;
+    }
+    VisDrain();
+    vis_ordinals_.clear();
+    if (!vis_pending_ && frame % uint64_t(REXCVAR_GET(fh1_visibility_census)) == 0) {
+      vis_frame_ = true;
+      vis_reset_ = false;
+      vis_label_ = UINT32_MAX;
+      vis_draws_.clear();
+    }
+  }
   frame_ = frame;
   if (slow_frame_log_) LogSlowFrame();
   if (frame % 64 == 0) ReleaseIdleSurfaces();
@@ -3551,6 +3757,148 @@ void Fh1NativeExecutor::GpuRenderingEnded(const char* ender) {
   GpuEnd(GpuPhase(kGpuPhases + gpu_rendering_label_), gpu_rendering_begin_);
   gpu_rendering_label_ = UINT32_MAX;
   gpu_rendering_begin_ = UINT32_MAX;
+}
+
+void Fh1NativeExecutor::VisMarkRendering() {
+  // Outside rendering: the queries are reset once, before the frame's first
+  // draw rendering; draws before it are not counted.
+  if (!vis_reset_) {
+    command_processor_.EndRenderPass();
+    command_processor_.deferred_command_buffer().CmdVkResetQueryPool(vis_query_pool_, 0,
+                                                                     kVisQueries);
+    vis_reset_ = true;
+  }
+  std::string label;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (bound_bits_ & (1u << i)) label += (label.empty() ? "" : "+") + pending_keys_[i].Describe();
+  }
+  if (label.empty()) label = "none";
+  auto [it, inserted] = vis_label_ids_.try_emplace(label, uint32_t(vis_labels_.size()));
+  if (inserted) {
+    vis_labels_.push_back(label);
+    vis_totals_.emplace_back();
+  }
+  vis_label_ = it->second;
+}
+
+bool Fh1NativeExecutor::VisOracleSkip(uint64_t key) {
+  const uint64_t ordinal = vis_ordinals_[key]++;
+  vis_key_ = key ^ (ordinal + 1) * 0x9E3779B97F4A7C15ull;
+  ++vis_oracle_draws_;
+  if (vis_frame_ || !REXCVAR_GET(fh1_visibility_oracle_skip)) return false;
+  const auto it = vis_oracle_.find(vis_key_);
+  if (it == vis_oracle_.end() || !(it->second & 1) ||
+      (REXCVAR_GET(fh1_visibility_oracle_late_only) && !(it->second & 2))) {
+    return false;
+  }
+  ++vis_oracle_skips_;
+  return true;
+}
+
+bool Fh1NativeExecutor::VisNoDepth() const {
+  return vis_frame_ && REXCVAR_GET(fh1_visibility_census_no_depth);
+}
+
+uint32_t Fh1NativeExecutor::VisBegin(const Fh1DrawInfo& draw, reg::RB_DEPTHCONTROL depth,
+                                     uint32_t vertex_count) {
+  if (!vis_frame_ || !vis_reset_ || vis_label_ == UINT32_MAX) return UINT32_MAX;
+  // Queries of one type cannot nest: the title's own query owns the pool.
+  if (draw.occlusion_query_active || vis_draws_.size() >= kVisQueries) {
+    ++vis_skipped_;
+    return UINT32_MAX;
+  }
+  uint32_t kind = 3;
+  if (depth.z_enable && depth.zfunc != xenos::CompareFunction::kAlways) {
+    const Shader* pixel = draw.pixel_shader;
+    const bool late =
+        pixel && (!pixel->implicit_early_z_write_allowed() ||
+                  (pixel->writes_color_target(0) &&
+                   draw_util::DoesCoverageDependOnAlpha(register_file_.Get<reg::RB_COLORCONTROL>())));
+    kind = depth.z_write_enable ? (late ? 1 : 0) : 2;
+  }
+  const uint32_t query = uint32_t(vis_draws_.size());
+  vis_draws_.push_back({vis_key_, vis_label_, vertex_count, kind});
+  command_processor_.deferred_command_buffer().CmdVkBeginQuery(vis_query_pool_, query, 0);
+  return query;
+}
+
+void Fh1NativeExecutor::VisEnd(uint32_t query) {
+  if (query == UINT32_MAX) return;
+  command_processor_.deferred_command_buffer().CmdVkEndQuery(vis_query_pool_, query);
+}
+
+void Fh1NativeExecutor::VisDrain() {
+  if (!vis_pending_ || command_processor_.GetCompletedSubmission() < vis_submission_) return;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  std::vector<uint64_t> results(vis_draws_.size() * 2);
+  if (!vis_draws_.empty()) {
+    const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
+        vulkan_device->device(), vis_query_pool_, 0, uint32_t(vis_draws_.size()),
+        results.size() * sizeof(uint64_t), results.data(), 2 * sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    bool unavailable = result != VK_SUCCESS && result != VK_NOT_READY;
+    for (size_t i = 0; i < vis_draws_.size() && !unavailable; ++i) {
+      unavailable = !results[i * 2 + 1];
+    }
+    if (unavailable && vis_retries_++ < 8) return;
+    if (unavailable) {
+      REXGPU_WARN("FH1 native executor (Vulkan): visibility census frame dropped");
+      vis_pending_ = false;
+      return;
+    }
+  }
+  vis_pending_ = false;
+  for (size_t i = 0; i < vis_draws_.size(); ++i) {
+    const VisDraw& draw = vis_draws_[i];
+    const uint64_t samples = results[i * 2];
+    uint64_t* v = vis_totals_[draw.label].v[draw.kind];
+    v[0] += 1;
+    v[1] += samples == 0;
+    v[2] += samples < 64;
+    v[3] += draw.vertices;
+    v[4] += samples == 0 ? draw.vertices : 0;
+    vis_oracle_[draw.key] = uint8_t(samples == 0) | uint8_t(draw.kind == 1) << 1;
+  }
+  if (vis_oracle_.size() > 1000000) vis_oracle_.clear();
+  if (++vis_frames_ % 10) return;
+  // Cumulative, by label and kind, the busiest renderings first.
+  std::vector<std::pair<uint64_t, uint32_t>> order;
+  uint64_t all[5] = {};
+  for (uint32_t label = 0; label < vis_totals_.size(); ++label) {
+    uint64_t draws = 0;
+    for (const auto& kind : vis_totals_[label].v) {
+      draws += kind[0];
+      for (int i = 0; i < 5; ++i) all[i] += kind[i];
+    }
+    order.emplace_back(draws, label);
+  }
+  std::sort(order.begin(), order.end(), std::greater<>());
+  const double frames = double(vis_frames_);
+  const auto share = [](uint64_t part, uint64_t whole) {
+    return 100.0 * double(part) / double(std::max<uint64_t>(whole, 1));
+  };
+  REXGPU_INFO(
+      "FH1 visibility census over {} frames: {:.0f} draws a frame, {:.1f} % pass no samples "
+      "({:.1f} % of vertices), {:.1f} % under 64; {} skipped",
+      vis_frames_, double(all[0]) / frames, share(all[1], all[0]), share(all[4], all[3]),
+      share(all[2], all[0]), vis_skipped_);
+  REXGPU_INFO("FH1 visibility oracle: {} of {} draws dropped since the last report",
+              vis_oracle_skips_, vis_oracle_draws_);
+  vis_oracle_skips_ = 0;
+  vis_oracle_draws_ = 0;
+  static const char* const kKinds[] = {"z-write", "z-write-late", "z-test", "no-z"};
+  for (size_t i = 0; i < order.size() && i < 12; ++i) {
+    const VisTotals& totals = vis_totals_[order[i].second];
+    for (uint32_t kind = 0; kind < kVisKinds; ++kind) {
+      const uint64_t* v = totals.v[kind];
+      if (!v[0]) continue;
+      REXGPU_INFO(
+          "FH1 visibility census {} {}: {:.1f} draws a frame, hidden {:.1f} % (vertices "
+          "{:.1f} % of {:.0f} a frame), under 64 samples {:.1f} %",
+          vis_labels_[order[i].second], kKinds[kind], double(v[0]) / frames, share(v[1], v[0]),
+          share(v[4], v[3]), double(v[3]) / frames, share(v[2], v[0]));
+    }
+  }
 }
 
 void Fh1NativeExecutor::GpuEndFrame() {

@@ -1,3 +1,4 @@
+#include <rex/cs_scheduler.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -22,6 +23,7 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/logging.h>
+#include <rex/session_probe.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
@@ -397,7 +399,26 @@ uint32_t CriticalSectionThread(const PPCContext& ctx, uint8_t* base) {
   return XThread::GetCurrentThread()->guest_object();
 }
 
+static uint64_t SessionCriticalKey(X_RTL_CRITICAL_SECTION* cs) {
+  return (UINT64_C(1) << 32) | uint32_t(reinterpret_cast<uint8_t*>(cs) -
+      REX_KERNEL_MEMORY()->virtual_membase());
+}
+
+static void SessionEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t thread) {
+  session_probe::LockGrant grant(SessionCriticalKey(cs));
+  // Keep private waiter-event allocations out of the input log. The guest's
+  // owning thread and recursion semantics remain those of the HLE lock.
+  if (cs->owning_thread == thread) {
+    rex::thread::atomic_inc(&cs->lock_count); ++cs->recursion_count;
+  } else {
+    while (!rex::thread::atomic_cas(-1, 0, &cs->lock_count)) rex::thread::MaybeYield();
+    cs->owning_thread = thread; cs->recursion_count = 1;
+  }
+  grant.Acquired();
+}
+
 void RtlEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cur_thread) {
+  if (session_probe::Enabled()) { SessionEnterCriticalSection(cs, cur_thread); return; }
   // The title's spin counts (up to 255 * 256) were tuned for the Xenon; cap
   // them, and read before each compare-exchange with a pause so waiters do
   // not keep stealing the cache line the owner needs to release the lock.
@@ -436,6 +457,23 @@ void RtlEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cur_thread) {
 }
 
 uint32_t RtlTryEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t thread) {
+  if (session_probe::Enabled()) {
+    const auto key = SessionCriticalKey(cs);
+    if (session_probe::Replaying()) {
+      const bool result = session_probe::Scalar(session_probe::Kind::kTryLock, key, 0, true);
+      if (result) SessionEnterCriticalSection(cs, thread);
+      return result;
+    }
+    uint32_t result = 0;
+    if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+      cs->owning_thread = thread; cs->recursion_count = 1; result = 1;
+    } else if (cs->owning_thread == thread) {
+      rex::thread::atomic_inc(&cs->lock_count); ++cs->recursion_count; result = 1;
+    }
+    session_probe::Scalar(session_probe::Kind::kTryLock, key, result);
+    if (result) { session_probe::LockGrant grant(key); grant.Acquired(); }
+    return result;
+  }
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
     // Able to steal the lock right away.
@@ -521,7 +559,7 @@ u32 RtlTimeFieldsToTime_entry(ppc_ptr_t<X_TIME_FIELDS> time_fields_ptr, mapped_u
     return 0;
   }
   auto dp = static_cast<std::chrono::sys_days>(year_month_day);
-  std::chrono::system_clock::time_point time = dp;
+  std::chrono::sys_time<WinSystemClock::duration> time = dp;
   time += std::chrono::hours{time_fields_ptr->hour};
   time += std::chrono::minutes{time_fields_ptr->minute};
   time += std::chrono::seconds{time_fields_ptr->second};
@@ -648,6 +686,7 @@ REX_EXPORT(__imp__RtlInitializeCriticalSectionAndSpinCount,
 // Raw hooks: the current thread comes from the caller's r13 (see
 // CriticalSectionThread).
 extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
+  rex::cs_scheduler::Kernel scheduled(reinterpret_cast<uintptr_t>(&__imp__RtlEnterCriticalSection));
   REX_TRACE_IMPORT_REACH(__imp__RtlEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
   // GuestPtr adds the 0xE0000000 view's host offset (Apple silicon), as
@@ -659,6 +698,7 @@ extern "C" REX_FUNC(__imp__RtlEnterCriticalSection) {
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlEnterCriticalSection(
     "__imp__RtlEnterCriticalSection", &__imp__RtlEnterCriticalSection);
 extern "C" REX_FUNC(__imp__RtlTryEnterCriticalSection) {
+  rex::cs_scheduler::Kernel scheduled(reinterpret_cast<uintptr_t>(&__imp__RtlTryEnterCriticalSection));
   REX_TRACE_IMPORT_REACH(__imp__RtlTryEnterCriticalSection);
   using namespace rex::kernel::xboxkrnl;
   ctx.r3.u64 = RtlTryEnterCriticalSection(
