@@ -26,8 +26,10 @@ target_link_libraries(rexglue
 
 rex_target_pch(rexglue <CLI/CLI.hpp>)
 
-# Delay-load FidelityFX DLLs so rexglue can run in tool mode without them.
 if(WIN32)
+    # Merged into the linker's manifest: the UTF-8 code page.
+    target_sources(rexglue PRIVATE rexglue.manifest)
+    # Delay-load FidelityFX DLLs so rexglue can run in tool mode without them.
     if(TARGET amd_fidelityfx_vk)
         target_link_options(rexglue PRIVATE
             "LINKER:/DELAYLOAD:$<TARGET_FILE_NAME:amd_fidelityfx_vk>")
