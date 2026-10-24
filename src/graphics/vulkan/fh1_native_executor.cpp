@@ -2993,10 +2993,9 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
       readback_size_ = size;
     }
   }
-  const ResolveReadback& range = resolve_readbacks_[(uint64_t(address) << 32) | length];
   PendingReadback readback = {address, length, readback_used_,
                               command_processor_.GetCurrentSubmission(),
-                              range.run_start_frame == range.new_since_frame ||
+                              resolve_readbacks_.IsFirstRun(address, length) ||
                                   REXCVAR_GET(fh1_readback_all_resolves)};
   readback_used_ += (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);

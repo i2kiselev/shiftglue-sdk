@@ -23,6 +23,7 @@
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/fh1_executor_counters.h>
 #include <rex/graphics/fh1_frame_inspector.h>
+#include <rex/graphics/fm4_resolve_readbacks.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -366,17 +367,6 @@ class Fh1NativeExecutor {
     VkDeviceSize offset;
     uint64_t submission;
   };
-  struct ResolveReadback {
-    uint64_t last_used_frame = 0;
-    uint64_t run_start_frame = 0;
-    uint64_t new_since_frame = 0;
-    // Order of the range's latest readback among all readbacks, 0 if none.
-    uint64_t readback_sequence = 0;
-    // Resolves this frame (count_frame) and in the frame before it.
-    uint64_t count_frame = UINT64_MAX;
-    uint32_t count = 0;
-    uint32_t previous_count = 0;
-  };
 
   SurfaceKey MakeColorKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                           xenos::ColorRenderTargetFormat format) const;
@@ -696,7 +686,7 @@ class Fh1NativeExecutor {
   VkDeviceMemory deferred_readback_memory_ = VK_NULL_HANDLE;
   const uint8_t* deferred_readback_mapped_ = nullptr;
   VkDeviceSize deferred_readback_next_ = 0;
-  std::map<uint64_t, ResolveReadback> resolve_readbacks_;
+  Fm4ResolveReadbacks resolve_readbacks_;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
   bool pending_targets_valid_ = false;
@@ -920,7 +910,6 @@ class Fh1NativeExecutor {
   // Copies the pending read-backs into guest memory, in order, up to the
   // first whose submission is after `completed_submission`.
   void CompleteResolveReadbacks(uint64_t completed_submission);
-  uint64_t readback_sequence_ = 0;
 
   // fh1_resolve_dump_dir: dumps the resolve's output in the frames asked for.
   void DumpResolveOnRequest(uint32_t address, uint32_t length);

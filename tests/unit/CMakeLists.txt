@@ -44,6 +44,9 @@ add_executable(unit_tests
     graphics/wrap_seam_test.cpp
     graphics/texture_cache_test.cpp
     graphics/fh1_edram_resolve_test.cpp
+    graphics/fm4_resolve_plan_test.cpp
+    graphics/fm4_scaled_resolve_test.cpp
+    graphics/fm4_resolve_readbacks_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -57,6 +60,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fh1_edram_resolve.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fm4_resolve_readbacks.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp

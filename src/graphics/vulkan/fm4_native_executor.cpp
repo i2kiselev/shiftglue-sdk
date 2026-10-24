@@ -1,7 +1,8 @@
 // FM4's additions to the FH1 native executor (Vulkan), kept out of
 // fh1_native_executor.cpp so that upstream's changes there merge cleanly.
 // IsOneOffResolve and FlushResolveReadbacks replace upstream's definitions:
-// port upstream changes to those two here.
+// port upstream changes to those two here, and to the readback rule itself
+// in fm4_resolve_readbacks.cpp.
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 
 #include <algorithm>
@@ -525,77 +526,25 @@ void Fh1NativeExecutor::DumpBufferRange(VkBuffer source, VkDeviceSize offset, Vk
 }
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
-  // As the D3D12 executor: the first frames of each run of resolves to a new
-  // range are read back: car thumbnails the game saves, the 32x512 blurred
-  // asphalt strips FM4 compresses on the CPU at race load, and the 8x8 cube
-  // faces no draw samples, which the CPU reads for the cars' ambient light. Any
-  // size: with a 64 KB floor those faces kept whatever the memory held before,
-  // tinting cars purple once a few races had left garbage there.
-  // A range another readback has written over since its own is new again: the
-  // showroom renders the 256x128 environment map the CPU reduces to the cars'
-  // ambient light into memory it shares with a 768x384 one, and when a car
-  // purchase reran the small map within the idle frames only the large one
-  // was read back, so the CPU lit every car from its bytes (magenta).
-  // So is a resolve to a range already resolved more times this frame than in
-  // the previous one: a capture drawn after the frame into one of its own
-  // targets, such as the photo mode picture the game encodes (#399).
-  constexpr uint64_t kRunGapFrames = 4, kRunReadbackFrames = 2, kIdleFrames = 300,
-                     kNewFrames = 120;
-  const uint64_t key = (uint64_t(address) << 32) | length;
-  ResolveReadback& readback = resolve_readbacks_[key];
-  if (readback.count_frame != frame_) {
-    readback.previous_count = readback.count_frame + 1 == frame_ ? readback.count : 0;
-    readback.count = 0;
-    readback.count_frame = frame_;
-  }
-  ++readback.count;
-  const bool run_start =
-      !readback.last_used_frame || frame_ > readback.last_used_frame + kRunGapFrames;
-  const uint64_t previous_run_frames =
-      readback.last_used_frame ? readback.last_used_frame - readback.run_start_frame + 1 : 0;
-  bool overwritten = false;
-  if (run_start) {
-    if (readback.readback_sequence) {
-      const uint64_t end = uint64_t(address) + length;
-      for (auto other = resolve_readbacks_.begin();
-           other != resolve_readbacks_.end() && (other->first >> 32) < end; ++other) {
-        if (other->first != key && other->second.readback_sequence > readback.readback_sequence &&
-            (other->first >> 32) + uint32_t(other->first) > address) {
-          overwritten = true;
-          break;
-        }
-      }
-    }
-    if (!readback.last_used_frame || frame_ > readback.last_used_frame + kIdleFrames ||
-        overwritten) {
-      readback.new_since_frame = frame_;
-    }
-    readback.run_start_frame = frame_;
-  }
-  const uint64_t idle_frames = readback.last_used_frame ? frame_ - readback.last_used_frame : 0;
-  readback.last_used_frame = frame_;
-  const bool extra = readback.previous_count && readback.count > readback.previous_count;
-  const bool read_back = REXCVAR_GET(fh1_readback_all_resolves) || extra ||
-                         (frame_ < readback.run_start_frame + kRunReadbackFrames &&
-                          frame_ < readback.new_since_frame + kNewFrames);
-  if (REXCVAR_GET(fh1_log_resolve_readbacks) &&
-      (run_start || frame_ == readback.run_start_frame + kRunReadbackFrames)) {
+  const auto decision =
+      resolve_readbacks_.Resolve(address, length, frame_, REXCVAR_GET(fh1_readback_all_resolves));
+  if (REXCVAR_GET(fh1_log_resolve_readbacks) && decision.log) {
     REXGPU_INFO("FH1 readback run {:08X}+{:X} frame {} {}: read back {}, before {}, "
                 "overwritten {}, idle {}, new since {}, previous run {} frames",
-                address, length, frame_, run_start ? "start" : "continues", read_back,
-                readback.readback_sequence != 0, overwritten, run_start ? idle_frames : 0,
-                frame_ - readback.new_since_frame, previous_run_frames);
+                address, length, frame_, decision.run_start ? "start" : "continues",
+                decision.read_back, decision.read_back_before, decision.overwritten,
+                decision.idle_frames, decision.new_since_frames, decision.previous_run_frames);
   }
-  if (read_back) readback.readback_sequence = ++readback_sequence_;
-  return read_back;
+  return decision.read_back;
 }
 
 void Fh1NativeExecutor::FlushResolveReadbacks() {
   ApplyCompletedDeferredReadbacks();
   if (pending_readbacks_.empty()) return;
-  if (async_readbacks_ && !REXCVAR_GET(fh1_async_readbacks_hold) &&
-      std::none_of(pending_readbacks_.begin(), pending_readbacks_.end(),
-                   [](const PendingReadback& pending) { return pending.wait; })) {
+  if (!Fm4ReadbacksWaitForGpu(
+          async_readbacks_, REXCVAR_GET(fh1_async_readbacks_hold),
+          std::any_of(pending_readbacks_.begin(), pending_readbacks_.end(),
+                      [](const PendingReadback& pending) { return pending.wait; }))) {
     CompleteResolveReadbacks(command_processor_.GetCompletedSubmission());
     return;
   }
