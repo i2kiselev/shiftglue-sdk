@@ -26,6 +26,8 @@ set(REXGPU_XENOS_SOURCES
     fh1_frame_dump.cpp
     fh1_frame_replay.cpp
     fh1_shader_pack.cpp
+    fm4_camera_cut.cpp
+    fm4_scene_jitter.cpp
     fm4_resolve_readbacks.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp

@@ -170,6 +170,9 @@ class Fh1NativeExecutor {
     // (UpscalerFrame).
     float jitter_x;
     float jitter_y;
+    // The scene is drawn turned 180 degrees (Fm4SceneTurned): its depth and
+    // motion are read from the opposite pixel.
+    bool turned;
   };
   void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
   // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
@@ -179,8 +182,8 @@ class Fh1NativeExecutor {
   // UP-1.5: jitter the scene with a Halton(2, 3) sequence of this length
   // from the next frame (0: none).
   void SetJitterPhases(uint32_t phases) { jitter_phases_ = phases; }
-  // Whether the current draw goes to the scene's color and depth surfaces,
-  // and if so this frame's jitter, in host pixels of the surface.
+  // Whether the current draw is a scene draw (Fm4JitterSceneDraw), and if
+  // so this frame's jitter, in host pixels of the surface.
   bool GetSceneJitter(float& x, float& y) const;
   // UP-1.7 per-object motion: scene draws write a slot per distinct object
   // reprojection to the object slot image, and the swap pass reprojects
@@ -561,22 +564,32 @@ class Fh1NativeExecutor {
   uint32_t camera_scene_depth_ = 0;
   uint64_t camera_scene_color_ = 0;
   bool camera_scene_depth_valid_ = false;
+  // The last lens a projection in the camera's registers gave, for scenes
+  // without one (Fm4CameraObjectSlot).
+  float lens_fov_y_ = 1.0472f;
+  float lens_near_ = 0.1f;
+  float lens_far_ = 0.0f;
+  // Whether the scene is drawn turned 180 degrees, as the last frame that
+  // could tell said (FH1 and FM4's races are).
+  bool scene_turned_ = true;
   uint64_t CurrentColorKey() const;
   // Records the swapped frame's jitter in camera_ready_ and picks the next.
   void AdvanceJitter();
   // UP-1.5 jitter: the sequence length, the position in it, and this
   // frame's offset in surface pixels.
   uint32_t jitter_phases_ = 0;
-  // Whether the current draw's vertex shader reads the camera matrix.
-  bool draw_uses_camera_matrix_ = false;
-  // UP-1.7: whether it is a car on the scene (SceneObjectMatrixRegister c0).
-  bool draw_is_scene_car_ = false;
+  // Whether the current draw is jittered (Fm4JitterSceneDraw).
+  bool draw_jittered_ = false;
   // UP-1.7: this frame's reprojections by slot, the slots by matrix hash and
   // by object, and the swapped frame's table.
   bool object_motion_enabled_ = false;
   float camera_depth_scale_ = 1.0f;
   uint32_t current_object_slot_ = 0;
   std::vector<std::array<float, 16>> object_reprojections_;
+  // Draws by slot this frame (Fm4CameraObjectSlot), and of them those whose
+  // matrix draws the scene turned and upright (Fm4SceneTurned).
+  std::vector<uint32_t> object_slot_draws_;
+  std::vector<std::array<uint32_t, 2>> object_slot_turned_votes_;
   std::unordered_map<uint64_t, uint32_t> object_slot_by_matrix_;
   // Draws of each mesh so far this frame, and each draw's matrix by mesh
   // and order this frame and the last.

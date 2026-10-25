@@ -3602,8 +3602,9 @@ layout(push_constant) uniform SwapCameraConstants {
   layout(row_major) mat4 reprojection;
   uvec2 size;
   vec2 size_inv;
-  // UP-1.7: the slots in the table (0: camera motion only), and the object
-  // slot depth (host) to the source depth's scale.
+  // UP-1.7: the slots in the table (0: camera motion only), bit 16 the slot
+  // debug view, bit 17 a scene drawn upright; and the object slot depth
+  // (host) to the source depth's scale.
   uint object_count;
   float object_depth_scale;
 } c;
@@ -3619,13 +3620,16 @@ void main() {
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
     return;
   }
-  // FH1 draws the scene turned 180 degrees in clip space (the post pass
-  // turns it back), so the scene depth of a screen pixel is at the opposite
-  // one, and its clip x and y are the screen's negated.
+  // FH1 and FM4's races draw the scene turned 180 degrees in clip space (the
+  // post pass turns it back), so the scene depth of a screen pixel is at the
+  // opposite one, and its clip x and y are the screen's negated. FM4's
+  // showroom draws it upright.
   // Its depth is reversed (1 near) by the viewport, not the matrix: the
   // matrix's clip z is the usual D3D depth, 1 minus the stored one, which is
   // also what the providers take.
-  ivec2 scene_pixel = ivec2(c.size) - 1 - pixel;
+  bool upright = ((c.object_count >> 17u) & 1u) != 0u;
+  ivec2 scene_pixel = upright ? pixel : ivec2(c.size) - 1 - pixel;
+  float turn = upright ? 1.0 : -1.0;
   float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
   float z = 1.0 - stored_z;
   // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
@@ -3656,10 +3660,10 @@ void main() {
   }
   vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  vec4 previous = reprojection * vec4(-ndc, z, 1.0);
+  vec4 previous = reprojection * vec4(turn * ndc, z, 1.0);
   vec2 motion_uv = vec2(0.0);
   if (previous.w > 1.0e-6) {
-    vec2 previous_ndc = -previous.xy / previous.w;
+    vec2 previous_ndc = turn * previous.xy / previous.w;
     motion_uv = vec2(previous_ndc.x * 0.5 + 0.5, 0.5 - previous_ndc.y * 0.5) - uv;
   }
   imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
@@ -3760,6 +3764,27 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   }
   swap_camera_failed_ = false;
   return true;
+}
+
+void VulkanCommandProcessor::ClearObjectSlotImage(VkPipelineStageFlags src_stage,
+                                                 VkAccessFlags src_access,
+                                                 VkImageLayout src_layout) {
+  // Cleared for the next frame's scene.
+  const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange();
+  PushImageMemoryBarrier(object_slot_image_, range, src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         src_access, VK_ACCESS_TRANSFER_WRITE_BIT, src_layout,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+                         VK_QUEUE_FAMILY_IGNORED, false);
+  SubmitBarriers(true);
+  const VkClearColorValue clear = {};
+  deferred_command_buffer_.CmdVkClearColorImage(object_slot_image_, VK_IMAGE_LAYOUT_GENERAL,
+                                                &clear, 1, &range);
+  PushImageMemoryBarrier(object_slot_image_, range, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+  object_slot_image_initialized_ = true;
 }
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -4682,7 +4707,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             camera_constants.size_inv[0] = 1.0f / float(guest_output_width);
             camera_constants.size_inv[1] = 1.0f / float(guest_output_height);
             camera_constants.object_count =
-                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug)) << 16;
+                object_count | uint32_t(REXCVAR_GET(present_upscaler_object_debug)) << 16 |
+                uint32_t(!camera.turned) << 17;
             if ((frame_current_ % 600) == 0) {
               REXGPU_INFO("Object motion: {} slots, {} slot draws, {} without the variant",
                           object_count, object_slot_draws_, object_slot_fallback_draws_);
@@ -4697,26 +4723,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             BindExternalComputePipeline(swap_camera_pipeline_);
             deferred_command_buffer_.CmdVkDispatch((guest_output_width + 7) / 8,
                                                    (guest_output_height + 7) / 8, 1);
-            // Cleared for the next frame's scene.
-            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
-                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
-                                   VK_QUEUE_FAMILY_IGNORED, false);
-            SubmitBarriers(true);
-            const VkClearColorValue object_slot_clear = {};
-            deferred_command_buffer_.CmdVkClearColorImage(
-                object_slot_image_, VK_IMAGE_LAYOUT_GENERAL, &object_slot_clear, 1,
-                &object_slot_range);
-            PushImageMemoryBarrier(object_slot_image_, object_slot_range,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   VK_ACCESS_TRANSFER_WRITE_BIT,
-                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
-            object_slot_image_initialized_ = true;
+            ClearObjectSlotImage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+                                 VK_IMAGE_LAYOUT_GENERAL);
             for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image()}) {
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -4734,6 +4742,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             upscaler_camera.jitter_x = camera.jitter_x;
             upscaler_camera.jitter_y = camera.jitter_y;
             vulkan_context.SetCameraWritten(upscaler_camera);
+          } else if (object_slot_image_ != VK_NULL_HANDLE) {
+            // Without a camera the slots still start the next frame clear: a
+            // scene whose camera only the slots give (the showroom without
+            // MSAA draws too few c128 draws for a world group) needs them.
+            if (object_slot_image_initialized_) {
+              ClearObjectSlotImage(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   VK_IMAGE_LAYOUT_GENERAL);
+            } else {
+              ClearObjectSlotImage(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                                   VK_IMAGE_LAYOUT_UNDEFINED);
+            }
           }
 
           // Insert the release barrier.

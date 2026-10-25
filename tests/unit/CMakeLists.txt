@@ -47,6 +47,8 @@ add_executable(unit_tests
     graphics/fm4_resolve_plan_test.cpp
     graphics/fm4_scaled_resolve_test.cpp
     graphics/fm4_resolve_readbacks_test.cpp
+    graphics/fm4_camera_cut_test.cpp
+    graphics/fm4_scene_jitter_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -61,6 +63,8 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/registers.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fh1_edram_resolve.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_resolve_readbacks.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fm4_camera_cut.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fm4_scene_jitter.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp

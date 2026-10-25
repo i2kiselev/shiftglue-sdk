@@ -12,9 +12,12 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <rex/graphics/fm4_camera_cut.h>
+#include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/logging.h>
@@ -52,8 +55,20 @@ void main() {
   if (any(greaterThanEqual(pixel, c.size))) {
     return;
   }
-  // Sample 0 of a multisampled surface.
+#if MULTISAMPLED
+  // The samples' mean: the standard sample locations centre on the pixel, so over one
+  // surface it is the depth at the pixel's centre, which the colour resolve and the object
+  // slots (gl_FragCoord.z) hold. Sample 0 lies off the centre, and on a sloped surface it
+  // never matched a slot's depth: with the game's MSAA most pixels lost their object's motion.
+  float z = 0.0;
+  int samples = textureSamples(depth);
+  for (int i = 0; i < samples; ++i) {
+    z += texelFetch(depth, ivec2(pixel), i).r;
+  }
+  z *= c.scale / float(samples);
+#else
   float z = texelFetch(depth, ivec2(pixel), 0).r * c.scale;
+#endif
   imageStore(dest, ivec2(pixel.x, pixel.y + c.dest_row), vec4(z, 0.0, 0.0, 0.0));
 }
 )";
@@ -144,32 +159,35 @@ struct MatrixHash {
 }  // namespace
 
 void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
-  draw_uses_camera_matrix_ = false;
-  draw_is_scene_car_ = false;
+  draw_jittered_ = false;
   current_object_slot_ = 0;
   if (!camera_tracking_enabled_ || !initialized_ || !draw.vertex_shader || !draw.rasterization_done ||
       draw.memexport) {
     return;
   }
   const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
+  draw_jittered_ =
+      camera_scene_depth_valid_ &&
+      Fm4JitterSceneDraw(Fm4JitterPlacement(map.float_bitmap),
+                         draw.normalized_depth_control.z_enable &&
+                             CurrentDepthKey() == camera_scene_depth_,
+                         (draw.normalized_color_mask & 0xF) &&
+                             Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
   if (((map.float_bitmap[kCameraFirstRegister / 64] >> (kCameraFirstRegister % 64)) & 0xF) !=
       0xF) {
-    // UP-1.7: a car, with its own matrix in c0-c3. Jittered with the scene
-    // (it draws to its own colour target, so GetSceneJitter's colour check
-    // left cars unjittered and aliased before).
+    // UP-1.7: a car, with its own matrix in c0-c3.
     if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) return;
-    draw_is_scene_car_ = true;
     if (object_motion_enabled_) {
-      std::array<float, 16> wvp;
-      std::memcpy(wvp.data(),
+      std::array<float, 16> registers;
+      std::memcpy(registers.data(),
                   &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
                                          kObjectFirstRegister * 4],
-                  sizeof(wvp));
+                  sizeof(registers));
+      const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
       current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
     }
     return;
   }
-  draw_uses_camera_matrix_ = true;
   if (!draw.normalized_depth_control.z_enable) return;
   CameraDraw& noted = camera_draws_.emplace_back();
   std::memcpy(noted.wvp.data(),
@@ -233,6 +251,14 @@ uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<f
       }
     }
   }
+  if (object_slot_draws_.size() <= slot) {
+    object_slot_draws_.resize(slot + 1);
+    object_slot_turned_votes_.resize(slot + 1);
+  }
+  ++object_slot_draws_[slot];
+  if (const std::optional<bool> turned = Fm4SceneTurned(wvp)) {
+    ++object_slot_turned_votes_[slot][*turned ? 0 : 1];
+  }
   return slot;
 }
 
@@ -291,13 +317,16 @@ uint64_t Fh1NativeExecutor::CurrentColorKey() const {
 }
 
 void Fh1NativeExecutor::AdvanceJitter() {
-  // The scene is drawn turned 180 degrees and the post pass turns it back,
-  // so a surface offset moves the picture the other way on the screen. In
-  // the upscalers' convention the frame's jitter is (-x, -y): of the four
+  // A scene drawn turned 180 degrees is turned back by the post pass, so a
+  // surface offset moves the picture the other way on the screen. In the
+  // upscalers' convention the frame's jitter is then (-x, -y): of the four
   // signs it is the one that came closest to a native 3x render of a still
-  // scene (PSNR, FSR 3.1.4 at 3x).
-  camera_ready_.jitter_x = -jitter_x_;
-  camera_ready_.jitter_y = -jitter_y_;
+  // scene (PSNR, FSR 3.1.4 at 3x). FM4's showroom draws it upright, where
+  // (-x, -y) made DLSS shake a still frame by 2.4 levels of luma a frame and
+  // (x, y) by 0.5.
+  const float sign = scene_turned_ ? -1.0f : 1.0f;
+  camera_ready_.jitter_x = sign * jitter_x_;
+  camera_ready_.jitter_y = sign * jitter_y_;
   if (jitter_phases_) {
     jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
     jitter_x_ = Halton(jitter_index_ + 1, 2) - 0.5f;
@@ -309,25 +338,10 @@ void Fh1NativeExecutor::AdvanceJitter() {
 }
 
 bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
-  // Only draws placed by the camera matrix: a screen-space pass in the
-  // scene (a quad ending at the screen edge) would leave a strip of the
-  // edge unwritten when moved, which showed as flickering stale colours.
-  if (!jitter_phases_ || !camera_scene_depth_valid_) return false;
-  if (draw_is_scene_car_) {
-    x = jitter_x_;
-    y = jitter_y_;
-    return true;
-  }
-  if (!draw_uses_camera_matrix_) return false;
-  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
-  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
-  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
-  if (MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
-                   depth_info.depth_format)
-              .Pack() != camera_scene_depth_ ||
-      CurrentColorKey() != camera_scene_color_) {
-    return false;
-  }
+  // Only draws placed by a matrix (Fm4JitterSceneDraw): a screen-space pass
+  // in the scene (a quad ending at the screen edge) would leave a strip of
+  // the edge unwritten when moved, which showed as flickering stale colours.
+  if (!jitter_phases_ || !draw_jittered_) return false;
   x = jitter_x_;
   y = jitter_y_;
   return true;
@@ -338,6 +352,11 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera_depth_dirty_ = false;
   std::vector<std::array<float, 16>> object_reprojections = std::move(object_reprojections_);
   object_reprojections_.clear();
+  std::vector<uint32_t> object_slot_draws = std::move(object_slot_draws_);
+  object_slot_draws_.clear();
+  std::vector<std::array<uint32_t, 2>> object_slot_turned_votes =
+      std::move(object_slot_turned_votes_);
+  object_slot_turned_votes_.clear();
   object_slot_by_matrix_.clear();
   object_occurrences_.clear();
   object_previous_wvp_ = std::move(object_current_wvp_);
@@ -384,32 +403,44 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   const auto world =
       std::max_element(groups.begin(), groups.end(),
                        [](const auto& a, const auto& b) { return a.second < b.second; });
-  if (world == groups.end() || world->second < kCameraMinWorldDraws) {
+  const bool world_found = world != groups.end() && world->second >= kCameraMinWorldDraws;
+  // Without a world group the camera can still be the objects' (the showroom
+  // without MSAA draws its 12 c128 draws, no projection, once instead of once
+  // per tile).
+  const uint32_t object_slot =
+      Fm4CameraObjectSlot(object_slot_draws, uint32_t(kCameraMinWorldDraws));
+  if (!world_found && !object_slot) {
     camera_previous_objects_.clear();
     return;
   }
-  const std::array<float, 16>& current = world->first;
+  static const std::array<float, 16> kNoWorld = {};
+  const std::array<float, 16>& current = world_found ? world->first : kNoWorld;
 
   // The lens, from the world's matrix (its world transform has unit scale).
   Camera camera = {};
   const double y_scale = RowLength(current, 1);
   const double z_length = RowLength(current, 2);
   const double w_length = RowLength(current, 3);
-  if (y_scale <= 0.0 || w_length <= 0.0) {
-    camera_previous_objects_ = std::move(objects);
-    return;
+  const double k = w_length > 0.0 ? z_length / w_length : 0.0;
+  const double near_plane =
+      k > 0.0 ? (k * current[15] / w_length - current[11] / w_length) / k : 0.0;
+  Matrix current_inverse;
+  const bool projection = world_found && y_scale > 0.0 && near_plane > 0.0 &&
+                          Invert(ToMatrix(current), current_inverse);
+  if (projection) {
+    lens_fov_y_ = float(2.0 * std::atan(1.0 / y_scale));
+    lens_near_ = float(near_plane);
+    lens_far_ = k > 1.0 ? float(k * near_plane / (k - 1.0)) : 0.0f;
   }
-  camera.fov_y = float(2.0 * std::atan(1.0 / y_scale));
-  const double k = z_length / w_length;
-  const double near_plane = (k * current[15] / w_length - current[11] / w_length) / k;
-  camera.near_plane = float(near_plane);
-  camera.far_plane = k > 1.0 ? float(k * near_plane / (k - 1.0)) : 0.0f;
+  camera.fov_y = lens_fov_y_;
+  camera.near_plane = lens_near_;
+  camera.far_plane = lens_far_;
 
   // The previous frame's matrix for the same objects.
   std::unordered_map<std::array<float, 16>, size_t, MatrixHash> previous_matches;
   size_t matched = 0;
   for (const auto& [object, wvp] : objects) {
-    if (wvp != current) continue;
+    if (!world_found || wvp != current) continue;
     auto previous = camera_previous_objects_.find(object);
     if (previous == camera_previous_objects_.end()) continue;
     ++previous_matches[previous->second];
@@ -417,27 +448,37 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   }
   camera.cut = true;
   Matrix reprojection = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-  if (!previous_matches.empty()) {
-    const auto previous =
-        std::max_element(previous_matches.begin(), previous_matches.end(),
-                         [](const auto& a, const auto& b) { return a.second < b.second; });
-    Matrix current_inverse;
-    if (previous->second >= kCameraMinWorldDraws / 2 && previous->second * 2 >= matched &&
-        Invert(ToMatrix(current), current_inverse)) {
-      const Matrix candidate = Multiply(ToMatrix(previous->first), current_inverse);
-      // A jump of the view between frames is a cut even when the world
-      // carries over.
-      double change = 0.0;
-      for (int r = 0; r < 2; ++r) {
-        for (int c = 0; c < 4; ++c) {
-          change = std::max(change, std::abs(candidate[r * 4 + c] - (r == c ? 1.0 : 0.0)));
-        }
-      }
-      if (change < 0.25) {
-        reprojection = candidate;
-        camera.cut = false;
+  std::optional<Matrix> candidate;
+  if (projection) {
+    if (!previous_matches.empty()) {
+      const auto previous =
+          std::max_element(previous_matches.begin(), previous_matches.end(),
+                           [](const auto& a, const auto& b) { return a.second < b.second; });
+      if (previous->second >= kCameraMinWorldDraws / 2 && previous->second * 2 >= matched) {
+        candidate = Multiply(ToMatrix(previous->first), current_inverse);
       }
     }
+  } else if (object_slot) {
+    candidate = ToMatrix(object_reprojections[object_slot]);
+  }
+  // Which way up the scene is drawn: the world's matrix, or most of the
+  // camera slot's draws (a wheel turned on its axle says otherwise).
+  std::optional<bool> turned;
+  if (projection) {
+    turned = Fm4SceneTurned(current);
+  } else if (object_slot && object_slot < object_slot_turned_votes.size()) {
+    const auto [turned_votes, upright_votes] = object_slot_turned_votes[object_slot];
+    if (turned_votes > 2 * upright_votes) turned = true;
+    if (upright_votes > 2 * turned_votes) turned = false;
+  }
+  if (turned) scene_turned_ = *turned;
+  camera.turned = scene_turned_;
+  // A jump of the view between frames is a cut even when the world carries
+  // over.
+  if (candidate && Fm4ReprojectedScreenShift(*candidate, camera.near_plane, camera.far_plane) <
+                       kFm4CameraCutScreenShift) {
+    reprojection = *candidate;
+    camera.cut = false;
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
   if (camera.cut) Count("camera_cut");
@@ -445,9 +486,9 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   if ((frame_ % 600) == 0) {
     REXGPU_INFO(
         "FH1 camera: world group {} draws, {} matched, cut {}, fov_y {:.2f} deg, near {:.3f}, "
-        "far {:.0f}",
-        world->second, matched, camera.cut, camera.fov_y * 57.29578f, camera.near_plane,
-        camera.far_plane);
+        "far {:.0f}, turned {}",
+        world_found ? world->second : 0, matched, camera.cut, camera.fov_y * 57.29578f,
+        camera.near_plane, camera.far_plane, camera.turned);
   }
   camera_ready_ = camera;
   camera_ready_valid_ = true;

@@ -858,6 +858,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // undefined, and the swap's camera pass initialises it.
   bool CreateObjectSlotImage(uint32_t width, uint32_t height);
   void DestroyObjectSlotImage();
+  // From the slot image's last use (src_*) to cleared, for fragment shaders.
+  void ClearObjectSlotImage(VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                            VkImageLayout src_layout);
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
