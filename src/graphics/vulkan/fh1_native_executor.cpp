@@ -3484,10 +3484,10 @@ bool Fh1NativeExecutor::IsHudTarget() const {
 }
 
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
-  NoteCameraDraw(draw);
   hud_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
+    NoteCameraDraw(draw);
     return;
   }
   const auto color_info =
@@ -3495,13 +3495,21 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   if (color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
     // FH1 composites the scene into the front buffer last in this format.
     hud_scene_base_ = color_info.color_base;
+    NoteCameraDraw(draw);
     return;
   }
   if (color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 ||
       color_info.color_base != hud_scene_base_) {
+    NoteCameraDraw(draw);
     return;
   }
   hud_draw_ = true;
+  // The HUD is put back after a temporal upscale from this frame, so it is
+  // never jittered, and its glyphs (placed like objects) must not make a
+  // menu look like a 3D scene with a camera.
+  draw_jittered_ = false;
+  current_object_slot_ = 0;
+  current_decal_ = false;
   // Untiled, the scene depth is whole by the HUD.
   if (untile_height_) SnapshotCameraDepth(0);
   if (!hud_snapshot_enabled_ || hud_snapshot_taken_) return;
