@@ -1,14 +1,16 @@
 #pragma once
 // The motion a temporal upscaler gets for FM4's car ground shadow. The track draws darken the
-// ground under the car from the grey map, downsampled from the car's own shadow map: an
-// orthographic view from the sun centred on the car. The shadow therefore moves with the car,
-// while the asphalt it falls on moves with the world. Given the asphalt's motion, a shadow
-// pixel's history came from where the asphalt was a frame earlier; in reverse look that is the
-// lit ground behind the shadow's edge, which DLSS kept as thin light lines across the shadow.
+// ground under the car from the grey map, downsampled from the car's own shadow map, which the
+// game draws again from the car every frame. The shadow therefore moves with the car, while the
+// asphalt it falls on moves with the world. Given the asphalt's motion, a shadow pixel's history
+// came from where the asphalt was a frame earlier; in reverse look that is the lit ground behind
+// the shadow's edge, which DLSS kept as thin light lines across the shadow.
+// The shadow map's own frame is no stand-in for the car's: it follows the car's position but
+// keeps the sun's orientation, so in a turn it gave the shadow under the bumper 1-9 pixels of
+// motion the car did not have, and DLSS ghosted the exhaust pipes into it.
 
 #include <array>
-#include <optional>
-#include <utility>
+#include <cstdint>
 #include <vector>
 
 namespace rex::graphics {
@@ -18,18 +20,9 @@ namespace rex::graphics {
 // and the reflection cube draw it in perspective.
 bool Fm4OrthographicMatrix(const std::array<float, 16>& wvp);
 
-// The shadow map's clip space to the scene's, from the car's meshes drawn in both (each pair: a
-// mesh's world-view-projection in the scene, then in the shadow map). For a rigid part both
-// share its world transform, so scene * shadow^-1 is the same for all of them; the largest group
-// of equal products, empty without one.
-std::optional<std::array<double, 16>> Fm4ShadowToScene(
-    const std::vector<std::pair<std::array<float, 16>, std::array<float, 16>>>& pairs);
-
-// The reprojection (the current frame's clip space to the previous frame's) of what is fixed in
-// the shadow map, such as the shadow on the ground, from both frames' Fm4ShadowToScene; empty
-// when the current one cannot be inverted.
-std::optional<std::array<double, 16>> Fm4ShadowReprojection(
-    const std::array<double, 16>& previous_shadow_to_scene,
-    const std::array<double, 16>& current_shadow_to_scene);
+// The object slot the ground shadow moves with: of the scene slots of the car's meshes drawn in
+// both the shadow map pass and the scene, the one most share (the body's); 0 without one. Slot 0
+// (the camera's motion, meshes new this frame) does not vote.
+uint32_t Fm4ShadowSlot(const std::vector<uint32_t>& scene_slots);
 
 }  // namespace rex::graphics

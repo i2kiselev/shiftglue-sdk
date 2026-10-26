@@ -194,7 +194,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
     const bool reads_world = Fm4ReadsWorldMatrix(std::to_array(map.float_bitmap));
     if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
       if (shadow_motion_enabled_ && Fm4OrthographicMatrix(wvp)) {
-        NoteShadowPart(shadow_map_parts_, draw, wvp);
+        NoteShadowPart(shadow_map_parts_, draw, 0);
       }
       if (decal_motion_enabled_ && reads_world && camera_scene_depth_valid_ &&
           Fm4ShadowDecalDraw(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL],
@@ -226,7 +226,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
     if (decal_motion_enabled_ && reads_world && current_object_slot_) {
       object_slot_by_world_.emplace(WorldMatrixKey(), current_object_slot_);
     }
-    if (shadow_motion_enabled_) NoteShadowPart(shadow_scene_parts_, draw, wvp);
+    if (shadow_motion_enabled_) NoteShadowPart(shadow_scene_parts_, draw, current_object_slot_);
     return;
   }
   if (!draw.normalized_depth_control.z_enable) return;
@@ -263,34 +263,34 @@ uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
 }
 
 void Fh1NativeExecutor::NoteShadowPart(std::unordered_map<uint32_t, ShadowPart>& parts,
-                                       const Fh1DrawInfo& draw,
-                                       const std::array<float, 16>& wvp) {
+                                       const Fh1DrawInfo& draw, uint32_t slot) {
   // The car's shadow map pass draws its meshes with shaders of its own, from the same vertex
   // buffers.
   const auto& bindings = draw.vertex_shader->vertex_bindings();
   if (bindings.empty()) return;
   ShadowPart& part =
       parts[register_file_.GetVertexFetch(bindings.front().fetch_constant).address];
-  part.wvp = wvp;
+  part.slot = slot;
   ++part.draws;
 }
 
-std::optional<std::array<double, 16>> Fh1NativeExecutor::TakeShadowToScene() {
+uint32_t Fh1NativeExecutor::TakeShadowSlot() {
   // Meshes drawn once in each: a wheel mesh is drawn at all four corners.
-  std::vector<std::pair<std::array<float, 16>, std::array<float, 16>>> pairs;
+  std::vector<uint32_t> slots;
   for (const auto& [address, shadow] : shadow_map_parts_) {
     const auto scene = shadow_scene_parts_.find(address);
     if (shadow.draws == 1 && scene != shadow_scene_parts_.end() && scene->second.draws == 1) {
-      pairs.emplace_back(scene->second.wvp, shadow.wvp);
+      slots.push_back(scene->second.slot);
     }
   }
+  const uint32_t slot = Fm4ShadowSlot(slots);
   if ((frame_ % 600) == 0 && shadow_motion_enabled_) {
-    REXGPU_INFO("FH1 camera: ground shadow from {} of {} shadow map meshes", pairs.size(),
-                shadow_map_parts_.size());
+    REXGPU_INFO("FH1 camera: ground shadow in slot {} from {} of {} shadow map meshes", slot,
+                slots.size(), shadow_map_parts_.size());
   }
   shadow_map_parts_.clear();
   shadow_scene_parts_.clear();
-  return Fm4ShadowToScene(pairs);
+  return slot;
 }
 
 uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp,
@@ -479,9 +479,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   object_current_world_.clear();
   object_reprojections_ready_.clear();
   object_shadow_slot_ready_ = 0;
-  const std::optional<std::array<double, 16>> shadow_to_scene = TakeShadowToScene();
-  const std::optional<std::array<double, 16>> shadow_to_scene_previous =
-      std::exchange(shadow_to_scene_previous_, shadow_to_scene);
+  const uint32_t shadow_slot = TakeShadowSlot();
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
     camera_draws_.clear();
@@ -615,17 +613,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_valid_ = true;
   camera_previous_objects_ = std::move(objects);
   if (!camera.cut) {
-    if (shadow_to_scene && shadow_to_scene_previous) {
-      if (const std::optional<Matrix> shadow =
-              Fm4ShadowReprojection(*shadow_to_scene_previous, *shadow_to_scene)) {
-        if (object_reprojections.empty()) object_reprojections.emplace_back();
-        if (object_reprojections.size() < kMaxObjectSlots) {
-          object_shadow_slot_ready_ = uint32_t(object_reprojections.size());
-          std::array<float, 16>& matrix = object_reprojections.emplace_back();
-          for (size_t i = 0; i < 16; ++i) matrix[i] = float((*shadow)[i]);
-        }
-      }
-    }
+    if (shadow_slot < object_reprojections.size()) object_shadow_slot_ready_ = shadow_slot;
     if (object_reprojections.size() > 1) Count("camera_object_frame");
     if ((frame_ % 600) == 0) {
       REXGPU_INFO("FH1 camera: {} object reprojections",

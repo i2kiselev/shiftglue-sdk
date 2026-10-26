@@ -193,8 +193,8 @@ class Fh1NativeExecutor {
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
   // Spinning objects (wheels) move with their origin (Fm4SpinFreeReprojection).
   void SetSpinFreeWheels(bool enabled) { spin_free_wheels_ = enabled; }
-  // The car's ground shadow moves with the shadow map (Fm4ShadowReprojection): the shadowed
-  // draws mark the second plane, and the shadow's reprojection is a slot of its own.
+  // The car's ground shadow moves with the car (Fm4ShadowSlot): the shadowed draws mark the
+  // second plane, which takes the slot of the car's body.
   void SetShadowMotion(bool enabled) { shadow_motion_enabled_ = enabled; }
   // Other cars' ground shadows move with the part whose world matrix they read
   // (Fm4ShadowDecalDraw): they mark the third plane with that part's slot.
@@ -643,19 +643,17 @@ class Fh1NativeExecutor {
   std::unordered_map<uint64_t, std::array<float, 16>> object_previous_world_;
   std::vector<std::array<float, 16>> object_reprojections_ready_;
   uint32_t object_shadow_slot_ready_ = 0;
-  // The car's meshes this frame by vertex buffer: their matrices in the scene and in the
-  // shadow map pass, and how often each was drawn there (once to be matched); the last
-  // frame's shadow map to scene clip space (Fm4ShadowToScene).
+  // The car's meshes this frame by vertex buffer: their object slots in the scene, and how
+  // often each was drawn there and in the shadow map pass (once to be matched; Fm4ShadowSlot).
   struct ShadowPart {
-    std::array<float, 16> wvp;
+    uint32_t slot = 0;
     uint32_t draws = 0;
   };
   std::unordered_map<uint32_t, ShadowPart> shadow_scene_parts_;
   std::unordered_map<uint32_t, ShadowPart> shadow_map_parts_;
-  std::optional<std::array<double, 16>> shadow_to_scene_previous_;
   void NoteShadowPart(std::unordered_map<uint32_t, ShadowPart>& parts, const Fh1DrawInfo& draw,
-                      const std::array<float, 16>& wvp);
-  std::optional<std::array<double, 16>> TakeShadowToScene();
+                      uint32_t slot);
+  uint32_t TakeShadowSlot();
   uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp,
                             const std::optional<std::array<float, 16>>& world);
   // The first register of the draw's world-view-projection (c128 the
