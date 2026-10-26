@@ -58,6 +58,7 @@
 #include <rex/types.h>
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -3970,6 +3971,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   }
 
   SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
+  // A temporal upscaler antialiases the guest output itself and would take
+  // FXAA's smear as detail: a frame without a HUD has no HUD-less copy, so
+  // the upscaler reads the swap output (fm4 replays with the toolbar hidden).
+  if (ui::IsTemporalUpscalerActive()) {
+    swap_post_effect = SwapPostEffect::kNone;
+  }
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
