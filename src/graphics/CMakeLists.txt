@@ -28,6 +28,7 @@ set(REXGPU_XENOS_SOURCES
     fh1_shader_pack.cpp
     fm4_camera_cut.cpp
     fm4_scene_jitter.cpp
+    fm4_decal_motion.cpp
     fm4_reactive_mask.cpp
     fm4_wheel_motion.cpp
     fm4_shadow_motion.cpp

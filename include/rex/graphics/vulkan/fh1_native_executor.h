@@ -196,6 +196,9 @@ class Fh1NativeExecutor {
   // The car's ground shadow moves with the shadow map (Fm4ShadowReprojection): the shadowed
   // draws mark the second plane, and the shadow's reprojection is a slot of its own.
   void SetShadowMotion(bool enabled) { shadow_motion_enabled_ = enabled; }
+  // Other cars' ground shadows move with the part whose world matrix they read
+  // (Fm4ShadowDecalDraw): they mark the third plane with that part's slot.
+  void SetDecalMotion(bool enabled) { decal_motion_enabled_ = enabled; }
   bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
@@ -212,13 +215,18 @@ class Fh1NativeExecutor {
   bool IsSceneShadowedDraw(const Shader& pixel_shader) const;
   // What the current draw marks in the reactive mask: its alpha
   // (IsSceneReactiveDraw, draws without an object slot) and its shadow
-  // (IsSceneShadowedDraw).
-  static constexpr uint32_t kReactiveAlpha = 1, kReactiveShadow = 2;
+  // (IsSceneShadowedDraw); and whether it is a car part's ground shadow, marking
+  // the third plane with its slot (SetDecalMotion).
+  static constexpr uint32_t kReactiveAlpha = 1, kReactiveShadow = 2, kReactiveDecal = 4;
   uint32_t SceneReactiveSources(const Shader& pixel_shader, bool object_slot) const {
     return (!object_slot && IsSceneReactiveDraw() ? kReactiveAlpha : 0) |
-           (IsSceneShadowedDraw(pixel_shader) ? kReactiveShadow : 0);
+           (IsSceneShadowedDraw(pixel_shader) ? kReactiveShadow : 0) |
+           (current_decal_ ? kReactiveDecal : 0);
   }
-  // The current draw's slot, after NoteCameraDraw (0: the camera's motion).
+  // The current draw's slot, after NoteCameraDraw (0: the camera's motion); a
+  // ground shadow's is its part's, with kObjectSlotHalveDepth where its
+  // fragment depth is twice the scene's (no depth test on a float24 surface).
+  static constexpr uint32_t kObjectSlotHalveDepth = 0x100;
   uint32_t current_object_slot() const { return current_object_slot_; }
   // The full-frame row of the current surface's first row, in host pixels.
   int32_t ObjectRowOffset() const;
@@ -612,8 +620,13 @@ class Fh1NativeExecutor {
   bool reactive_shadows_enabled_ = false;
   bool spin_free_wheels_ = true;
   bool shadow_motion_enabled_ = false;
+  bool decal_motion_enabled_ = false;
   float camera_depth_scale_ = 1.0f;
   uint32_t current_object_slot_ = 0;
+  bool current_decal_ = false;
+  // This frame's object slots by the world matrix (c8-c11) their draws read.
+  std::unordered_map<uint64_t, uint32_t> object_slot_by_world_;
+  uint64_t WorldMatrixKey() const;
   std::vector<std::array<float, 16>> object_reprojections_;
   // Draws by slot this frame (Fm4CameraObjectSlot), and of them those whose
   // matrix draws the scene turned and upright (Fm4SceneTurned).

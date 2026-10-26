@@ -49,6 +49,7 @@ add_executable(unit_tests
     graphics/fm4_resolve_readbacks_test.cpp
     graphics/fm4_camera_cut_test.cpp
     graphics/fm4_scene_jitter_test.cpp
+    graphics/fm4_decal_motion_test.cpp
     graphics/fm4_reactive_mask_test.cpp
     graphics/fm4_wheel_motion_test.cpp
     graphics/fm4_shadow_motion_test.cpp
@@ -69,6 +70,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_resolve_readbacks.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_camera_cut.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_scene_jitter.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fm4_decal_motion.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_reactive_mask.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_wheel_motion.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_shadow_motion.cpp

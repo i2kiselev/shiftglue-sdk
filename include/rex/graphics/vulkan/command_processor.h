@@ -1252,6 +1252,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t object_slot_fallback_draws_ = 0;
   uint32_t reactive_draws_ = 0;
   uint32_t reactive_shadow_draws_ = 0;
+  uint32_t decal_draws_ = 0;
   // Draws of the current frame recorded with a pipeline still being built
   // (vulkan_async_pipeline_bind_on_replay).
   uint32_t pending_pipeline_binds_ = 0;

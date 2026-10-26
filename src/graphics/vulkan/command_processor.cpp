@@ -101,13 +101,18 @@ REXCVAR_DEFINE_BOOL(present_upscaler_shadow_motion, true, "GPU",
                     "Give a temporal upscaler the car's ground shadow's own motion (FM4): with "
                     "the ground's, DLSS drew thin light lines across the shadow in reverse look");
 
+REXCVAR_DEFINE_BOOL(present_upscaler_decal_motion, true, "GPU",
+                    "Give a temporal upscaler other cars' ground shadows' motion as their "
+                    "parts' (FM4): with the ground's, DLAA trailed them behind the cars and "
+                    "fizzled at the tyres");
+
 REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
                     "Give a temporal upscaler spinning wheels' motion as their hubs' (FM4): "
                     "the spin itself is too fast to follow and drew light lines along the car "
                     "by the wheels");
 
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
-                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's), 2 the reactive mask (red)");
+                     "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's), 2 the reactive mask (red), 3 the ground shadows' slots (red: written, green: taken)");
 
 REXCVAR_DEFINE_BOOL(fh1_untile_predicated_tiling, REX_PLATFORM_ANDROID || REX_PLATFORM_MAC, "GPU",
                     "Render FH1's predicated tiling passes once: the first tile draws every "
@@ -3626,16 +3631,18 @@ layout(push_constant) uniform SwapCameraConstants {
   // UP-1.7: the slots in the table (0: camera motion only), bit 16 the slot
   // debug view, bit 17 a scene drawn upright, bit 18 the reactive plane
   // written for the mask, bit 19 its debug view, bits 20-27 the ground
-  // shadow's slot (0: none); and the object slot depth (host) to the source
-  // depth's scale.
+  // shadow's slot (0: none), bit 28 the third plane's ground shadow slots
+  // read, bit 29 their debug view; and the object slot depth (host) to the
+  // source depth's scale.
   uint object_count;
   float object_depth_scale;
 } c;
 layout(set = 0, binding = 0) uniform texture2D source_depth;
 layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
 layout(set = 0, binding = 2, rg16f) writeonly uniform image2D motion;
-// The object slots, and below them the reactive plane: the nearest
-// alpha-blended or shadowed fragment's (depth << 8) | alpha or shadow depth.
+// The object slots, below them the reactive plane: the nearest alpha-blended
+// or shadowed fragment's (depth << 8) | alpha or shadow depth, and below that
+// the nearest darkening ground shadow fragment's (depth << 8) | slot.
 layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
 layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
   layout(row_major) mat4 object_reprojections[];
@@ -3646,7 +3653,7 @@ void main() {
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
     return;
   }
-  ivec2 slots_size = imageSize(object_slots) / ivec2(1, 2);
+  ivec2 slots_size = imageSize(object_slots) / ivec2(1, 3);
   // FH1 and FM4's races draw the scene turned 180 degrees in clip space (the
   // post pass turns it back), so the scene depth of a screen pixel is at the
   // opposite one, and its clip x and y are the screen's negated. FM4's
@@ -3698,6 +3705,26 @@ void main() {
     if (slot != 0u && slot < object_count &&
         abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
             (1.0 / 65536.0)) {
+      reprojection = object_reprojections[slot];
+    }
+  }
+  // Other cars' ground shadows move with their part where they lie on what the
+  // pixel shows, within a tenth of its distance (depth is about near over
+  // distance): drawn without a depth test, a shadow's plane dips under the
+  // road's camber, and the game's stencil kept it off what is nearer or farther.
+  if (((c.object_count >> 28u) & 1u) != 0u && all(lessThan(scene_pixel, slots_size))) {
+    uint key = imageLoad(object_slots, scene_pixel + ivec2(0, 2 * slots_size.y)).r;
+    uint slot = key & 0xFFu;
+    float decal_z = float(key >> 8u) * (c.object_depth_scale / 16777215.0);
+    bool on_surface = slot != 0u && slot < object_count &&
+                      abs(decal_z - stored_z) < stored_z * 0.1 + (1.0 / 65536.0);
+    if (((c.object_count >> 29u) & 1u) != 0u) {
+      imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
+      imageStore(motion, pixel, vec4(slot != 0u ? 10.0 * c.size_inv.x : 0.0,
+                                     on_surface ? 10.0 * c.size_inv.y : 0.0, 0.0, 0.0));
+      return;
+    }
+    if (on_surface) {
       reprojection = object_reprojections[slot];
     }
   }
@@ -4117,6 +4144,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         REXCVAR_GET(present_upscaler_reactive_shadows));
     fh1_native_executor_->SetSpinFreeWheels(REXCVAR_GET(present_upscaler_spin_free_wheels));
     fh1_native_executor_->SetShadowMotion(REXCVAR_GET(present_upscaler_shadow_motion));
+    fh1_native_executor_->SetDecalMotion(REXCVAR_GET(present_upscaler_decal_motion));
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     if (camera_wanted) {
@@ -4775,19 +4803,22 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                     << 18 |
                 uint32_t(object_debug == 2) << 19 |
                 (object_slots_readable ? fh1_native_executor_->object_shadow_slot_ready() << 20
-                                       : 0u);
+                                       : 0u) |
+                uint32_t(object_slots_readable && REXCVAR_GET(present_upscaler_decal_motion)) << 28 |
+                uint32_t(object_debug == 3) << 29;
             if ((frame_current_ % 600) == 0) {
               REXGPU_INFO(
                   "Object motion: {} slots, {} slot draws, {} without the variant, {} reactive "
-                  "draws, {} shadowed draws",
+                  "draws, {} shadowed draws, {} ground shadow draws",
                   object_count, object_slot_draws_, object_slot_fallback_draws_, reactive_draws_,
-                  reactive_shadow_draws_);
+                  reactive_shadow_draws_, decal_draws_);
             }
             camera_constants.object_depth_scale = fh1_native_executor_->camera_depth_scale();
             object_slot_draws_ = 0;
             object_slot_fallback_draws_ = 0;
             reactive_draws_ = 0;
             reactive_shadow_draws_ = 0;
+            decal_draws_ = 0;
             deferred_command_buffer_.CmdVkPushConstants(swap_camera_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(camera_constants),
@@ -6417,6 +6448,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
             : 0;
     reactive_draws_ += uint32_t((reactive & Fh1NativeExecutor::kReactiveAlpha) && !i);
     reactive_shadow_draws_ += uint32_t((reactive & Fh1NativeExecutor::kReactiveShadow) && !i);
+    decal_draws_ += uint32_t((reactive & Fh1NativeExecutor::kReactiveDecal) && !i);
     if (program_hit) {
       // NA-2.4: the recorded modifications and translations (ready when
       // recorded, and translations are never dropped).
@@ -6464,6 +6496,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           pixel_shader_modification.pixel.reactive_shadow_fetch_constant =
               kFm4GroundShadowFetchConstant;
         }
+        if (reactive & Fh1NativeExecutor::kReactiveDecal) {
+          pixel_shader_modification.pixel.decal_slot_output = 1;
+        }
         const WrapSeamBits wrap_seam = SelectWrapSeamBits(
             wrap_seam_shaders(), wrap_seam_fix(), vertex_shader->ucode_data_hash(),
             pixel_shader ? pixel_shader->ucode_data_hash() : 0,
@@ -6491,6 +6526,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
           pixel_shader_modification.pixel.reactive_output = 0;
           pixel_shader_modification.pixel.reactive_shadow = 0;
           pixel_shader_modification.pixel.reactive_shadow_fetch_constant = 0;
+          pixel_shader_modification.pixel.decal_slot_output = 0;
           pixel_shader_translation = static_cast<VulkanShader::VulkanTranslation*>(
               pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value));
           translation_request = pipeline_cache_->RequestShadersTranslated(
@@ -6932,7 +6968,8 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder &&
       (pixel_shader_modification.pixel.object_slot_output ||
        pixel_shader_modification.pixel.reactive_output ||
-       pixel_shader_modification.pixel.reactive_shadow)) {
+       pixel_shader_modification.pixel.reactive_shadow ||
+       pixel_shader_modification.pixel.decal_slot_output)) {
     // UP-1.7: the slot-writing variant's pipeline is new even when the base
     // one is cached, so waiting for it stalled the frame (up to the wait per
     // draw, over a second a frame driving into new areas). Draw with the base
@@ -6942,6 +6979,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     base_modification.pixel.reactive_output = 0;
     base_modification.pixel.reactive_shadow = 0;
     base_modification.pixel.reactive_shadow_fetch_constant = 0;
+    base_modification.pixel.decal_slot_output = 0;
     auto* base_translation = static_cast<VulkanShader::VulkanTranslation*>(
         pixel_shader->GetOrCreateTranslation(base_modification.value));
     VkPipeline base_pipeline;
@@ -9548,7 +9586,7 @@ bool VulkanCommandProcessor::CreateObjectSlotImage(uint32_t width, uint32_t heig
   image_create_info.imageType = VK_IMAGE_TYPE_2D;
   image_create_info.format = VK_FORMAT_R32_UINT;
   // The object slots, then the reactive mask's plane.
-  image_create_info.extent = {width, height * 2, 1};
+  image_create_info.extent = {width, height * SpirvShaderTranslator::kObjectSlotPlanes, 1};
   image_create_info.mipLevels = 1;
   image_create_info.arrayLayers = 1;
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;

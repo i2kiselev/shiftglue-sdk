@@ -108,6 +108,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // reactive plane like reactive_output. After it for the same reason.
       uint32_t reactive_shadow : 1;
       uint32_t reactive_shadow_fetch_constant : 5;
+      // Write the draw's object slot with the fragment depth to the object
+      // slot image's third plane where RT 0 darkens the scene it multiplies
+      // (a car part's ground shadow, fm4_decal_motion.h). Last for the same
+      // reason.
+      uint32_t decal_slot_output : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -464,9 +469,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool shared_memory_texel_buffer;
   };
   static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
-  // UP-1.7: the R32_UINT object slot image in the shared memory set: the
-  // object slots in its top half, the reactive mask's in its bottom half.
+  // UP-1.7: the R32_UINT object slot image in the shared memory set, in
+  // planes of the output's size: the object slots, the reactive mask's, and
+  // the ground shadows' slots (fm4_decal_motion.h).
   static constexpr uint32_t kObjectSlotImageBinding = 3;
+  static constexpr uint32_t kObjectSlotPlanes = 3;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments, bool edram_fragment_shader_interlock,
@@ -649,9 +656,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // At the end of a pixel shader with reactive_output writing RT 0 or with
   // reactive_shadow.
   void WriteReactiveMask();
-  // (depth << 8) | low_byte into the object slot image's plane, the largest
-  // winning.
-  void WriteObjectSlotImage(spv::Id low_byte, bool reactive_plane);
+  // At the end of a pixel shader with decal_slot_output writing RT 0.
+  void WriteDecalSlot();
+  // (depth << 8) | low_byte into one of the object slot image's three planes
+  // (kObjectSlotPlanes), the largest winning; the fragment depth times
+  // depth_scale if given.
+  void WriteObjectSlotImage(spv::Id low_byte, uint32_t plane,
+                            spv::Id depth_scale = spv::NoResult);
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.

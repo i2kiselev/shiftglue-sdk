@@ -473,7 +473,8 @@ void SpirvShaderTranslator::StartTranslation() {
       (is_pixel_shader() && !edram_fragment_shader_interlock_ &&
                (GetSpirvShaderModification().pixel.object_slot_output ||
                 GetSpirvShaderModification().pixel.reactive_output ||
-                GetSpirvShaderModification().pixel.reactive_shadow)
+                GetSpirvShaderModification().pixel.reactive_shadow ||
+                GetSpirvShaderModification().pixel.decal_slot_output)
            ? 0
            : 2);
   id_vector_temp_.clear();
@@ -3204,7 +3205,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   const bool object_slot_output =
       !edram_fragment_shader_interlock_ && (GetSpirvShaderModification().pixel.object_slot_output ||
                                             GetSpirvShaderModification().pixel.reactive_output ||
-                                            GetSpirvShaderModification().pixel.reactive_shadow);
+                                            GetSpirvShaderModification().pixel.reactive_shadow ||
+                                            GetSpirvShaderModification().pixel.decal_slot_output);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
       object_slot_output) {

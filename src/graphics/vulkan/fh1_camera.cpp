@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/graphics/fm4_camera_cut.h>
+#include <rex/graphics/fm4_decal_motion.h>
 #include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/fm4_shadow_motion.h>
@@ -165,6 +166,7 @@ struct MatrixHash {
 void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   draw_jittered_ = false;
   current_object_slot_ = 0;
+  current_decal_ = false;
   if (!camera_tracking_enabled_ || !initialized_ || !draw.vertex_shader || !draw.rasterization_done ||
       draw.memexport) {
     return;
@@ -189,13 +191,33 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                                        kObjectFirstRegister * 4],
                 sizeof(registers));
     const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
+    const bool reads_world = Fm4ReadsWorldMatrix(std::to_array(map.float_bitmap));
     if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
       if (shadow_motion_enabled_ && Fm4OrthographicMatrix(wvp)) {
         NoteShadowPart(shadow_map_parts_, draw, wvp);
       }
+      if (decal_motion_enabled_ && reads_world && camera_scene_depth_valid_ &&
+          Fm4ShadowDecalDraw(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL],
+                             register_file_.values[XE_GPU_REG_RB_BLENDCONTROL0],
+                             draw.normalized_color_mask,
+                             Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_))) {
+        const auto part = object_slot_by_world_.find(WorldMatrixKey());
+        if (part != object_slot_by_world_.end() && part->second) {
+          // Without the depth test the host keeps float24 depth unhalved (draw_util).
+          const bool full_float24 =
+              !draw.normalized_depth_control.z_enable &&
+              register_file_.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                  xenos::DepthRenderTargetFormat::kD24FS8;
+          current_object_slot_ = part->second | (full_float24 ? kObjectSlotHalveDepth : 0);
+          current_decal_ = true;
+        }
+      }
       return;
     }
     current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+    if (decal_motion_enabled_ && reads_world && current_object_slot_) {
+      object_slot_by_world_.emplace(WorldMatrixKey(), current_object_slot_);
+    }
     if (shadow_motion_enabled_) NoteShadowPart(shadow_scene_parts_, draw, wvp);
     return;
   }
@@ -211,6 +233,13 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   if (object_motion_enabled_ && IsSceneObjectDraw(*draw.vertex_shader)) {
     current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp);
   }
+}
+
+uint64_t Fh1NativeExecutor::WorldMatrixKey() const {
+  std::array<float, 16> world;
+  std::memcpy(world.data(), &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 8 * 4],
+              sizeof(world));
+  return MatrixHash()(world);
 }
 
 uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
@@ -430,6 +459,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
       std::move(object_slot_turned_votes_);
   object_slot_turned_votes_.clear();
   object_slot_by_matrix_.clear();
+  object_slot_by_world_.clear();
   object_occurrences_.clear();
   object_previous_wvp_ = std::move(object_current_wvp_);
   object_current_wvp_.clear();

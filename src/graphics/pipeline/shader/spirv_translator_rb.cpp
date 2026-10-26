@@ -988,6 +988,10 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
        GetSpirvShaderModification().pixel.reactive_shadow)) {
     WriteReactiveMask();
   }
+  if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.decal_slot_output &&
+      (color_targets_written & 0b1)) {
+    WriteDecalSlot();
+  }
 
   if (color_targets_written) {
     spv::Id fsi_color_targets_written = spv::NoResult;
@@ -3519,7 +3523,7 @@ void SpirvShaderTranslator::WriteObjectSlot() {
       spv::NoPrecision);
   WriteObjectSlotImage(
       builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot, builder_->makeUintConstant(0xFF)),
-      false);
+      0);
 }
 
 void SpirvShaderTranslator::WriteReactiveMask() {
@@ -3557,11 +3561,52 @@ void SpirvShaderTranslator::WriteReactiveMask() {
   SpirvBuilder::IfBuilder if_visible(
       builder_->createBinOp(spv::OpINotEqual, type_bool_, alpha_255, const_uint_0_),
       spv::SelectionControlMaskNone, *builder_);
-  WriteObjectSlotImage(alpha_255, true);
+  WriteObjectSlotImage(alpha_255, 1);
   if_visible.makeEndIf();
 }
 
-void SpirvShaderTranslator::WriteObjectSlotImage(spv::Id low_byte, bool reactive_plane) {
+void SpirvShaderTranslator::WriteDecalSlot() {
+  // A multiplying draw darkens the scene by one minus its colour: where that is over 2 %
+  // (the threshold of the car's own ground shadow), its slot, nearest fragment winning.
+  // The swap pass takes it where the fragment lies on the visible surface, so pixels the
+  // game's stencil kept out (a car in front, the scene behind) stay out too.
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
+  spv::Id slot = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  spv::Id darkest = const_float_1_;
+  for (int component = 0; component < 3; ++component) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(component));
+    darkest = builder_->createBinBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NMin, darkest,
+        builder_->createLoad(builder_->createAccessChain(spv::StorageClassOutput,
+                                                         output_or_var_fragment_data_[0],
+                                                         id_vector_temp_),
+                             spv::NoPrecision));
+  }
+  SpirvBuilder::IfBuilder if_darkened(
+      builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, darkest,
+                            builder_->makeFloatConstant(0.98f)),
+      spv::SelectionControlMaskNone, *builder_);
+  // Bit 8: halve the fragment depth to the scene's (Fh1NativeExecutor::kObjectSlotHalveDepth).
+  spv::Id depth_scale = builder_->createTriOp(
+      spv::OpSelect, type_float_,
+      builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot,
+                                                  builder_->makeUintConstant(0x100)),
+                            const_uint_0_),
+      builder_->makeFloatConstant(0.5f), const_float_1_);
+  WriteObjectSlotImage(
+      builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot, builder_->makeUintConstant(0xFF)),
+      2, depth_scale);
+  if_darkened.makeEndIf();
+}
+
+void SpirvShaderTranslator::WriteObjectSlotImage(spv::Id low_byte, uint32_t plane,
+                                                 spv::Id depth_scale) {
   assert_true(input_fragment_coordinates_ != spv::NoResult);
   builder_->addCapability(spv::CapabilityImageQuery);
   spv::Id type_image = builder_->makeImageType(type_uint_, spv::Dim2D, false, false, false, 2,
@@ -3596,13 +3641,17 @@ void SpirvShaderTranslator::WriteObjectSlotImage(spv::Id low_byte, bool reactive
                                     std::vector<spv::Id>{builder_->createLoad(image,
                                                                               spv::NoPrecision)});
   spv::Id plane_height =
-      builder_->createBinOp(spv::OpShiftRightArithmetic, type_int_,
+      builder_->createBinOp(spv::OpSDiv, type_int_,
                             builder_->createCompositeExtract(size, type_int_, 1),
-                            builder_->makeIntConstant(1));
+                            builder_->makeIntConstant(int(kObjectSlotPlanes)));
   id_vector_temp_.clear();
   id_vector_temp_.push_back(x);
   id_vector_temp_.push_back(
-      reactive_plane ? builder_->createBinOp(spv::OpIAdd, type_int_, y, plane_height) : y);
+      plane ? builder_->createBinOp(
+                  spv::OpIAdd, type_int_, y,
+                  builder_->createBinOp(spv::OpIMul, type_int_, plane_height,
+                                        builder_->makeIntConstant(int(plane))))
+            : y);
   spv::Id coordinates = builder_->createCompositeConstruct(type_int2_, id_vector_temp_);
   spv::Id inside = builder_->createBinOp(
       spv::OpLogicalAnd, type_bool_,
@@ -3619,9 +3668,12 @@ void SpirvShaderTranslator::WriteObjectSlotImage(spv::Id low_byte, bool reactive
     // as the camera's depth copy does).
     spv::Id depth = builder_->createUnaryOp(
         spv::OpConvertFToU, type_uint_,
-        builder_->createBinOp(spv::OpFMul, type_float_,
-                              builder_->createCompositeExtract(frag_coord, type_float_, 2),
-                              builder_->makeFloatConstant(16777215.0f)));
+        builder_->createBinOp(
+            spv::OpFMul, type_float_, builder_->createCompositeExtract(frag_coord, type_float_, 2),
+            depth_scale != spv::NoResult
+                ? builder_->createBinOp(spv::OpFMul, type_float_, depth_scale,
+                                        builder_->makeFloatConstant(16777215.0f))
+                : builder_->makeFloatConstant(16777215.0f)));
     spv::Id key = builder_->createBinOp(
         spv::OpBitwiseOr, type_uint_,
         builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, depth,
