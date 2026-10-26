@@ -25,4 +25,13 @@ bool Fm4SameColorSurface(uint64_t a, uint64_t b);
 bool Fm4JitterSceneDraw(Fm4DrawPlacement placement, bool tests_scene_depth,
                         bool writes_scene_color);
 
+// Alpha to coverage (the alpha_to_mask system constant: 2-bit dither offsets by a pixel's
+// place in its 2x2 quad, bit 8 enabled) for a draw a temporal upscaler jitters: one steady
+// threshold, 0.5, in every pixel, and the bit below turns the shader's ordered dither over a
+// guest pixel's host pixels (above 1x) off. A dither across pixels showed as hatching on leaf
+// edges wherever motion keeps the upscaler from averaging it, and a threshold varied frame to
+// frame made distant fences, trees and the showroom's background grass flicker.
+constexpr uint32_t kFm4AlphaToMaskUniformBit = 12;
+uint32_t Fm4UpscalerAlphaToMask(uint32_t alpha_to_mask);
+
 }  // namespace rex::graphics

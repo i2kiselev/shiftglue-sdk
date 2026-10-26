@@ -16,6 +16,7 @@
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
@@ -724,15 +725,25 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
                                                   uint32_t host_sample_index, float threshold_base,
                                                   float threshold_offset_scale,
                                                   bool dither) -> spv::Id {
-          spv::Id sample_threshold =
-              dither ? builder_->createBinOp(spv::OpFMul, type_float_,
-                                            dither_rank_plus_1_minus_offset,
-                                            builder_->makeFloatConstant(1.0f / float(block_pixels)))
-                     : builder_->createBinOp(
-                           spv::OpFSub, type_float_, builder_->makeFloatConstant(threshold_base),
-                           builder_->createBinOp(spv::OpFMul, type_float_,
-                                                 alpha_to_coverage_offset_float,
-                                                 builder_->makeFloatConstant(threshold_offset_scale)));
+          spv::Id sample_threshold = builder_->createBinOp(
+              spv::OpFSub, type_float_, builder_->makeFloatConstant(threshold_base),
+              builder_->createBinOp(spv::OpFMul, type_float_, alpha_to_coverage_offset_float,
+                                    builder_->makeFloatConstant(threshold_offset_scale)));
+          if (dither) {
+            // Not under a temporal upscaler (Fm4UpscalerAlphaToMask): it shows the pattern
+            // wherever motion keeps it from averaging.
+            sample_threshold = builder_->createTriOp(
+                spv::OpSelect, type_float_,
+                builder_->createBinOp(
+                    spv::OpINotEqual, type_bool_,
+                    builder_->createBinOp(
+                        spv::OpBitwiseAnd, type_uint_, alpha_to_mask,
+                        builder_->makeUintConstant(UINT32_C(1) << kFm4AlphaToMaskUniformBit)),
+                    const_uint_0_),
+                sample_threshold,
+                builder_->createBinOp(spv::OpFMul, type_float_, dither_rank_plus_1_minus_offset,
+                                      builder_->makeFloatConstant(1.0f / float(block_pixels))));
+          }
           spv::Id sample_covered = builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_,
                                                          alpha_to_coverage_alpha, sample_threshold);
           if (edram_fragment_shader_interlock_) {

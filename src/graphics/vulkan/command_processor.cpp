@@ -43,6 +43,7 @@
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/fm4_reactive_mask.h>
+#include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -110,6 +111,11 @@ REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
                     "Give a temporal upscaler spinning wheels' motion without the spin (FM4): "
                     "the spin itself is too fast to follow and drew light lines along the car "
                     "by the wheels");
+
+REXCVAR_DEFINE_BOOL(present_upscaler_uniform_alpha_to_coverage, false, "GPU",
+                    "Give alpha to coverage one steady threshold in every pixel on the scene draws "
+                    "a temporal upscaler jitters (FM4): above 1x the ordered dither showed as "
+                    "hatching on leaf edges");
 
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
                      "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's), 2 the reactive mask (red), 3 the ground shadows' slots (red: written, green: taken)");
@@ -10331,6 +10337,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   if (alpha_to_mask && host_msaa_samples < rb_surface_info.msaa_samples &&
       REXCVAR_GET(fh1_stable_alpha_to_coverage)) {
     alpha_to_mask = 0xAA | (UINT32_C(1) << 8);
+  }
+  float jitter_x, jitter_y;
+  if (alpha_to_mask && host_msaa_samples == xenos::MsaaSamples::k1X &&
+      REXCVAR_GET(present_upscaler_uniform_alpha_to_coverage) && fh1_native_executor_ &&
+      fh1_native_executor_->GetSceneJitter(jitter_x, jitter_y)) {
+    alpha_to_mask = Fm4UpscalerAlphaToMask(alpha_to_mask);
   }
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;

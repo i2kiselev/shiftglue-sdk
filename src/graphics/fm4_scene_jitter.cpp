@@ -19,4 +19,9 @@ bool Fm4JitterSceneDraw(Fm4DrawPlacement placement, bool tests_scene_depth,
   return placement != Fm4DrawPlacement::kUnplaced && (tests_scene_depth || writes_scene_color);
 }
 
+uint32_t Fm4UpscalerAlphaToMask(uint32_t alpha_to_mask) {
+  if (!alpha_to_mask) return 0;
+  return (alpha_to_mask & ~UINT32_C(0xFF)) | 0xAA | UINT32_C(1) << kFm4AlphaToMaskUniformBit;
+}
+
 }  // namespace rex::graphics

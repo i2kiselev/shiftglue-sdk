@@ -52,3 +52,12 @@ TEST_CASE("Scene jitter takes placed draws on the scene's depth or colour", "[ji
   // A full-screen pass on the scene would leave a strip of the edge unwritten when moved.
   CHECK_FALSE(Fm4JitterSceneDraw(Fm4DrawPlacement::kUnplaced, true, true));
 }
+
+TEST_CASE("Upscaler alpha to coverage takes one steady threshold", "[alpha_dither]") {
+  CHECK(Fm4UpscalerAlphaToMask(0) == 0);
+  constexpr uint32_t kUniform = 1u << kFm4AlphaToMaskUniformBit;
+  // The guest's dither offsets (0, 2, 3, 1 by the pixel's place in its quad) become offset 2,
+  // threshold 0.5, in every pixel, and the shader's ordered dither is turned off.
+  CHECK(Fm4UpscalerAlphaToMask(0x78 | (1 << 8)) == (0xAA | (1u << 8) | kUniform));
+  CHECK(Fm4UpscalerAlphaToMask(0xAA | (1 << 8)) == (0xAA | (1u << 8) | kUniform));
+}
