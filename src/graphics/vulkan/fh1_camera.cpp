@@ -14,11 +14,13 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/graphics/fm4_camera_cut.h>
 #include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
+#include <rex/graphics/fm4_shadow_motion.h>
 #include <rex/graphics/fm4_wheel_motion.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
@@ -177,16 +179,24 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                              Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
   if (DrawObjectMatrixRegister(*draw.vertex_shader) != kCameraFirstRegister) {
     // UP-1.7: a car, with its own matrix in c0-c3.
-    if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) return;
-    if (object_motion_enabled_) {
-      std::array<float, 16> registers;
-      std::memcpy(registers.data(),
-                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
-                                         kObjectFirstRegister * 4],
-                  sizeof(registers));
-      const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
-      current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+    if (!object_motion_enabled_ ||
+        DrawObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
+      return;
     }
+    std::array<float, 16> registers;
+    std::memcpy(registers.data(),
+                &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                       kObjectFirstRegister * 4],
+                sizeof(registers));
+    const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
+    if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
+      if (shadow_motion_enabled_ && Fm4OrthographicMatrix(wvp)) {
+        NoteShadowPart(shadow_map_parts_, draw, wvp);
+      }
+      return;
+    }
+    current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+    if (shadow_motion_enabled_) NoteShadowPart(shadow_scene_parts_, draw, wvp);
     return;
   }
   if (!draw.normalized_depth_control.z_enable) return;
@@ -213,6 +223,37 @@ uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
     object ^= (uint64_t(fetch.address) << 2) * 0x9E3779B97F4A7C15ull;
   }
   return object;
+}
+
+void Fh1NativeExecutor::NoteShadowPart(std::unordered_map<uint32_t, ShadowPart>& parts,
+                                       const Fh1DrawInfo& draw,
+                                       const std::array<float, 16>& wvp) {
+  // The car's shadow map pass draws its meshes with shaders of its own, from the same vertex
+  // buffers.
+  const auto& bindings = draw.vertex_shader->vertex_bindings();
+  if (bindings.empty()) return;
+  ShadowPart& part =
+      parts[register_file_.GetVertexFetch(bindings.front().fetch_constant).address];
+  part.wvp = wvp;
+  ++part.draws;
+}
+
+std::optional<std::array<double, 16>> Fh1NativeExecutor::TakeShadowToScene() {
+  // Meshes drawn once in each: a wheel mesh is drawn at all four corners.
+  std::vector<std::pair<std::array<float, 16>, std::array<float, 16>>> pairs;
+  for (const auto& [address, shadow] : shadow_map_parts_) {
+    const auto scene = shadow_scene_parts_.find(address);
+    if (shadow.draws == 1 && scene != shadow_scene_parts_.end() && scene->second.draws == 1) {
+      pairs.emplace_back(scene->second.wvp, shadow.wvp);
+    }
+  }
+  if ((frame_ % 600) == 0 && shadow_motion_enabled_) {
+    REXGPU_INFO("FH1 camera: ground shadow from {} of {} shadow map meshes", pairs.size(),
+                shadow_map_parts_.size());
+  }
+  shadow_map_parts_.clear();
+  shadow_scene_parts_.clear();
+  return Fm4ShadowToScene(pairs);
 }
 
 uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp) {
@@ -287,8 +328,8 @@ bool Fh1NativeExecutor::IsSceneReactiveDraw() const {
 
 bool Fh1NativeExecutor::IsSceneShadowedDraw(const Shader& pixel_shader) const {
   constexpr uint32_t kZEnable = 1u << 1;
-  if (!reactive_shadows_enabled_ || !object_motion_enabled_ || !camera_tracking_enabled_ ||
-      !camera_scene_depth_valid_ ||
+  if ((!reactive_shadows_enabled_ && !shadow_motion_enabled_) || !object_motion_enabled_ ||
+      !camera_tracking_enabled_ || !camera_scene_depth_valid_ ||
       !(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL] & kZEnable) ||
       CurrentDepthKey() != camera_scene_depth_ ||
       !Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_)) {
@@ -393,6 +434,10 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   object_previous_wvp_ = std::move(object_current_wvp_);
   object_current_wvp_.clear();
   object_reprojections_ready_.clear();
+  object_shadow_slot_ready_ = 0;
+  const std::optional<std::array<double, 16>> shadow_to_scene = TakeShadowToScene();
+  const std::optional<std::array<double, 16>> shadow_to_scene_previous =
+      std::exchange(shadow_to_scene_previous_, shadow_to_scene);
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
     camera_draws_.clear();
@@ -526,6 +571,17 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera_ready_valid_ = true;
   camera_previous_objects_ = std::move(objects);
   if (!camera.cut) {
+    if (shadow_to_scene && shadow_to_scene_previous) {
+      if (const std::optional<Matrix> shadow =
+              Fm4ShadowReprojection(*shadow_to_scene_previous, *shadow_to_scene)) {
+        if (object_reprojections.empty()) object_reprojections.emplace_back();
+        if (object_reprojections.size() < kMaxObjectSlots) {
+          object_shadow_slot_ready_ = uint32_t(object_reprojections.size());
+          std::array<float, 16>& matrix = object_reprojections.emplace_back();
+          for (size_t i = 0; i < 16; ++i) matrix[i] = float((*shadow)[i]);
+        }
+      }
+    }
     if (object_reprojections.size() > 1) Count("camera_object_frame");
     if ((frame_ % 600) == 0) {
       REXGPU_INFO("FH1 camera: {} object reprojections",

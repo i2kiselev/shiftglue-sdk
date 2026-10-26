@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
@@ -192,6 +193,9 @@ class Fh1NativeExecutor {
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
   // Spinning objects (wheels) move with their origin (Fm4SpinFreeReprojection).
   void SetSpinFreeWheels(bool enabled) { spin_free_wheels_ = enabled; }
+  // The car's ground shadow moves with the shadow map (Fm4ShadowReprojection): the shadowed
+  // draws mark the second plane, and the shadow's reprojection is a slot of its own.
+  void SetShadowMotion(bool enabled) { shadow_motion_enabled_ = enabled; }
   bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
@@ -223,6 +227,8 @@ class Fh1NativeExecutor {
   const std::vector<std::array<float, 16>>& object_reprojections_ready() const {
     return object_reprojections_ready_;
   }
+  // The ground shadow's slot in that table, 0 without one.
+  uint32_t object_shadow_slot_ready() const { return object_shadow_slot_ready_; }
   // Host depth to the camera depth copy's (float24 depth is kept halved).
   float camera_depth_scale() const { return camera_depth_scale_; }
 
@@ -605,6 +611,7 @@ class Fh1NativeExecutor {
   bool reactive_mask_enabled_ = false;
   bool reactive_shadows_enabled_ = false;
   bool spin_free_wheels_ = true;
+  bool shadow_motion_enabled_ = false;
   float camera_depth_scale_ = 1.0f;
   uint32_t current_object_slot_ = 0;
   std::vector<std::array<float, 16>> object_reprojections_;
@@ -619,6 +626,20 @@ class Fh1NativeExecutor {
   std::unordered_map<uint64_t, std::array<float, 16>> object_current_wvp_;
   std::unordered_map<uint64_t, std::array<float, 16>> object_previous_wvp_;
   std::vector<std::array<float, 16>> object_reprojections_ready_;
+  uint32_t object_shadow_slot_ready_ = 0;
+  // The car's meshes this frame by vertex buffer: their matrices in the scene and in the
+  // shadow map pass, and how often each was drawn there (once to be matched); the last
+  // frame's shadow map to scene clip space (Fm4ShadowToScene).
+  struct ShadowPart {
+    std::array<float, 16> wvp;
+    uint32_t draws = 0;
+  };
+  std::unordered_map<uint32_t, ShadowPart> shadow_scene_parts_;
+  std::unordered_map<uint32_t, ShadowPart> shadow_map_parts_;
+  std::optional<std::array<double, 16>> shadow_to_scene_previous_;
+  void NoteShadowPart(std::unordered_map<uint32_t, ShadowPart>& parts, const Fh1DrawInfo& draw,
+                      const std::array<float, 16>& wvp);
+  std::optional<std::array<double, 16>> TakeShadowToScene();
   uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp);
   // The first register of the draw's world-view-projection (c128 the
   // camera's, c0 a car's own), UINT32_MAX without one.

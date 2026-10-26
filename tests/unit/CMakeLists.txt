@@ -51,6 +51,7 @@ add_executable(unit_tests
     graphics/fm4_scene_jitter_test.cpp
     graphics/fm4_reactive_mask_test.cpp
     graphics/fm4_wheel_motion_test.cpp
+    graphics/fm4_shadow_motion_test.cpp
     ui/presentation_pacer_test.cpp
 )
 
@@ -69,6 +70,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_scene_jitter.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_reactive_mask.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/fm4_wheel_motion.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/fm4_shadow_motion.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp

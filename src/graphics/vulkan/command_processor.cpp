@@ -96,6 +96,10 @@ REXCVAR_DEFINE_BOOL(present_upscaler_reactive_shadows, false, "GPU",
                     "reactive mask, how deep in the shadow each pixel is (with "
                     "present_upscaler_object_motion)");
 
+REXCVAR_DEFINE_BOOL(present_upscaler_shadow_motion, true, "GPU",
+                    "Give a temporal upscaler the car's ground shadow's own motion (FM4): with "
+                    "the ground's, DLSS drew thin light lines across the shadow in reverse look");
+
 REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
                     "Give a temporal upscaler spinning wheels' motion as their hubs' (FM4): "
                     "the spin itself is too fast to follow and drew light lines along the car "
@@ -3620,8 +3624,9 @@ layout(push_constant) uniform SwapCameraConstants {
   vec2 size_inv;
   // UP-1.7: the slots in the table (0: camera motion only), bit 16 the slot
   // debug view, bit 17 a scene drawn upright, bit 18 the reactive plane
-  // written, bit 19 its debug view; and the object slot depth (host) to the
-  // source depth's scale.
+  // written for the mask, bit 19 its debug view, bits 20-27 the ground
+  // shadow's slot (0: none); and the object slot depth (host) to the source
+  // depth's scale.
   uint object_count;
   float object_depth_scale;
 } c;
@@ -3629,7 +3634,7 @@ layout(set = 0, binding = 0) uniform texture2D source_depth;
 layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
 layout(set = 0, binding = 2, rg16f) writeonly uniform image2D motion;
 // The object slots, and below them the reactive plane: the nearest
-// alpha-blended fragment's (depth << 8) | alpha.
+// alpha-blended or shadowed fragment's (depth << 8) | alpha or shadow depth.
 layout(set = 0, binding = 3, r32ui) readonly uniform uimage2D object_slots;
 layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
   layout(row_major) mat4 object_reprojections[];
@@ -3654,14 +3659,17 @@ void main() {
   float stored_z = texelFetch(source_depth, scene_pixel, 0).r;
   float z = 1.0 - stored_z;
   // The blended fragment counts where the scene's depth does not hide it.
-  float reactive_value = 0.0;
-  if (((c.object_count >> 18u) & 1u) != 0u && all(lessThan(scene_pixel, slots_size))) {
+  bool reactive_output = ((c.object_count >> 18u) & 1u) != 0u;
+  uint shadow_slot = (c.object_count >> 20u) & 0xFFu;
+  float plane_value = 0.0;
+  if ((reactive_output || shadow_slot != 0u) && all(lessThan(scene_pixel, slots_size))) {
     uint key = imageLoad(object_slots, scene_pixel + ivec2(0, slots_size.y)).r;
     if (key != 0u &&
         float(key >> 8u) * (c.object_depth_scale / 16777215.0) > stored_z - (1.0 / 65536.0)) {
-      reactive_value = float(key & 0xFFu) / 255.0;
+      plane_value = float(key & 0xFFu) / 255.0;
     }
   }
+  float reactive_value = reactive_output ? plane_value : 0.0;
   imageStore(reactive, pixel, vec4(reactive_value, 0.0, 0.0, 0.0));
   if (((c.object_count >> 19u) & 1u) != 0u) {
     imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
@@ -3691,6 +3699,10 @@ void main() {
             (1.0 / 65536.0)) {
       reprojection = object_reprojections[slot];
     }
+  }
+  // The car's ground shadow moves with the car, not with the ground it falls on.
+  if (shadow_slot != 0u && shadow_slot < object_count && plane_value > 0.02) {
+    reprojection = object_reprojections[shadow_slot];
   }
   vec2 uv = (vec2(pixel) + 0.5) * c.size_inv;
   vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -4097,6 +4109,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     fh1_native_executor_->SetReactiveShadowsEnabled(
         REXCVAR_GET(present_upscaler_reactive_shadows));
     fh1_native_executor_->SetSpinFreeWheels(REXCVAR_GET(present_upscaler_spin_free_wheels));
+    fh1_native_executor_->SetShadowMotion(REXCVAR_GET(present_upscaler_shadow_motion));
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     if (camera_wanted) {
@@ -4753,7 +4766,9 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 uint32_t(object_slots_readable && (REXCVAR_GET(present_upscaler_reactive_mask) ||
                                                    REXCVAR_GET(present_upscaler_reactive_shadows)))
                     << 18 |
-                uint32_t(object_debug == 2) << 19;
+                uint32_t(object_debug == 2) << 19 |
+                (object_slots_readable ? fh1_native_executor_->object_shadow_slot_ready() << 20
+                                       : 0u);
             if ((frame_current_ % 600) == 0) {
               REXGPU_INFO(
                   "Object motion: {} slots, {} slot draws, {} without the variant, {} reactive "

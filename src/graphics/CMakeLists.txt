@@ -30,6 +30,7 @@ set(REXGPU_XENOS_SOURCES
     fm4_scene_jitter.cpp
     fm4_reactive_mask.cpp
     fm4_wheel_motion.cpp
+    fm4_shadow_motion.cpp
     fm4_resolve_readbacks.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
