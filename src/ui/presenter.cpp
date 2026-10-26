@@ -1054,10 +1054,15 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     bool temporal_quality_mode_forced =
         is_temporal_effect &&
         config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto;
+    // A temporal upscaler also runs at 1:1, as DLAA or native AA; only a
+    // downscale, which it cannot do, is left to CAS.
+    const bool temporal_fits = is_temporal_effect &&
+                               ffx_last_size.first <= output_width_clamped &&
+                               ffx_last_size.second <= output_height_clamped;
     if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr || is_temporal_effect) &&
         ((ffx_last_size.first < output_width_clamped ||
           ffx_last_size.second < output_height_clamped) ||
-         temporal_quality_mode_forced)) {
+         temporal_quality_mode_forced || temporal_fits)) {
       // AMD FidelityFX Super Resolution - upsample along at least one axis.
       // Using the output size clamped to the maximum render target size here as
       // EASU will always write to intermediate images, and RCAS supports only
