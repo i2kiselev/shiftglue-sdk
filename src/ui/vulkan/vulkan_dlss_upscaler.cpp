@@ -34,9 +34,11 @@ REXCVAR_DEFINE_STRING(present_dlss_runtime, "", "UI/Presenter",
                       "Folder holding the DLSS runtime (nvngx_dlss.dll); empty searches "
                       "upscalers/dlss/<version> next to the executable, newest first");
 
-REXCVAR_DEFINE_STRING(present_dlss_preset, "default", "UI/Presenter",
-                      "DLSS preset: default (the DLSS runtime's choice per mode, and the one the "
-                      "NVIDIA app's override replaces), j, k, l or m")
+REXCVAR_DEFINE_STRING(present_dlss_preset, "k", "UI/Presenter",
+                      "DLSS preset: k (the transformer model; FM4's tyre smoke over fast ground "
+                      "breaks into blocks with the runtime's Performance choice and with m), "
+                      "default (the DLSS runtime's choice per mode, and the one the NVIDIA app's "
+                      "override replaces), j, l or m")
     .allowed({"default", "j", "k", "l", "m"});
 
 REXCVAR_DEFINE_INT32(present_dlss_jitter_sign, 0, "UI/Presenter",
