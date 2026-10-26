@@ -1,66 +1,76 @@
 #include <rex/graphics/fm4_wheel_motion.h>
 
-#include <algorithm>
 #include <cmath>
 
 namespace rex::graphics {
 
 namespace {
 
-// A turn of more than about 14 degrees a frame on the screen: a car body turns under a degree,
-// a wheel rolling at 30 km/h at 120 fps about 12.
-constexpr double kSpinRatio = 0.25;
-// Object-space probes around the origin, in metres: a wheel's size.
-constexpr double kProbeRadius = 0.25;
+// More than 5 degrees a frame about the axle: a wheel rolling at about 12 km/h at 120 fps.
+// Below it the spin is slow enough for an upscaler to follow; a car body pitches far less.
+constexpr double kMinSpin = 0.087;
+// The axle may swing by up to about 11 degrees a frame (steering, a car's turn); a turn about
+// another axis is not a wheel's spin.
+constexpr double kMinAxleCosine = 0.98;
 
-struct Point {
-  double x, y;
-  bool valid;
-};
+using Matrix3 = std::array<double, 9>;
 
-Point Project(const std::array<float, 16>& m, double x, double y, double z) {
-  double clip[4];
-  for (int r = 0; r < 4; ++r) {
-    clip[r] = m[r * 4] * x + m[r * 4 + 1] * y + m[r * 4 + 2] * z + m[r * 4 + 3];
+Matrix3 Upper(const std::array<float, 16>& m) {
+  return {m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]};
+}
+
+bool Invert(const Matrix3& m, Matrix3& out) {
+  const double c0 = m[4] * m[8] - m[5] * m[7];
+  const double c1 = m[5] * m[6] - m[3] * m[8];
+  const double c2 = m[3] * m[7] - m[4] * m[6];
+  const double determinant = m[0] * c0 + m[1] * c1 + m[2] * c2;
+  if (std::abs(determinant) < 1e-12) return false;
+  const double inverse = 1.0 / determinant;
+  out = {c0 * inverse,
+         (m[2] * m[7] - m[1] * m[8]) * inverse,
+         (m[1] * m[5] - m[2] * m[4]) * inverse,
+         c1 * inverse,
+         (m[0] * m[8] - m[2] * m[6]) * inverse,
+         (m[2] * m[3] - m[0] * m[5]) * inverse,
+         c2 * inverse,
+         (m[1] * m[6] - m[0] * m[7]) * inverse,
+         (m[0] * m[4] - m[1] * m[3]) * inverse};
+  return true;
+}
+
+Matrix3 Multiply(const Matrix3& a, const Matrix3& b) {
+  Matrix3 out = {};
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      for (int k = 0; k < 3; ++k) out[r * 3 + c] += a[r * 3 + k] * b[k * 3 + c];
+    }
   }
-  if (clip[3] <= 1.0e-6) return {0.0, 0.0, false};
-  return {clip[0] / clip[3], clip[1] / clip[3], true};
+  return out;
 }
 
 }  // namespace
 
-std::optional<std::array<double, 16>> Fm4SpinFreeReprojection(
-    const std::array<float, 16>& previous_wvp, const std::array<float, 16>& current_wvp) {
-  const Point origin_now = Project(current_wvp, 0.0, 0.0, 0.0);
-  const Point origin_before = Project(previous_wvp, 0.0, 0.0, 0.0);
-  if (!origin_now.valid || !origin_before.valid) return std::nullopt;
-  // How far each axis probe turns about the origin on the screen, against its distance from
-  // it; an axis seen end-on says nothing.
-  double offsets[3] = {}, turns[3] = {};
-  for (int axis = 0; axis < 3; ++axis) {
-    const double probe[3] = {axis == 0 ? kProbeRadius : 0.0, axis == 1 ? kProbeRadius : 0.0,
-                             axis == 2 ? kProbeRadius : 0.0};
-    const Point now = Project(current_wvp, probe[0], probe[1], probe[2]);
-    const Point before = Project(previous_wvp, probe[0], probe[1], probe[2]);
-    if (!now.valid || !before.valid) return std::nullopt;
-    const double now_x = now.x - origin_now.x, now_y = now.y - origin_now.y;
-    offsets[axis] = std::hypot(now_x, now_y);
-    turns[axis] =
-        std::hypot(before.x - origin_before.x - now_x, before.y - origin_before.y - now_y);
+std::optional<std::array<double, 16>> Fm4SpinFreePreviousWvp(
+    const std::array<float, 16>& previous_wvp, const std::array<float, 16>& previous_world,
+    const std::array<float, 16>& current_world) {
+  // The turn from the previous frame's object space to this frame's.
+  Matrix3 previous_inverse;
+  if (!Invert(Upper(previous_world), previous_inverse)) return std::nullopt;
+  const Matrix3 turn = Multiply(previous_inverse, Upper(current_world));
+  if (turn[0] < kMinAxleCosine) return std::nullopt;
+  const double spin = std::atan2(turn[7] - turn[5], turn[4] + turn[8]);
+  if (std::abs(spin) <= kMinSpin) return std::nullopt;
+  // The previous frame's matrix with this frame's spin: x unchanged, y and z turned.
+  const double c = std::cos(spin), s = std::sin(spin);
+  std::array<double, 16> out;
+  for (int r = 0; r < 4; ++r) {
+    const double y = previous_wvp[r * 4 + 1], z = previous_wvp[r * 4 + 2];
+    out[r * 4] = previous_wvp[r * 4];
+    out[r * 4 + 1] = y * c + z * s;
+    out[r * 4 + 2] = z * c - y * s;
+    out[r * 4 + 3] = previous_wvp[r * 4 + 3];
   }
-  const double longest = std::max({offsets[0], offsets[1], offsets[2]});
-  if (longest <= 0.0) return std::nullopt;
-  bool spins = false;
-  for (int axis = 0; axis < 3; ++axis) {
-    if (offsets[axis] >= 0.25 * longest && turns[axis] > kSpinRatio * offsets[axis]) {
-      spins = true;
-    }
-  }
-  if (!spins) return std::nullopt;
-  return std::array<double, 16>{1.0, 0.0, 0.0, origin_before.x - origin_now.x,
-                                0.0, 1.0, 0.0, origin_before.y - origin_now.y,
-                                0.0, 0.0, 1.0, 0.0,
-                                0.0, 0.0, 0.0, 1.0};
+  return out;
 }
 
 }  // namespace rex::graphics

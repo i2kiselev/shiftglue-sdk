@@ -634,10 +634,13 @@ class Fh1NativeExecutor {
   std::vector<std::array<uint32_t, 2>> object_slot_turned_votes_;
   std::unordered_map<uint64_t, uint32_t> object_slot_by_matrix_;
   // Draws of each mesh so far this frame, and each draw's matrix by mesh
-  // and order this frame and the last.
+  // and order this frame and the last; its world matrix too when the draw
+  // reads one (Fm4SpinFreePreviousWvp).
   std::unordered_map<uint64_t, uint32_t> object_occurrences_;
   std::unordered_map<uint64_t, std::array<float, 16>> object_current_wvp_;
   std::unordered_map<uint64_t, std::array<float, 16>> object_previous_wvp_;
+  std::unordered_map<uint64_t, std::array<float, 16>> object_current_world_;
+  std::unordered_map<uint64_t, std::array<float, 16>> object_previous_world_;
   std::vector<std::array<float, 16>> object_reprojections_ready_;
   uint32_t object_shadow_slot_ready_ = 0;
   // The car's meshes this frame by vertex buffer: their matrices in the scene and in the
@@ -653,7 +656,8 @@ class Fh1NativeExecutor {
   void NoteShadowPart(std::unordered_map<uint32_t, ShadowPart>& parts, const Fh1DrawInfo& draw,
                       const std::array<float, 16>& wvp);
   std::optional<std::array<double, 16>> TakeShadowToScene();
-  uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp);
+  uint32_t AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp,
+                            const std::optional<std::array<float, 16>>& world);
   // The first register of the draw's world-view-projection (c128 the
   // camera's, c0 a car's own), UINT32_MAX without one.
   uint32_t DrawObjectMatrixRegister(const Shader& vertex_shader) const;

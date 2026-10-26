@@ -107,7 +107,7 @@ REXCVAR_DEFINE_BOOL(present_upscaler_decal_motion, true, "GPU",
                     "fizzled at the tyres");
 
 REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
-                    "Give a temporal upscaler spinning wheels' motion as their hubs' (FM4): "
+                    "Give a temporal upscaler spinning wheels' motion without the spin (FM4): "
                     "the spin itself is too fast to follow and drew light lines along the car "
                     "by the wheels");
 

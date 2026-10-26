@@ -214,7 +214,15 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
       }
       return;
     }
-    current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp);
+    std::optional<std::array<float, 16>> world;
+    if (reads_world) {
+      std::array<float, 16> world_registers;
+      std::memcpy(world_registers.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 8 * 4],
+                  sizeof(world_registers));
+      world = Fm4ObjectMatrix(world_registers);
+    }
+    current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp, world);
     if (decal_motion_enabled_ && reads_world && current_object_slot_) {
       object_slot_by_world_.emplace(WorldMatrixKey(), current_object_slot_);
     }
@@ -231,7 +239,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   noted.color_key = CurrentColorKey();
   if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
   if (object_motion_enabled_ && IsSceneObjectDraw(*draw.vertex_shader)) {
-    current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp);
+    current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp, std::nullopt);
   }
 }
 
@@ -285,25 +293,29 @@ std::optional<std::array<double, 16>> Fh1NativeExecutor::TakeShadowToScene() {
   return Fm4ShadowToScene(pairs);
 }
 
-uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp) {
+uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp,
+                                             const std::optional<std::array<float, 16>>& world) {
   // One mesh drawn several times a frame (a car's four wheels, or each
   // predicated tile's band) is told apart by its order among the draws of
   // that mesh, which a frame repeats.
   const uint64_t key = object ^ (uint64_t(object_occurrences_[object]++) + 1) *
                                     0xC2B2AE3D27D4EB4Full;
   object_current_wvp_.emplace(key, wvp);
+  if (world) object_current_world_.emplace(key, *world);
   uint32_t slot = 0;
   // Objects new this frame keep the camera's motion (slot 0).
   auto previous = object_previous_wvp_.find(key);
   Matrix current_inverse;
   if (previous != object_previous_wvp_.end() && Invert(ToMatrix(wvp), current_inverse)) {
-    Matrix reprojection = Multiply(ToMatrix(previous->second), current_inverse);
-    if (spin_free_wheels_) {
+    Matrix previous_wvp = ToMatrix(previous->second);
+    const auto previous_world = object_previous_world_.find(key);
+    if (spin_free_wheels_ && world && previous_world != object_previous_world_.end()) {
       if (const std::optional<Matrix> spin_free =
-              Fm4SpinFreeReprojection(previous->second, wvp)) {
-        reprojection = *spin_free;
+              Fm4SpinFreePreviousWvp(previous->second, previous_world->second, *world)) {
+        previous_wvp = *spin_free;
       }
     }
+    const Matrix reprojection = Multiply(previous_wvp, current_inverse);
     std::array<float, 16> matrix;
     for (size_t i = 0; i < 16; ++i) matrix[i] = float(reprojection[i]);
     // Objects that move with the world (most props and the world's own
@@ -463,6 +475,8 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   object_occurrences_.clear();
   object_previous_wvp_ = std::move(object_current_wvp_);
   object_current_wvp_.clear();
+  object_previous_world_ = std::move(object_current_world_);
+  object_current_world_.clear();
   object_reprojections_ready_.clear();
   object_shadow_slot_ready_ = 0;
   const std::optional<std::array<double, 16>> shadow_to_scene = TakeShadowToScene();
