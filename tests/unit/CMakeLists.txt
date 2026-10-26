@@ -53,6 +53,7 @@ add_executable(unit_tests
     graphics/fm4_wheel_motion_test.cpp
     graphics/fm4_shadow_motion_test.cpp
     ui/presentation_pacer_test.cpp
+    ui/fm4_dlss_preset_test.cpp
 )
 
 target_sources(unit_tests PRIVATE
@@ -74,6 +75,7 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/util/draw.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/util.cpp
     ${PROJECT_SOURCE_DIR}/src/ui/graphics_util.cpp
+    ${PROJECT_SOURCE_DIR}/src/ui/fm4_dlss_preset.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp

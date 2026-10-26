@@ -23,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/ui/fm4_dlss_preset.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/instance.h>
 
@@ -34,12 +35,11 @@ REXCVAR_DEFINE_STRING(present_dlss_runtime, "", "UI/Presenter",
                       "Folder holding the DLSS runtime (nvngx_dlss.dll); empty searches "
                       "upscalers/dlss/<version> next to the executable, newest first");
 
-REXCVAR_DEFINE_STRING(present_dlss_preset, "k", "UI/Presenter",
-                      "DLSS preset: k (the transformer model; FM4's tyre smoke over fast ground "
-                      "breaks into blocks with the runtime's Performance choice and with m), "
-                      "default (the DLSS runtime's choice per mode, and the one the NVIDIA app's "
-                      "override replaces), j, l or m")
-    .allowed({"default", "j", "k", "l", "m"});
+REXCVAR_DEFINE_STRING(present_dlss_preset, "auto", "UI/Presenter",
+                      "DLSS preset: auto (m from Performance mode on RTX 40 and later, k "
+                      "otherwise; fm4_dlss_preset.h), default (the DLSS runtime's choice per "
+                      "mode, and the one the NVIDIA app's override replaces), j, k, l or m")
+    .allowed({"auto", "default", "j", "k", "l", "m"});
 
 REXCVAR_DEFINE_INT32(present_dlss_jitter_sign, 0, "UI/Presenter",
                      "Debug: negate the jitter DLSS is given, 1 for x, 2 for y, 3 for both")
@@ -181,8 +181,13 @@ NVSDK_NGX_PerfQuality_Value PerfQualityForRatio(float ratio) {
   return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
 }
 
-NVSDK_NGX_DLSS_Hint_Render_Preset PresetFromCvar() {
+NVSDK_NGX_DLSS_Hint_Render_Preset PresetFromCvar(uint32_t device_id, float ratio) {
   const std::string preset = REXCVAR_GET(present_dlss_preset);
+  if (preset == "auto") {
+    return Fm4DlssAutoPreset(device_id, ratio) == Fm4DlssPreset::kM
+               ? NVSDK_NGX_DLSS_Hint_Render_Preset_M
+               : NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+  }
   if (preset == "j") return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
   if (preset == "k") return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
   if (preset == "l") return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
@@ -268,7 +273,9 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     if (!info_.available) {
       return false;
     }
-    const NVSDK_NGX_DLSS_Hint_Render_Preset preset = PresetFromCvar();
+    const NVSDK_NGX_DLSS_Hint_Render_Preset preset =
+        PresetFromCvar(device_->properties().deviceID,
+                       max_render_width ? float(max_output_width) / float(max_render_width) : 1.0f);
     if (feature_ && (max_render_width != render_width_ || max_render_height != render_height_ ||
                      max_output_width != output_width_ || max_output_height != output_height_ ||
                      hdr != hdr_ || preset != preset_)) {
