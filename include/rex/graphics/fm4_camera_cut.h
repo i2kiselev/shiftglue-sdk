@@ -31,6 +31,21 @@ double Fm4ReprojectedScreenShift(const std::array<double, 16>& reprojection, dou
 // slot_draws[0] counts the draws without a slot.
 uint32_t Fm4CameraObjectSlot(const std::vector<uint32_t>& slot_draws, uint32_t min_draws);
 
+// A depth surface the camera's matrix draws tested against in a frame.
+struct Fm4DepthCandidate {
+  uint32_t key;
+  // Guest pixels.
+  uint32_t width;
+  size_t draws;
+};
+
+// The scene's depth among a frame's candidates: the widest, then the most draws. FM4's
+// replays render the car's reflection cube (280 pixels wide) with more camera draws than a
+// long-lens replay camera's scene (1280), and picking by draws alone made the cube's 90-degree
+// face the camera on most replay frames: a cut each time, its depth and the jitter's sign
+// handed to the upscaler. 0 when there are none.
+uint32_t Fm4SceneDepth(const std::vector<Fm4DepthCandidate>& candidates);
+
 // An object's world-view-projection, row-major for column vectors as the camera's c128-c131
 // are, from its c0-c3. FM4's object shaders take the registers as columns (x * c0 + y * c1 +
 // z * c2 + c3); read as rows, every moving car's reprojection was wrong.

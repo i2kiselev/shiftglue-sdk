@@ -98,6 +98,20 @@ TEST_CASE("the camera's motion is the object reprojection most draws share",
   CHECK(Fm4CameraObjectSlot({500, 10, 12}, 16) == 0);
   CHECK(Fm4CameraObjectSlot({}, 16) == 0);
 }
+TEST_CASE("the scene's depth is the widest the camera draws test, not the busiest",
+          "[graphics][camera]") {
+  // A replay's long-lens camera at 1x: the reflection cube (280 wide) has 228 camera draws, the
+  // scene (1280) 108, a shadow map (320) 9.
+  CHECK(Fm4SceneDepth({{0x00203800, 560, 2},
+                       {0x00306800, 520, 1},
+                       {0x00602040, 320, 9},
+                       {0x007038E0, 280, 228},
+                       {0x006082D0, 1280, 108}}) == 0x006082D0);
+  // Equal widths: the most draws.
+  CHECK(Fm4SceneDepth({{1, 1280, 3}, {2, 1280, 40}, {3, 320, 90}}) == 2);
+  CHECK(Fm4SceneDepth({}) == 0);
+}
+
 TEST_CASE("an object's matrix registers are the columns of its world-view-projection",
           "[graphics][camera]") {
   // c0-c3 of an AI car 33 m ahead, logged in a race at 1x: c3 is where the car's origin

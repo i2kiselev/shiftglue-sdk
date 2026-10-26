@@ -38,6 +38,17 @@ uint32_t Fm4CameraObjectSlot(const std::vector<uint32_t>& slot_draws, uint32_t m
   return best;
 }
 
+uint32_t Fm4SceneDepth(const std::vector<Fm4DepthCandidate>& candidates) {
+  const Fm4DepthCandidate* best = nullptr;
+  for (const Fm4DepthCandidate& candidate : candidates) {
+    if (!best || candidate.width > best->width ||
+        (candidate.width == best->width && candidate.draws > best->draws)) {
+      best = &candidate;
+    }
+  }
+  return best ? best->key : 0;
+}
+
 std::array<float, 16> Fm4ObjectMatrix(const std::array<float, 16>& registers) {
   std::array<float, 16> rows;
   for (int r = 0; r < 4; ++r) {

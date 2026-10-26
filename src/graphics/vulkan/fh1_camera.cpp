@@ -368,13 +368,14 @@ void Fh1NativeExecutor::FinishCameraFrame() {
     camera_previous_objects_.clear();
     return;
   }
-  // The scene's depth: the one most of the matrix draws test against.
   std::unordered_map<uint32_t, size_t> depth_counts;
   for (const CameraDraw& noted : camera_draws_) ++depth_counts[noted.depth_key];
-  const uint32_t scene_depth =
-      std::max_element(depth_counts.begin(), depth_counts.end(),
-                       [](const auto& a, const auto& b) { return a.second < b.second; })
-          ->first;
+  std::vector<Fm4DepthCandidate> depth_candidates;
+  for (const auto& [key, count] : depth_counts) {
+    const Surface* surface = FindSurface(key);
+    depth_candidates.push_back({key, surface ? surface->width : 0u, count});
+  }
+  const uint32_t scene_depth = Fm4SceneDepth(depth_candidates);
   // The next frame's bands copy it (shadow and reflection depths come
   // first in a frame, so a running count would pick them).
   camera_scene_depth_ = scene_depth;
