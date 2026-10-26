@@ -253,8 +253,7 @@ WaitRegMemPolicy CurrentWaitRegMemPolicy() {
 REXCVAR_DEFINE_STRING(fh1_debug_skip_draws, "", "GPU",
                       "Diagnostics: skip the draws with these indices in every frame, as "
                       "<first>-<last>[,<first>-<last>...] counted from each frame's first draw "
-                      "(bisecting a rendering fault in a frame replay)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                      "(bisecting a rendering fault in a frame replay)");
 REXCVAR_DEFINE_STRING(fh1_debug_null_fetch, "", "GPU",
                       "Diagnostics: <draw>:<fetch constant> - that draw of every frame sees "
                       "the texture fetch constant as invalid (a null texture)")
@@ -3408,20 +3407,21 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       // Diagnostics for frame replays: which draw is which, and dropping a
       // range of them.
-      static const auto skip_ranges = [] {
-        std::vector<std::pair<uint32_t, uint32_t>> ranges;
+      static std::vector<std::pair<uint32_t, uint32_t>> skip_ranges;
+      const uint32_t draw_index = debug_frame_draw_index_++;
+      // Re-read each frame, so a paused scene can be bisected live.
+      if (draw_index == 0) {
+        skip_ranges.clear();
         const std::string list = REXCVAR_GET(fh1_debug_skip_draws);
         for (size_t start = 0; start < list.size();) {
           const size_t end = std::min(list.find(',', start), list.size());
           uint32_t first, last;
           if (std::sscanf(list.substr(start, end - start).c_str(), "%u-%u", &first, &last) == 2) {
-            ranges.emplace_back(first, last);
+            skip_ranges.emplace_back(first, last);
           }
           start = end + 1;
         }
-        return ranges;
-      }();
-      const uint32_t draw_index = debug_frame_draw_index_++;
+      }
       static const uint64_t log_ps = std::strtoull(REXCVAR_GET(fh1_debug_log_ps).c_str(), nullptr, 16);
       if (log_ps && active_pixel_shader_ && active_pixel_shader_->ucode_data_hash() == log_ps) {
         const RegisterFile& regs = *register_file_;
