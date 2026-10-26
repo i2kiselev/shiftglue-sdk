@@ -2151,6 +2151,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     }
   }
 
+  // The darkest shadow texel component this fragment fetched, for the
+  // reactive mask.
+  if (var_main_reactive_shadow_ != spv::NoResult &&
+      instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+      instr.operands[1].storage_index ==
+          GetSpirvShaderModification().pixel.reactive_shadow_fetch_constant) {
+    spv::Id darkest = builder_->createLoad(var_main_reactive_shadow_, spv::NoPrecision);
+    uint32_t shadow_components_remaining = used_result_nonzero_components;
+    uint32_t shadow_component_index;
+    while (rex::bit_scan_forward(shadow_components_remaining, &shadow_component_index)) {
+      shadow_components_remaining &= ~(UINT32_C(1) << shadow_component_index);
+      darkest = builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                               GLSLstd450NMin, darkest,
+                                               result[shadow_component_index]);
+    }
+    builder_->createStore(darkest, var_main_reactive_shadow_);
+  }
+
   // Store the needed components of the result.
   spv::Id result_vector;
   if (used_result_component_count > 1) {

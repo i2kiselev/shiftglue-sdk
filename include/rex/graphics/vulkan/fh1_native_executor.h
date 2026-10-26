@@ -195,6 +195,23 @@ class Fh1NativeExecutor {
   // writing the scene's depth whose vertex shader reads the camera's matrix
   // or an object's own (DrawObjectMatrixRegister).
   bool IsSceneObjectDraw(const Shader& vertex_shader) const;
+  // The reactive mask in the object slot image's second plane, while object
+  // motion is on: whether the current draw marks it (Fm4ReactiveSceneDraw).
+  void SetReactiveMaskEnabled(bool enabled) { reactive_mask_enabled_ = enabled; }
+  bool IsSceneReactiveDraw() const;
+  // The car's ground shadow in the reactive mask: whether the current draw
+  // is a scene draw whose pixel shader samples the ground shadow map
+  // (Fm4GroundShadowMap).
+  void SetReactiveShadowsEnabled(bool enabled) { reactive_shadows_enabled_ = enabled; }
+  bool IsSceneShadowedDraw(const Shader& pixel_shader) const;
+  // What the current draw marks in the reactive mask: its alpha
+  // (IsSceneReactiveDraw, draws without an object slot) and its shadow
+  // (IsSceneShadowedDraw).
+  static constexpr uint32_t kReactiveAlpha = 1, kReactiveShadow = 2;
+  uint32_t SceneReactiveSources(const Shader& pixel_shader, bool object_slot) const {
+    return (!object_slot && IsSceneReactiveDraw() ? kReactiveAlpha : 0) |
+           (IsSceneShadowedDraw(pixel_shader) ? kReactiveShadow : 0);
+  }
   // The current draw's slot, after NoteCameraDraw (0: the camera's motion).
   uint32_t current_object_slot() const { return current_object_slot_; }
   // The full-frame row of the current surface's first row, in host pixels.
@@ -583,6 +600,8 @@ class Fh1NativeExecutor {
   // UP-1.7: this frame's reprojections by slot, the slots by matrix hash and
   // by object, and the swapped frame's table.
   bool object_motion_enabled_ = false;
+  bool reactive_mask_enabled_ = false;
+  bool reactive_shadows_enabled_ = false;
   float camera_depth_scale_ = 1.0f;
   uint32_t current_object_slot_ = 0;
   std::vector<std::array<float, 16>> object_reprojections_;

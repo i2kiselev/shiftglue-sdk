@@ -299,6 +299,8 @@ void SpirvShaderTranslator::Reset() {
             spv::NoResult);
   var_main_point_size_edge_flag_kill_vertex_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
+  var_main_reactive_shadow_ = spv::NoResult;
+  object_slot_image_ = spv::NoResult;
   var_main_fragment_depth_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
 
@@ -465,11 +467,13 @@ void SpirvShaderTranslator::StartTranslation() {
       {"object_row_offset", offsetof(SystemConstants, object_row_offset), type_int_},
   };
   // UP-1.7: the object slot constants (last) only in the shaders that write
-  // it, so the others translate as before.
+  // the object slot image, so the others translate as before.
   const size_t system_constant_count =
       rex::countof(system_constants) -
       (is_pixel_shader() && !edram_fragment_shader_interlock_ &&
-               GetSpirvShaderModification().pixel.object_slot_output
+               (GetSpirvShaderModification().pixel.object_slot_output ||
+                GetSpirvShaderModification().pixel.reactive_output ||
+                GetSpirvShaderModification().pixel.reactive_shadow)
            ? 0
            : 2);
   id_vector_temp_.clear();
@@ -3198,7 +3202,9 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
   const bool object_slot_output =
-      !edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output;
+      !edram_fragment_shader_interlock_ && (GetSpirvShaderModification().pixel.object_slot_output ||
+                                            GetSpirvShaderModification().pixel.reactive_output ||
+                                            GetSpirvShaderModification().pixel.reactive_shadow);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
       object_slot_output) {
@@ -3310,6 +3316,12 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     // For killing with fragment shader interlock when demotion is supported,
     // using OpIsHelperInvocationEXT to avoid allocating a variable in addition
     // to the execution mask GPUs naturally have.
+  }
+
+  if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.reactive_shadow) {
+    var_main_reactive_shadow_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
+                                 "xe_var_reactive_shadow", const_float_1_);
   }
 
   if (edram_fragment_shader_interlock_) {

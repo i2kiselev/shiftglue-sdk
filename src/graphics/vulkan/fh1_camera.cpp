@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/graphics/fm4_camera_cut.h>
+#include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
@@ -264,6 +265,35 @@ uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<f
 
 bool Fh1NativeExecutor::IsSceneObjectDraw(const Shader& vertex_shader) const {
   return object_motion_enabled_ && SceneObjectMatrixRegister(vertex_shader) != UINT32_MAX;
+}
+
+bool Fh1NativeExecutor::IsSceneReactiveDraw() const {
+  if (!reactive_mask_enabled_ || !object_motion_enabled_ || !camera_tracking_enabled_ ||
+      !camera_scene_depth_valid_) {
+    return false;
+  }
+  return Fm4ReactiveSceneDraw(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL],
+                              register_file_.values[XE_GPU_REG_RB_BLENDCONTROL0],
+                              register_file_.values[XE_GPU_REG_RB_COLOR_MASK],
+                              CurrentDepthKey() == camera_scene_depth_,
+                              Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
+}
+
+bool Fh1NativeExecutor::IsSceneShadowedDraw(const Shader& pixel_shader) const {
+  constexpr uint32_t kZEnable = 1u << 1;
+  if (!reactive_shadows_enabled_ || !object_motion_enabled_ || !camera_tracking_enabled_ ||
+      !camera_scene_depth_valid_ ||
+      !(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL] & kZEnable) ||
+      CurrentDepthKey() != camera_scene_depth_ ||
+      !Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_)) {
+    return false;
+  }
+  const std::vector<Shader::TextureBinding>& bindings = pixel_shader.texture_bindings();
+  return std::any_of(bindings.begin(), bindings.end(),
+                     [](const Shader::TextureBinding& binding) {
+                       return binding.fetch_constant == kFm4GroundShadowFetchConstant;
+                     }) &&
+         Fm4GroundShadowMap(register_file_.GetTextureFetch(kFm4GroundShadowFetchConstant));
 }
 
 uint32_t Fh1NativeExecutor::SceneObjectMatrixRegister(const Shader& vertex_shader) const {

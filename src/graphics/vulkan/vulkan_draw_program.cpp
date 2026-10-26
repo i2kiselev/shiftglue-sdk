@@ -206,6 +206,7 @@ void VulkanCommandProcessor::DrawProgramRecord(ProgramDraw& d, bool recordable, 
   d.hud_scale = o.hud_scale;
   d.major_mode_explicit = o.major_mode_explicit;
   d.object_slot = o.object_slot;
+  d.reactive = o.reactive;
   d.hud_draw = fh1_native_executor_ && fh1_native_executor_->IsHudDraw();
   d.vertex_shader = o.vertex_shader;
   d.pixel_shader = o.pixel_shader;

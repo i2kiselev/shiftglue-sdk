@@ -310,6 +310,13 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
         inputs.motion_vectors.view, inputs.motion_vectors.image, range,
         inputs.motion_vectors.format, inputs.motion_vectors.width, inputs.motion_vectors.height,
         false);
+    NVSDK_NGX_Resource_VK reactive_mask = {};
+    if (inputs.reactive_mask.image) {
+      reactive_mask = NVSDK_NGX_Create_ImageView_Resource_VK(
+          inputs.reactive_mask.view, inputs.reactive_mask.image, range,
+          inputs.reactive_mask.format, inputs.reactive_mask.width, inputs.reactive_mask.height,
+          false);
+    }
     NVSDK_NGX_Resource_VK output = NVSDK_NGX_Create_ImageView_Resource_VK(
         inputs.output.view, inputs.output.image, range, inputs.output.format, inputs.output.width,
         inputs.output.height, true);
@@ -320,6 +327,9 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     eval.Feature.pInOutput = &output;
     eval.pInDepth = &depth;
     eval.pInMotionVectors = &motion_vectors;
+    if (inputs.reactive_mask.image) {
+      eval.pInBiasCurrentColorMask = &reactive_mask;
+    }
     eval.InJitterOffsetX = (jitter_sign & 1) ? -frame.jitter_x : frame.jitter_x;
     eval.InJitterOffsetY = (jitter_sign & 2) ? -frame.jitter_y : frame.jitter_y;
     eval.InRenderSubrectDimensions.Width = frame.render_width;

@@ -98,6 +98,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // Fetches at r0.z take the vertex shader's wrap_seam_u2 copy where it varies less
       // (gpu_wrap_seam_*).
       uint32_t wrap_seam_u2 : 1;
+      // Write RT 0's alpha with the fragment depth to the object slot image's
+      // reactive plane, nearest fragment winning, for a temporal upscaler's
+      // reactive mask (fm4_reactive_mask.h). Host render targets only. Last:
+      // the modifications are stored with the pipelines.
+      uint32_t reactive_output : 1;
+      // Write one minus the darkest texel component fetched from
+      // reactive_shadow_fetch_constant (a shadow map, 1 where lit) to the
+      // reactive plane like reactive_output. After it for the same reason.
+      uint32_t reactive_shadow : 1;
+      uint32_t reactive_shadow_fetch_constant : 5;
     } pixel;
     uint64_t value = 0;
 
@@ -454,7 +464,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool shared_memory_texel_buffer;
   };
   static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
-  // UP-1.7: the R32_UINT object slot image in the shared memory set.
+  // UP-1.7: the R32_UINT object slot image in the shared memory set: the
+  // object slots in its top half, the reactive mask's in its bottom half.
   static constexpr uint32_t kObjectSlotImageBinding = 3;
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -635,6 +646,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void CompleteFragmentShaderInMain();
   // UP-1.7, at the end of a pixel shader with object_slot_output.
   void WriteObjectSlot();
+  // At the end of a pixel shader with reactive_output writing RT 0 or with
+  // reactive_shadow.
+  void WriteReactiveMask();
+  // (depth << 8) | low_byte into the object slot image's plane, the largest
+  // winning.
+  void WriteObjectSlotImage(spv::Id low_byte, bool reactive_plane);
 
   // Updates the current flow control condition (to be called in the beginning
   // of exec and in jumps), closing the previous conditionals if needed.
@@ -1101,6 +1118,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_point_size_edge_flag_kill_vertex_;
   // PS, only when needed - bool.
   spv::Id var_main_kill_pixel_;
+  // PS with reactive_shadow - float, the darkest shadow texel component
+  // fetched so far.
+  spv::Id var_main_reactive_shadow_;
+  // PS writing the object slot image - its variable, once declared.
+  spv::Id object_slot_image_;
   // PS, with fragment shader interlock and depth export - float.
   spv::Id var_main_fragment_depth_;
   // PS, only when writing to color render targets with fragment shader

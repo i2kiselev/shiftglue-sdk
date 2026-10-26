@@ -1250,6 +1250,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool object_slot_set_binding_ = false;
   uint32_t object_slot_draws_ = 0;
   uint32_t object_slot_fallback_draws_ = 0;
+  uint32_t reactive_draws_ = 0;
+  uint32_t reactive_shadow_draws_ = 0;
   // Draws of the current frame recorded with a pipeline still being built
   // (vulkan_async_pipeline_bind_on_replay).
   uint32_t pending_pipeline_binds_ = 0;
@@ -1555,8 +1557,10 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t interpolator_mask = 0;
     uint32_t ps_param_gen_pos = 0;
     uint32_t depth_control = 0;
-    // UP-1.7: whether the pixel shader writes the object slot.
+    // UP-1.7: whether the pixel shader writes the object slot, and what it
+    // marks in the reactive mask (Fh1NativeExecutor::SceneReactiveSources).
     bool object_slot = false;
+    uint32_t reactive = 0;
     uint32_t wrap_seam_generation = 0;
     SpirvShaderTranslator::Modification vertex_modification;
     SpirvShaderTranslator::Modification pixel_modification;
@@ -1618,6 +1622,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_scale = 0.0;
     bool major_mode_explicit = false;
     bool object_slot = false;
+    uint32_t reactive = 0;
     bool hud_draw = false;
     // Outputs.
     VulkanShader* vertex_shader = nullptr;
@@ -1742,6 +1747,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     double hud_squeeze;
     double hud_scale;
     bool object_slot;
+    uint32_t reactive;
     bool indices_owned;
     uint32_t index_version;
   };

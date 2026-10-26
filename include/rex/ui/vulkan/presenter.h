@@ -139,15 +139,18 @@ class VulkanPresenter final : public Presenter {
     void SetHudlessWritten();
 
     // UP-1.3 and UP-1.4, when WantsGuestOutputCamera: the scene depth (guest
-    // z in [0, 1], kGuestOutputDepthFormat) and the motion of each pixel to
-    // its place in the previous frame (in UV units, kGuestOutputMotionFormat),
-    // at the guest output's size. Sampled and storage usage; released to
+    // z in [0, 1], kGuestOutputDepthFormat), the motion of each pixel to its
+    // place in the previous frame (in UV units, kGuestOutputMotionFormat) and
+    // the reactive mask (0 keeps the history, 1 takes the current frame;
+    // kGuestOutputReactiveFormat), at the guest output's size. Sampled and storage usage; released to
     // kGuestOutputInternal* like the guest output. Created on first use.
     bool EnsureCameraImages();
     VkImage depth_image() const;
     VkImageView depth_image_view() const;
     VkImage motion_image() const;
     VkImageView motion_image_view() const;
+    VkImage reactive_image() const;
+    VkImageView reactive_image_view() const;
     bool camera_ever_written_previously() const;
     void SetCameraWritten(const UpscalerCamera& camera);
 
@@ -196,6 +199,7 @@ class VulkanPresenter final : public Presenter {
   // The formats of the guest output's camera images.
   static constexpr VkFormat kGuestOutputDepthFormat = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kGuestOutputMotionFormat = VK_FORMAT_R16G16_SFLOAT;
+  static constexpr VkFormat kGuestOutputReactiveFormat = VK_FORMAT_R8_UNORM;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -253,6 +257,8 @@ class VulkanPresenter final : public Presenter {
     VkImageView depth_view() const { return depth_view_; }
     VkImage motion_image() const { return motion_image_; }
     VkImageView motion_view() const { return motion_view_; }
+    VkImage reactive_image() const { return reactive_image_; }
+    VkImageView reactive_view() const { return reactive_view_; }
     bool camera_ever_written = false;
 
    private:
@@ -286,6 +292,9 @@ class VulkanPresenter final : public Presenter {
     VkImage motion_image_ = VK_NULL_HANDLE;
     VkDeviceMemory motion_memory_ = VK_NULL_HANDLE;
     VkImageView motion_view_ = VK_NULL_HANDLE;
+    VkImage reactive_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory reactive_memory_ = VK_NULL_HANDLE;
+    VkImageView reactive_view_ = VK_NULL_HANDLE;
   };
 
   struct GuestOutputImageInstance {

@@ -983,6 +983,11 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   if (!edram_fragment_shader_interlock_ && GetSpirvShaderModification().pixel.object_slot_output) {
     WriteObjectSlot();
   }
+  if (!edram_fragment_shader_interlock_ &&
+      ((GetSpirvShaderModification().pixel.reactive_output && (color_targets_written & 0b1)) ||
+       GetSpirvShaderModification().pixel.reactive_shadow)) {
+    WriteReactiveMask();
+  }
 
   if (color_targets_written) {
     spv::Id fsi_color_targets_written = spv::NoResult;
@@ -3506,28 +3511,77 @@ void SpirvShaderTranslator::WriteObjectSlot() {
   // whatever order the draws come in and whether its depth test passed.
   // Killed and demoted invocations reach here not at all or as helpers,
   // whose atomics have no effect.
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
+  spv::Id slot = builder_->createLoad(
+      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                  id_vector_temp_),
+      spv::NoPrecision);
+  WriteObjectSlotImage(
+      builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot, builder_->makeUintConstant(0xFF)),
+      false);
+}
+
+void SpirvShaderTranslator::WriteReactiveMask() {
+  // The nearest fragment's alpha (or how deep in the shadow it is) in 1/255
+  // steps; the swap pass keeps it where that fragment is not behind the
+  // scene's depth. Fully transparent and lit fragments (a billboard's
+  // corners) write nothing, so they do not hide a visible one behind them.
+  const SpirvShaderTranslator::Modification::PixelShaderModification& modification =
+      GetSpirvShaderModification().pixel;
+  spv::Id alpha = const_float_0_;
+  if (modification.reactive_output && output_or_var_fragment_data_[0] != spv::NoResult) {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(3));
+    alpha = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassOutput, output_or_var_fragment_data_[0],
+                                    id_vector_temp_),
+        spv::NoPrecision);
+  }
+  if (modification.reactive_shadow) {
+    alpha = builder_->createBinBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450NMax, alpha,
+        builder_->createBinOp(spv::OpFSub, type_float_, const_float_1_,
+                              builder_->createLoad(var_main_reactive_shadow_, spv::NoPrecision)));
+  }
+  spv::Id alpha_255 = builder_->createUnaryOp(
+      spv::OpConvertFToU, type_uint_,
+      builder_->createBinOp(
+          spv::OpFAdd, type_float_,
+          builder_->createBinOp(spv::OpFMul, type_float_,
+                                builder_->createTriBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                               GLSLstd450NClamp, alpha,
+                                                               const_float_0_, const_float_1_),
+                                builder_->makeFloatConstant(255.0f)),
+          builder_->makeFloatConstant(0.5f)));
+  SpirvBuilder::IfBuilder if_visible(
+      builder_->createBinOp(spv::OpINotEqual, type_bool_, alpha_255, const_uint_0_),
+      spv::SelectionControlMaskNone, *builder_);
+  WriteObjectSlotImage(alpha_255, true);
+  if_visible.makeEndIf();
+}
+
+void SpirvShaderTranslator::WriteObjectSlotImage(spv::Id low_byte, bool reactive_plane) {
   assert_true(input_fragment_coordinates_ != spv::NoResult);
   builder_->addCapability(spv::CapabilityImageQuery);
   spv::Id type_image = builder_->makeImageType(type_uint_, spv::Dim2D, false, false, false, 2,
                                                spv::ImageFormatR32ui);
-  spv::Id image = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
-                                           type_image, "xe_object_slots");
-  builder_->addDecoration(image, spv::DecorationDescriptorSet,
-                          int(kDescriptorSetSharedMemoryAndEdram));
-  builder_->addDecoration(image, spv::DecorationBinding, int(kObjectSlotImageBinding));
-  if (features_.spirv_version >= spv::Spv_1_4) {
-    main_interface_.push_back(image);
+  if (object_slot_image_ == spv::NoResult) {
+    object_slot_image_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassUniformConstant, type_image, "xe_object_slots");
+    builder_->addDecoration(object_slot_image_, spv::DecorationDescriptorSet,
+                            int(kDescriptorSetSharedMemoryAndEdram));
+    builder_->addDecoration(object_slot_image_, spv::DecorationBinding,
+                            int(kObjectSlotImageBinding));
+    if (features_.spirv_version >= spv::Spv_1_4) {
+      main_interface_.push_back(object_slot_image_);
+    }
   }
+  const spv::Id image = object_slot_image_;
   spv::Id frag_coord = builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
   id_vector_temp_.clear();
   id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectRowOffset));
   spv::Id row_offset = builder_->createLoad(
-      builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                  id_vector_temp_),
-      spv::NoPrecision);
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantObjectSlot));
-  spv::Id slot = builder_->createLoad(
       builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
                                   id_vector_temp_),
       spv::NoPrecision);
@@ -3538,13 +3592,18 @@ void SpirvShaderTranslator::WriteObjectSlot() {
       builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
                               builder_->createCompositeExtract(frag_coord, type_float_, 1)),
       row_offset);
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(x);
-  id_vector_temp_.push_back(y);
-  spv::Id coordinates = builder_->createCompositeConstruct(type_int2_, id_vector_temp_);
   spv::Id size = builder_->createOp(spv::OpImageQuerySize, type_int2_,
                                     std::vector<spv::Id>{builder_->createLoad(image,
                                                                               spv::NoPrecision)});
+  spv::Id plane_height =
+      builder_->createBinOp(spv::OpShiftRightArithmetic, type_int_,
+                            builder_->createCompositeExtract(size, type_int_, 1),
+                            builder_->makeIntConstant(1));
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(x);
+  id_vector_temp_.push_back(
+      reactive_plane ? builder_->createBinOp(spv::OpIAdd, type_int_, y, plane_height) : y);
+  spv::Id coordinates = builder_->createCompositeConstruct(type_int2_, id_vector_temp_);
   spv::Id inside = builder_->createBinOp(
       spv::OpLogicalAnd, type_bool_,
       builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
@@ -3553,8 +3612,7 @@ void SpirvShaderTranslator::WriteObjectSlot() {
                             builder_->createBinOp(spv::OpSLessThan, type_bool_, x,
                                                   builder_->createCompositeExtract(
                                                       size, type_int_, 0))),
-      builder_->createBinOp(spv::OpSLessThan, type_bool_, y,
-                            builder_->createCompositeExtract(size, type_int_, 1)));
+      builder_->createBinOp(spv::OpSLessThan, type_bool_, y, plane_height));
   SpirvBuilder::IfBuilder if_inside(inside, spv::SelectionControlMaskNone, *builder_);
   {
     // Host depth (float24 surfaces keep it halved; the swap pass scales it
@@ -3568,8 +3626,7 @@ void SpirvShaderTranslator::WriteObjectSlot() {
         spv::OpBitwiseOr, type_uint_,
         builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, depth,
                               builder_->makeUintConstant(8)),
-        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, slot,
-                              builder_->makeUintConstant(0xFF)));
+        low_byte);
     spv::Id pointer = builder_->createOp(
         spv::OpImageTexelPointer, builder_->makePointer(spv::StorageClassImage, type_uint_),
         std::vector<spv::Id>{image, coordinates, const_uint_0_});
