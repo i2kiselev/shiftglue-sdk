@@ -96,6 +96,11 @@ REXCVAR_DEFINE_BOOL(present_upscaler_reactive_shadows, false, "GPU",
                     "reactive mask, how deep in the shadow each pixel is (with "
                     "present_upscaler_object_motion)");
 
+REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
+                    "Give a temporal upscaler spinning wheels' motion as their hubs' (FM4): "
+                    "the spin itself is too fast to follow and drew light lines along the car "
+                    "by the wheels");
+
 REXCVAR_DEFINE_INT32(present_upscaler_object_debug, 0, "GPU",
                      "UP-1.7 debug: 1 shows the object slots in the motion view (red: slot, green: its depth is the pixel's), 2 the reactive mask (red)");
 
@@ -4091,6 +4096,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     fh1_native_executor_->SetReactiveMaskEnabled(REXCVAR_GET(present_upscaler_reactive_mask));
     fh1_native_executor_->SetReactiveShadowsEnabled(
         REXCVAR_GET(present_upscaler_reactive_shadows));
+    fh1_native_executor_->SetSpinFreeWheels(REXCVAR_GET(present_upscaler_spin_free_wheels));
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     if (camera_wanted) {

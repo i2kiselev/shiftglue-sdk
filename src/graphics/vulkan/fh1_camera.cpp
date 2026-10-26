@@ -19,6 +19,7 @@
 #include <rex/graphics/fm4_camera_cut.h>
 #include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
+#include <rex/graphics/fm4_wheel_motion.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 #include <rex/logging.h>
@@ -227,7 +228,13 @@ uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<f
   auto previous = object_previous_wvp_.find(key);
   Matrix current_inverse;
   if (previous != object_previous_wvp_.end() && Invert(ToMatrix(wvp), current_inverse)) {
-    const Matrix reprojection = Multiply(ToMatrix(previous->second), current_inverse);
+    Matrix reprojection = Multiply(ToMatrix(previous->second), current_inverse);
+    if (spin_free_wheels_) {
+      if (const std::optional<Matrix> spin_free =
+              Fm4SpinFreeReprojection(previous->second, wvp)) {
+        reprojection = *spin_free;
+      }
+    }
     std::array<float, 16> matrix;
     for (size_t i = 0; i < 16; ++i) matrix[i] = float(reprojection[i]);
     // Objects that move with the world (most props and the world's own

@@ -190,6 +190,8 @@ class Fh1NativeExecutor {
   // each pixel's depth with its slot's matrix.
   static constexpr uint32_t kMaxObjectSlots = 256;
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
+  // Spinning objects (wheels) move with their origin (Fm4SpinFreeReprojection).
+  void SetSpinFreeWheels(bool enabled) { spin_free_wheels_ = enabled; }
   bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
@@ -602,6 +604,7 @@ class Fh1NativeExecutor {
   bool object_motion_enabled_ = false;
   bool reactive_mask_enabled_ = false;
   bool reactive_shadows_enabled_ = false;
+  bool spin_free_wheels_ = true;
   float camera_depth_scale_ = 1.0f;
   uint32_t current_object_slot_ = 0;
   std::vector<std::array<float, 16>> object_reprojections_;
