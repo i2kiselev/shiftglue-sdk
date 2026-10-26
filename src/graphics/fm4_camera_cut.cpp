@@ -65,4 +65,11 @@ std::optional<bool> Fm4SceneTurned(const std::array<float, 16>& rows) {
   return up < 0.0;
 }
 
+uint32_t Fm4MatrixRegister(const std::array<uint64_t, 4>& float_bitmap, bool dynamic_addressing) {
+  if ((float_bitmap[0] & 0xF) == 0xF && dynamic_addressing) return 0;
+  if ((float_bitmap[2] & 0xF) == 0xF) return 128;
+  if ((float_bitmap[0] & 0xF) == 0xF) return 0;
+  return UINT32_MAX;
+}
+
 }  // namespace rex::graphics

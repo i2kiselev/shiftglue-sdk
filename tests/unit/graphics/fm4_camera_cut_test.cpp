@@ -168,3 +168,16 @@ TEST_CASE("a camera rolled on its side or looking straight down does not say",
                                       0, -1, 0, 0};
   CHECK_FALSE(Fm4SceneTurned(down).has_value());
 }
+
+TEST_CASE("a shader indexing its constants is placed by c0-c3, not the camera's registers",
+          "[graphics][camera]") {
+  // The track (c0-c4 and c128-c131 read), a car (c0-c3 and c128-c130), and the driver,
+  // whose bone palette is indexed: every register counts as read.
+  const std::array<uint64_t, 4> world = {0x1F, 0, 0xF, 0};
+  const std::array<uint64_t, 4> car = {0xF, 0, 0x7, 0};
+  const std::array<uint64_t, 4> all = {~0ull, ~0ull, ~0ull, ~0ull};
+  CHECK(Fm4MatrixRegister(world, false) == 128);
+  CHECK(Fm4MatrixRegister(car, false) == 0);
+  CHECK(Fm4MatrixRegister(all, true) == 0);
+  CHECK(Fm4MatrixRegister({0x3, 0, 0, 0}, false) == UINT32_MAX);
+}

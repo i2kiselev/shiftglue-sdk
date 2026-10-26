@@ -51,6 +51,13 @@ uint32_t Fm4SceneDepth(const std::vector<Fm4DepthCandidate>& candidates);
 // z * c2 + c3); read as rows, every moving car's reprojection was wrong.
 std::array<float, 16> Fm4ObjectMatrix(const std::array<float, 16>& registers);
 
+// The first register of a vertex shader's world-view-projection, from the float constants it
+// reads: 128 for the camera's (the world), 0 for an object's own, UINT32_MAX for neither. A
+// shader that indexes its constants (the driver's bone palette) is marked as reading all 256,
+// and read as a world draw it took bones for the camera's matrix: the driver got the camera's
+// motion and ghosted behind the windscreen. Such shaders place their mesh by c0-c3.
+uint32_t Fm4MatrixRegister(const std::array<uint64_t, 4>& float_bitmap, bool dynamic_addressing);
+
 // Whether a world-view-projection (row-major for column vectors, y up) draws the scene turned
 // 180 degrees in clip space: world up landing on clip -y. Races draw it so and the post pass
 // turns it back; the showroom draws it upright, and treating it as turned handed the upscaler

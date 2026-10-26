@@ -175,8 +175,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                              CurrentDepthKey() == camera_scene_depth_,
                          (draw.normalized_color_mask & 0xF) &&
                              Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
-  if (((map.float_bitmap[kCameraFirstRegister / 64] >> (kCameraFirstRegister % 64)) & 0xF) !=
-      0xF) {
+  if (DrawObjectMatrixRegister(*draw.vertex_shader) != kCameraFirstRegister) {
     // UP-1.7: a car, with its own matrix in c0-c3.
     if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) return;
     if (object_motion_enabled_) {
@@ -323,12 +322,7 @@ uint32_t Fh1NativeExecutor::DrawObjectMatrixRegister(const Shader& vertex_shader
   // cars (body, wheels, interior: 60-odd vertex shaders a frame on the
   // Fujimi drive) read their own at c0-c3 instead.
   const Shader::ConstantRegisterMap& map = vertex_shader.constant_register_map();
-  if (((map.float_bitmap[kCameraFirstRegister / 64] >> (kCameraFirstRegister % 64)) & 0xF) ==
-      0xF) {
-    return kCameraFirstRegister;
-  }
-  if ((map.float_bitmap[0] & 0xF) == 0xF) return kObjectFirstRegister;
-  return UINT32_MAX;
+  return Fm4MatrixRegister(std::to_array(map.float_bitmap), map.float_dynamic_addressing);
 }
 
 uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
