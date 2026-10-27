@@ -60,6 +60,12 @@ REXCVAR_DEFINE_BOOL(fh1_readback_all_resolves, false, "GPU",
                     "Diagnostics: copy every resolve into guest memory, waiting for the GPU, "
                     "not only the captures the CPU is known to read (Vulkan; slow)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_readback_all_resolves_hold, false, "GPU",
+                    "Read live: while set, every resolve is read back and waited for, as with "
+                    "fh1_readback_all_resolves. A game sets it around a render whose result the "
+                    "CPU reads in ways the readback rules miss (FM4: the car thumbnails, lit "
+                    "from captures re-rendered past a run's first frames or after a range "
+                    "stopped being new)");
 REXCVAR_DEFINE_BOOL(fh1_log_resolve_readbacks, false, "GPU",
                     "Diagnostics: log the start of every run of resolves into a range, whether "
                     "it is read back into guest memory and whether the range was read back before");
@@ -532,7 +538,9 @@ void Fh1NativeExecutor::DumpBufferRange(VkBuffer source, VkDeviceSize offset, Vk
 
 bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
   const auto decision =
-      resolve_readbacks_.Resolve(address, length, frame_, REXCVAR_GET(fh1_readback_all_resolves));
+      resolve_readbacks_.Resolve(address, length, frame_,
+                                 REXCVAR_GET(fh1_readback_all_resolves) ||
+                                     REXCVAR_GET(fh1_readback_all_resolves_hold));
   if (REXCVAR_GET(fh1_log_resolve_readbacks) && decision.log) {
     REXGPU_INFO("FH1 readback run {:08X}+{:X} frame {} {}: read back {}, before {}, "
                 "overwritten {}, recurring {}, idle {}, new since {}, previous run {} frames",
