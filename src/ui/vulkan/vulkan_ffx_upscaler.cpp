@@ -386,8 +386,8 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     dispatch_desc.renderSize.height = frame.render_height;
     dispatch_desc.upscaleSize.width = frame.output_width;
     dispatch_desc.upscaleSize.height = frame.output_height;
-    dispatch_desc.enableSharpening = frame.sharpness > 0.0f;
-    dispatch_desc.sharpness = std::clamp(frame.sharpness, 0.0f, 1.0f);
+    // The presenter's RCAS pass sharpens every temporal upscaler alike.
+    dispatch_desc.enableSharpening = false;
     dispatch_desc.frameTimeDelta = frame.frame_delta_ms;
     dispatch_desc.preExposure = 1.0f;
     dispatch_desc.reset = frame.reset;

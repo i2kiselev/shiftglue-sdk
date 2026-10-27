@@ -135,8 +135,7 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
                                               ID3D12Resource* input_resource, uint32_t input_width,
                                               uint32_t input_height,
                                               ID3D12Resource* output_resource,
-                                              uint32_t output_width, uint32_t output_height,
-                                              const GuestOutputPaintConfig& config) {
+                                              uint32_t output_width, uint32_t output_height) {
   if (!command_list || !input_resource || !output_resource || !input_width || !input_height ||
       !output_width || !output_height) {
     return false;
@@ -172,8 +171,8 @@ bool D3D12Presenter::DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command
   dispatch_desc.renderSize.height = input_height;
   dispatch_desc.upscaleSize.width = output_width;
   dispatch_desc.upscaleSize.height = output_height;
-  dispatch_desc.enableSharpening = true;
-  dispatch_desc.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
+  // The presenter's RCAS pass sharpens every temporal upscaler alike.
+  dispatch_desc.enableSharpening = false;
   // The presenter path doesn't currently provide accurate temporal inputs,
   // so run in reset mode each frame to avoid history artifacts.
   dispatch_desc.reset = true;
@@ -877,7 +876,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           temporal_dispatch_done = DispatchTemporalUpscaler(
               command_list, effect_source_resource, effect_input_width, effect_input_height,
               effect_dest_resource, guest_output_flow.effect_output_sizes[i].first,
-              guest_output_flow.effect_output_sizes[i].second, guest_output_paint_config);
+              guest_output_flow.effect_output_sizes[i].second);
           if (!temporal_dispatch_done) {
             D3D12_RESOURCE_BARRIER barrier_uav_to_rtv;
             barrier_uav_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

@@ -268,8 +268,7 @@ class D3D12Presenter final : public Presenter {
   bool DispatchTemporalUpscaler(ID3D12GraphicsCommandList* command_list,
                                 ID3D12Resource* input_resource, uint32_t input_width,
                                 uint32_t input_height, ID3D12Resource* output_resource,
-                                uint32_t output_width, uint32_t output_height,
-                                const GuestOutputPaintConfig& config);
+                                uint32_t output_width, uint32_t output_height);
   void DestroyTemporalUpscalerContext();
 #endif
 

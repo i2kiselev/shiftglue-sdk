@@ -110,8 +110,6 @@ struct UpscalerFrame {
   float camera_near = 0.1f;
   float camera_far = 1000.0f;
   float camera_fov_y = 1.0472f;
-  // 0 (none) to 1 (most), for providers with their own sharpening.
-  float sharpness = 0.0f;
 };
 
 }  // namespace ui

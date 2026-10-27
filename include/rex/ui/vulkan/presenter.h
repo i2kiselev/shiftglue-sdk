@@ -653,7 +653,6 @@ class VulkanPresenter final : public Presenter {
                                 VkImage output_image, VkImageView output_view,
                                 uint32_t output_width, uint32_t output_height,
                                 uint64_t guest_output_refresh_serial,
-                                const GuestOutputPaintConfig& config,
                                 const GuestOutputImage* camera_source = nullptr,
                                 const UpscalerCamera* camera = nullptr);
 

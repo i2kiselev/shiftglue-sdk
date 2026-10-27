@@ -272,6 +272,14 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
+
+    // The RCAS pass after a temporal upscaler, 0 (no pass) to 1 (RCAS at its
+    // maximum), on FSR 2's curve: 2 x (1 - sharpness) stops of reduction.
+    static constexpr float kUpscalerSharpnessMin = 0.0f;
+    static constexpr float kUpscalerSharpnessMax = 1.0f;
+    static constexpr float kUpscalerSharpnessDefault = 0.3f;
+    static_assert(kUpscalerSharpnessDefault >= kUpscalerSharpnessMin &&
+                  kUpscalerSharpnessDefault <= kUpscalerSharpnessMax);
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // In the sharpness setters, min / max with a constant as the first argument
@@ -307,6 +315,19 @@ class Presenter {
                    std::max(kFsrSharpnessReductionMin, new_fsr_sharpness_reduction));
     }
 
+    float GetUpscalerSharpness() const { return upscaler_sharpness_; }
+    void SetUpscalerSharpness(float new_upscaler_sharpness) {
+      upscaler_sharpness_ = std::min(kUpscalerSharpnessMax,
+                                     std::max(kUpscalerSharpnessMin, new_upscaler_sharpness));
+    }
+
+    // The RCAS pass's strength: the upscaler sharpness after a temporal
+    // upscaler, else the FSR 1 setting.
+    float GetRcasSharpnessReduction() const {
+      return IsTemporalEffect(effect_) ? 2.0f * (1.0f - upscaler_sharpness_)
+                                       : fsr_sharpness_reduction_;
+    }
+
     FsrQualityMode GetFsrQualityMode() const { return fsr_quality_mode_; }
     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
       fsr_quality_mode_ = new_fsr_quality_mode;
@@ -330,6 +351,7 @@ class Presenter {
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
+    float upscaler_sharpness_ = kUpscalerSharpnessDefault;
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
 #endif
     bool dither_ = false;
@@ -668,7 +690,7 @@ class Presenter {
     void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index,
                     const GuestOutputPaintConfig& config) {
       flow.GetEffectOutputOffset(effect_index, output_offset[0], output_offset[1]);
-      sharpness_post_setup = CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
+      sharpness_post_setup = CalculatePostSetupSharpness(config.GetRcasSharpnessReduction());
     }
   };
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)

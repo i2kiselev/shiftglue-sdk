@@ -596,8 +596,7 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     VkCommandBuffer command_buffer, VulkanUpscaler& upscaler, VkImage source_image,
     VkImageView source_view, uint32_t source_width, uint32_t source_height, VkImage output_image,
     VkImageView output_view, uint32_t output_width, uint32_t output_height,
-    uint64_t guest_output_refresh_serial, const GuestOutputPaintConfig& config,
-    const GuestOutputImage* camera_source, const UpscalerCamera* camera) {
+    uint64_t guest_output_refresh_serial, const GuestOutputImage* camera_source, const UpscalerCamera* camera) {
   TemporalUpscaleState& state = temporal_upscale_;
   const bool same_target = state.output_valid && state.upscaler == &upscaler &&
                            state.output_image == output_image &&
@@ -643,7 +642,6 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     frame.jitter_x = camera->jitter_x;
     frame.jitter_y = camera->jitter_y;
   }
-  frame.sharpness = std::clamp(1.0f - config.GetFsrSharpnessReduction() * 0.5f, 0.0f, 1.0f);
 
   VulkanUpscalerInputs inputs;
   constexpr VkImageUsageFlags kGuestOutputUsage =
@@ -2746,7 +2744,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                          source_view, effect_input_width, effect_input_height,
                                          output_image, output.view(), effect_rect_size.first,
                                          effect_rect_size.second, guest_output_refresh_serial,
-                                         guest_output_paint_config, use_camera ? &source : nullptr,
+                                         use_camera ? &source : nullptr,
                                          use_camera ? &guest_output_camera : nullptr)) {
               const std::string& view_mode = REXCVAR_GET(present_upscaler_view);
               const uint32_t debug_view =

@@ -76,9 +76,16 @@ REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
 
 REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
-                      "UI/Presenter", "FSR RCAS sharpness reduction in stops")
+                      "UI/Presenter", "FSR 1 RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax);
+
+REXCVAR_DEFINE_INT32(
+    present_upscaler_sharpness,
+    int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kUpscalerSharpnessDefault * 100.0f),
+    "UI/Presenter",
+    "Sharpening after DLSS, FSR 2 and FSR 3 in percent (0: none, 100: RCAS at its maximum)")
+    .range(0, 100);
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
@@ -219,6 +226,7 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   config.SetFsrMaxUpsamplingPasses(
       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
   config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+  config.SetUpscalerSharpness(float(REXCVAR_GET(present_upscaler_sharpness)) / 100.0f);
   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
 #endif
   config.SetDither(REXCVAR_GET(present_dither));
@@ -653,8 +661,13 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
       new_config.GetFsrSharpnessReduction()) {
     modified = true;
-    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
-        GuestOutputPaintConfig::IsTemporalEffect(new_config.GetEffect())) {
+    if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
+      request_repaint = true;
+    }
+  }
+  if (guest_output_paint_config_.GetUpscalerSharpness() != new_config.GetUpscalerSharpness()) {
+    modified = true;
+    if (GuestOutputPaintConfig::IsTemporalEffect(new_config.GetEffect())) {
       request_repaint = true;
     }
   }
@@ -1123,9 +1136,11 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
           ++easu_pass_count;
         }
       }
-      assert_true(flow.effect_count < flow.effects.size());
-      flow.effect_output_sizes[flow.effect_count] = ffx_last_size;
-      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kFsrRcas;
+      if (!is_temporal_effect || config.GetUpscalerSharpness() > 0.0f) {
+        assert_true(flow.effect_count < flow.effects.size());
+        flow.effect_output_sizes[flow.effect_count] = ffx_last_size;
+        flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kFsrRcas;
+      }
     } else {
       // AMD FidelityFX Contrast Adaptive Sharpening - sharpen or downsample, or
       // upsample up to 2x2 if CAS is specified to be used for upscaling too.
@@ -1147,8 +1162,14 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;
+  bool last_effect_not_final = false;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+  // A temporal upscale without sharpening ends the flow in its EASU slot.
+  last_effect_not_final =
+      flow.effect_count && !CanGuestOutputPaintEffectBeFinal(flow.effects[flow.effect_count - 1]);
+#endif
   if (!last_pre_bilinear_effect_size || last_pre_bilinear_effect_size->first != output_width ||
-      last_pre_bilinear_effect_size->second != output_height) {
+      last_pre_bilinear_effect_size->second != output_height || last_effect_not_final) {
     // If not using FidelityFX, or it has reached its upscaling capabilities,
     // but more is needed, stretch via bilinear filtering.
     // Clamp the output size of the last effect to the maximum render target

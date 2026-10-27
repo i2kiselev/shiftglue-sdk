@@ -140,6 +140,7 @@ constexpr const char* kPresenterPaintCvars[] = {
     "present_cas_additional_sharpness",
     "present_fsr_max_upsampling_passes",
     "present_fsr_sharpness_reduction",
+    "present_upscaler_sharpness",
     "present_fsr_quality_mode",
     "present_dither",
     "present_allow_overscan_cutoff",
