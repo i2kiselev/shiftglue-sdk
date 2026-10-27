@@ -161,6 +161,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     return device;
   }
 
+  // The LOD bias the texture cache's samplers are created with.
+  double sampler_mip_lod_bias() const { return sampler_mip_lod_bias_; }
+
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
@@ -386,10 +389,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // resolution scale cvars name another square scale from 1x to 4x, so the
   // scale changes without a restart (NP-4.7).
   void SwitchDrawResolutionScaleIfRequested();
-  // Between frames, destroys the samplers when texture_mip_lod_bias or
-  // anisotropic_override differs from what they were created with, so they
-  // are created again with it.
+  // Between frames, destroys the samplers when the LOD bias (texture_mip_lod_bias
+  // and a temporal upscale's) or anisotropic_override differs from what they
+  // were created with, so they are created again with it.
   void RecreateSamplersIfSettingsChanged();
+  static double ConfiguredMipLodBias();
   // Forgets the samplers and texture descriptors draws reuse. The GPU must be
   // done with every submission and none may be open.
   void ResetSamplerBindings();
@@ -1129,7 +1133,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // A requested scale that cannot be switched to, so the request is reported
   // once.
   uint32_t declined_draw_resolution_scale_ = 0;
-  // texture_mip_lod_bias when the texture cache's samplers were last dropped.
+  // ConfiguredMipLodBias() when the texture cache's samplers were last dropped.
   double sampler_mip_lod_bias_ = 0.0;
   int32_t sampler_anisotropic_override_ = 0;
 

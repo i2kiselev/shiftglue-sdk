@@ -66,6 +66,14 @@ std::vector<UpscalerInfo> GetSpatialUpscalerInfos();
 bool IsTemporalUpscalerActive();
 void SetTemporalUpscalerActive(bool active);
 
+// The texture LOD bias that makes a temporal upscale's render size pick the mips the output
+// size would (DLSS guide 3.5: log2(render / output) is its least negative bias; it recommends
+// a further -1, the offset's to try), never positive for a render larger than the output.
+float TemporalUpscalerMipBias(uint32_t render_width, uint32_t output_width, float offset);
+// The bias of the presenter's last paint, 0 without a temporal upscale. Any thread.
+float GetTemporalUpscalerMipBias();
+void SetTemporalUpscalerMipBias(float bias);
+
 // Per-frame description of a temporal upscale, for every graphics API.
 // The game camera of a frame, for a temporal upscaler's depth and motion.
 struct UpscalerCamera {

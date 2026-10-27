@@ -1,6 +1,8 @@
 #include <rex/ui/upscaler.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 
 namespace rex {
 namespace ui {
@@ -43,6 +45,7 @@ const char* GetUpscalerModeName(UpscalerMode mode) {
 
 namespace {
 std::atomic<bool> temporal_upscaler_active = false;
+std::atomic<float> temporal_upscaler_mip_bias = 0.0f;
 }  // namespace
 
 bool IsTemporalUpscalerActive() {
@@ -51,6 +54,18 @@ bool IsTemporalUpscalerActive() {
 
 void SetTemporalUpscalerActive(bool active) {
   temporal_upscaler_active.store(active, std::memory_order_relaxed);
+}
+
+float TemporalUpscalerMipBias(uint32_t render_width, uint32_t output_width, float offset) {
+  return std::min(0.0f, std::log2(float(render_width) / float(output_width))) + offset;
+}
+
+float GetTemporalUpscalerMipBias() {
+  return temporal_upscaler_mip_bias.load(std::memory_order_relaxed);
+}
+
+void SetTemporalUpscalerMipBias(float bias) {
+  temporal_upscaler_mip_bias.store(bias, std::memory_order_relaxed);
 }
 
 std::vector<UpscalerInfo> GetSpatialUpscalerInfos() {

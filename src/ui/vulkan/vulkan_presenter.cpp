@@ -83,6 +83,13 @@ REXCVAR_DEFINE_BOOL(present_upscaler_jitter, true, "UI/Presenter",
                     "Have the game jitter the scene by a sub-pixel offset each frame for a "
                     "temporal upscaler (with present_upscaler_camera)");
 
+REXCVAR_DEFINE_DOUBLE(present_upscaler_mip_bias, 0.0, "UI/Presenter",
+                      "Added to the texture LOD bias of log2(render / output width) a temporal "
+                      "upscaler gives, so textures keep the output size's detail: negative is "
+                      "sharper (the DLSS and FSR guides' -1), positive softer")
+    .range(-2.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(present_upscaler_view, "upscale", "UI/Presenter",
                       "Show a temporal upscaler's output (upscale) or one of its inputs instead: "
                       "depth (near white, far black) or motion (red and green around grey)")
@@ -2644,18 +2651,23 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                           std::memory_order_relaxed);
         // A Halton(2, 3) sequence of 8 samples per output pixel, the length
         // FSR and DLSS recommend for the upscaling ratio.
+        uint32_t temporal_input_width = 0, temporal_input_height = 0;
+        if (temporal_reads_guest_output) {
+          guest_output_flow.GetEffectInputSize(0, temporal_input_width, temporal_input_height);
+        }
+        const uint32_t temporal_output_width = guest_output_flow.effect_output_sizes[0].first;
         uint32_t jitter_phases = 0;
-        if (camera_allowed && temporal_reads_guest_output && REXCVAR_GET(present_upscaler_jitter)) {
-          uint32_t jitter_input_width = 0, jitter_input_height = 0;
-          guest_output_flow.GetEffectInputSize(0, jitter_input_width, jitter_input_height);
-          if (jitter_input_width) {
-            const float ratio =
-                float(guest_output_flow.effect_output_sizes[0].first) / float(jitter_input_width);
-            jitter_phases = std::max(1u, uint32_t(std::ceil(8.0f * ratio * ratio)));
-          }
+        if (camera_allowed && temporal_input_width && REXCVAR_GET(present_upscaler_jitter)) {
+          const float ratio = float(temporal_output_width) / float(temporal_input_width);
+          jitter_phases = std::max(1u, uint32_t(std::ceil(8.0f * ratio * ratio)));
         }
         guest_output_jitter_phases_.store(jitter_phases, std::memory_order_relaxed);
         SetTemporalUpscalerActive(temporal_reads_guest_output);
+        SetTemporalUpscalerMipBias(
+            temporal_input_width
+                ? TemporalUpscalerMipBias(temporal_input_width, temporal_output_width,
+                                          float(REXCVAR_GET(present_upscaler_mip_bias)))
+                : 0.0f);
         for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
           bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
           GuestOutputPaintEffect effect = guest_output_flow.effects[i];

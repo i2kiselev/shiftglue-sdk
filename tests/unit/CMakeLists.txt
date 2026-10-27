@@ -55,6 +55,7 @@ add_executable(unit_tests
     graphics/fm4_shadow_motion_test.cpp
     ui/presentation_pacer_test.cpp
     ui/fm4_dlss_preset_test.cpp
+    ui/upscaler_mip_bias_test.cpp
 )
 
 target_sources(unit_tests PRIVATE

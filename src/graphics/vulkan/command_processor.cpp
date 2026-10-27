@@ -2614,7 +2614,7 @@ bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_sca
     return false;
   }
   // A new texture cache has no samplers yet.
-  sampler_mip_lod_bias_ = REXCVAR_GET(texture_mip_lod_bias);
+  sampler_mip_lod_bias_ = ConfiguredMipLodBias();
   sampler_anisotropic_override_ = REXCVAR_GET(anisotropic_override);
 
   if (REXCVAR_GET(vulkan_fh1_native_executor) && REXCVAR_GET(vulkan_dynamic_rendering) &&
@@ -2864,8 +2864,12 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
                   .count());
 }
 
+double VulkanCommandProcessor::ConfiguredMipLodBias() {
+  return REXCVAR_GET(texture_mip_lod_bias) + ui::GetTemporalUpscalerMipBias();
+}
+
 void VulkanCommandProcessor::RecreateSamplersIfSettingsChanged() {
-  const double mip_lod_bias = REXCVAR_GET(texture_mip_lod_bias);
+  const double mip_lod_bias = ConfiguredMipLodBias();
   const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
   if ((mip_lod_bias == sampler_mip_lod_bias_ &&
        anisotropic_override == sampler_anisotropic_override_) ||
