@@ -114,6 +114,42 @@ TEST_CASE("a range never resolved counts as a first run", "[graphics][readbacks]
   CHECK(readbacks.IsFirstRun(kAddress, kLength));
 }
 
+TEST_CASE("a recurring capture new again after idling is a recurring first run",
+          "[graphics][readbacks]") {
+  Readbacks r;
+  for (uint64_t run = 0; run < Fm4ResolveReadbacks::kRecurringRuns; ++run) r.A(1 + run * 6);
+  CHECK_FALSE(r.readbacks.IsRecurringRun(kAddress, kLength));
+  const auto again = r.A(1000);
+  CHECK(again.recurring);
+  CHECK(r.readbacks.IsFirstRun(kAddress, kLength));
+  CHECK(r.readbacks.IsRecurringRun(kAddress, kLength));
+  r.A(1006);
+  CHECK_FALSE(r.readbacks.IsRecurringRun(kAddress, kLength));
+}
+
+TEST_CASE("a capture with fewer runs is not recurring", "[graphics][readbacks]") {
+  Readbacks r;
+  for (uint64_t run = 0; run + 1 < Fm4ResolveReadbacks::kRecurringRuns; ++run) r.A(1 + run * 6);
+  CHECK_FALSE(r.A(1000).recurring);
+  CHECK_FALSE(r.readbacks.IsRecurringRun(kAddress, kLength));
+}
+
+TEST_CASE("a recurring capture another readback wrote over is not recurring",
+          "[graphics][readbacks]") {
+  Readbacks r;
+  for (uint64_t run = 0; run < Fm4ResolveReadbacks::kRecurringRuns; ++run) r.A(1 + run * 6);
+  CHECK(r.readbacks.Resolve(kAddress, 0x60000, 500, false).read_back);
+  const auto again = r.A(1000);
+  CHECK(again.overwritten);
+  CHECK_FALSE(again.recurring);
+  CHECK_FALSE(r.readbacks.IsRecurringRun(kAddress, kLength));
+}
+
+TEST_CASE("a range never resolved is not recurring", "[graphics][readbacks]") {
+  const Fm4ResolveReadbacks readbacks;
+  CHECK_FALSE(readbacks.IsRecurringRun(kAddress, kLength));
+}
+
 TEST_CASE("readbacks wait for the GPU unless async runs free", "[graphics][readbacks]") {
   CHECK(Fm4ReadbacksWaitForGpu(false, false, false));
   CHECK(Fm4ReadbacksWaitForGpu(true, true, false));

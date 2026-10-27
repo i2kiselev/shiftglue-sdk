@@ -42,11 +42,17 @@ Fm4ResolveReadbacks::Decision Fm4ResolveReadbacks::Resolve(uint32_t address, uin
         }
       }
     }
+    range.recurring = false;
     if (!range.last_used_frame || frame > range.last_used_frame + kIdleFrames ||
         decision.overwritten) {
+      range.recurring = !decision.overwritten && range.readback_sequence &&
+                        range.runs_since_new >= kRecurringRuns;
       range.new_since_frame = frame;
+      range.runs_since_new = 0;
     }
+    ++range.runs_since_new;
     range.run_start_frame = frame;
+    decision.recurring = range.recurring;
   }
   if (decision.run_start && range.last_used_frame) {
     decision.idle_frames = frame - range.last_used_frame;
@@ -66,6 +72,11 @@ Fm4ResolveReadbacks::Decision Fm4ResolveReadbacks::Resolve(uint32_t address, uin
 bool Fm4ResolveReadbacks::IsFirstRun(uint32_t address, uint32_t length) const {
   const auto range = ranges_.find((uint64_t(address) << 32) | length);
   return range == ranges_.end() || range->second.run_start_frame == range->second.new_since_frame;
+}
+
+bool Fm4ResolveReadbacks::IsRecurringRun(uint32_t address, uint32_t length) const {
+  const auto range = ranges_.find((uint64_t(address) << 32) | length);
+  return range != ranges_.end() && range->second.recurring;
 }
 
 bool Fm4ReadbacksWaitForGpu(bool async, bool held, bool first_run_pending) {

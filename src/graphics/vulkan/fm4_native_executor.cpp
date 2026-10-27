@@ -51,6 +51,11 @@ REXCVAR_DEFINE_BOOL(fh1_async_readbacks_hold, false, "GPU",
                     "Read live: while set, readbacks wait as without fh1_async_readbacks. A game "
                     "sets it where it caches what it computes from a capture read too early "
                     "(FM4: the menu car's lighting)");
+REXCVAR_DEFINE_BOOL(fh1_async_recurring_readbacks, true, "GPU",
+                    "Read live: with fh1_async_readbacks, the first run of a capture the game "
+                    "keeps re-rendering does not wait either when it is new again only after "
+                    "an idle gap (FM4: the cars' environment captures mid-race), since guest "
+                    "memory still holds its previous readback; false waits as before");
 REXCVAR_DEFINE_BOOL(fh1_readback_all_resolves, false, "GPU",
                     "Diagnostics: copy every resolve into guest memory, waiting for the GPU, "
                     "not only the captures the CPU is known to read (Vulkan; slow)")
@@ -530,9 +535,10 @@ bool Fh1NativeExecutor::IsOneOffResolve(uint32_t address, uint32_t length) {
       resolve_readbacks_.Resolve(address, length, frame_, REXCVAR_GET(fh1_readback_all_resolves));
   if (REXCVAR_GET(fh1_log_resolve_readbacks) && decision.log) {
     REXGPU_INFO("FH1 readback run {:08X}+{:X} frame {} {}: read back {}, before {}, "
-                "overwritten {}, idle {}, new since {}, previous run {} frames",
+                "overwritten {}, recurring {}, idle {}, new since {}, previous run {} frames",
                 address, length, frame_, decision.run_start ? "start" : "continues",
                 decision.read_back, decision.read_back_before, decision.overwritten,
+                decision.recurring,
                 decision.idle_frames, decision.new_since_frames, decision.previous_run_frames);
   }
   return decision.read_back;

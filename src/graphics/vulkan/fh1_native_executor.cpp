@@ -41,6 +41,7 @@ REXCVAR_DEFINE_BOOL(fh1_scaled_msaa_single_sample, false, "GPU",
                     "host sample. Much less GPU work at 3x and 4x; edges lose their MSAA")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, fh1_readback_all_resolves);
+REXCVAR_DECLARE(bool, fh1_async_recurring_readbacks);
 
 REXCVAR_DEFINE_BOOL(fh1_surface_rows_on_demand, true, "GPU",
                     "Size each FH1 surface image to the rows its uses claim and grow it when a "
@@ -2995,7 +2996,9 @@ void Fh1NativeExecutor::QueueResolveReadback(uint32_t address, uint32_t length) 
   }
   PendingReadback readback = {address, length, readback_used_,
                               command_processor_.GetCurrentSubmission(),
-                              resolve_readbacks_.IsFirstRun(address, length) ||
+                              (resolve_readbacks_.IsFirstRun(address, length) &&
+                               !(REXCVAR_GET(fh1_async_recurring_readbacks) &&
+                                 resolve_readbacks_.IsRecurringRun(address, length))) ||
                                   REXCVAR_GET(fh1_readback_all_resolves)};
   readback_used_ += (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
   config_.memory->Use(VulkanSharedMemory::Usage::kRead);
