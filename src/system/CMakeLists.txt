@@ -63,6 +63,9 @@ set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 # the targets linking rexruntime; rexruntime and the object libraries built
 # into it do not get this definition.
 target_compile_definitions(rexruntime INTERFACE REX_RUNTIME_IMPORTS=1)
+# rexui's PUBLIC definition stops at this library: its users need it too, or
+# they read the Presenter at another class layout than the runtime built.
+target_compile_definitions(rexruntime PUBLIC REX_HAS_FIDELITYFX_SDK=1)
 if(REXGLUE_ENABLE_CS_PROBES)
     target_compile_definitions(rexruntime PUBLIC REXGLUE_ENABLE_CS_PROBES=1)
 endif()
