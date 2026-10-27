@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -49,6 +50,11 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
+
+REXCVAR_DEFINE_STRING(debug_guest_thread_start_delay, "", "Diagnostics",
+                      "<hex start address>:<ms> - every guest thread with that start address "
+                      "waits that long before it runs (reproduces a thread the host starts "
+                      "late)");
 
 REXCVAR_DEFINE_BOOL(cs_ctx_addresses, false, "Diagnostics",
                     "Log thread context ranges for the CS-0.2 sampled traffic ceiling")
@@ -639,6 +645,13 @@ X_STATUS XThread::Create() {
     session_probe::SetThreadTag(thread_id_, creation_params_.start_address);
     current_xthread_tls_ = this;
     if (!cs_scheduler::Enabled()) running_ = true;
+    if (const std::string& delay = REXCVAR_GET(debug_guest_thread_start_delay); !delay.empty()) {
+      uint32_t address = 0, ms = 0;
+      if (std::sscanf(delay.c_str(), "%x:%u", &address, &ms) == 2 &&
+          address == creation_params_.start_address) {
+        rex::thread::Sleep(std::chrono::milliseconds(ms));
+      }
+    }
     Execute();
     running_ = false;
     current_xthread_tls_ = nullptr;
