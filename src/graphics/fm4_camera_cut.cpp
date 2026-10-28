@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace rex::graphics {
 
@@ -70,6 +71,30 @@ uint32_t Fm4MatrixRegister(const std::array<uint64_t, 4>& float_bitmap, bool dyn
   if ((float_bitmap[2] & 0xF) == 0xF) return 128;
   if ((float_bitmap[0] & 0xF) == 0xF) return 0;
   return UINT32_MAX;
+}
+
+bool Fm4PlacedByObjectMatrix(const std::array<uint64_t, 4>& float_bitmap,
+                             const std::array<float, 16>& camera_registers) {
+  if ((float_bitmap[0] & 0xF) != 0xF || (float_bitmap[2] & 0xF) != 0xF) return false;
+  // Gaussian elimination with partial pivoting; a vanishing pivot is a singular matrix, as
+  // the object slots' inversion finds it.
+  double a[4][4];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) a[r][c] = camera_registers[r * 4 + c];
+  }
+  for (int col = 0; col < 4; ++col) {
+    int pivot = col;
+    for (int r = col + 1; r < 4; ++r) {
+      if (std::abs(a[r][col]) > std::abs(a[pivot][col])) pivot = r;
+    }
+    if (std::abs(a[pivot][col]) < 1e-12) return true;
+    std::swap(a[pivot], a[col]);
+    for (int r = col + 1; r < 4; ++r) {
+      const double f = a[r][col] / a[col][col];
+      for (int c = col; c < 4; ++c) a[r][c] -= f * a[col][c];
+    }
+  }
+  return false;
 }
 
 }  // namespace rex::graphics

@@ -239,7 +239,19 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   noted.color_key = CurrentColorKey();
   if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
   if (object_motion_enabled_ && IsSceneObjectDraw(*draw.vertex_shader)) {
-    current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp, std::nullopt);
+    // Still a camera draw for the scene's depth and colour: the showroom's camera draws hold
+    // no matrix in c128-c131 either.
+    if (Fm4PlacedByObjectMatrix(std::to_array(map.float_bitmap), noted.wvp)) {
+      std::array<float, 16> registers;
+      std::memcpy(registers.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                         kObjectFirstRegister * 4],
+                  sizeof(registers));
+      current_object_slot_ =
+          AssignObjectSlot(noted.object, Fm4ObjectMatrix(registers), std::nullopt);
+    } else {
+      current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp, std::nullopt);
+    }
   }
 }
 

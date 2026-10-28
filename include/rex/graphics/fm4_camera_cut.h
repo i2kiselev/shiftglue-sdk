@@ -58,6 +58,14 @@ std::array<float, 16> Fm4ObjectMatrix(const std::array<float, 16>& registers);
 // motion and ghosted behind the windscreen. Such shaders place their mesh by c0-c3.
 uint32_t Fm4MatrixRegister(const std::array<uint64_t, 4>& float_bitmap, bool dynamic_addressing);
 
+// Whether a draw of a shader that reads both register groups is placed by its c0-c3 although
+// it reads c128-c131: those hold no matrix (a singular one). The 599 GTO's exhaust tips read
+// them as constants and their offset; taken for world draws, their reprojection failed and
+// they got the camera's motion, the asphalt's, so a car driving across the screen fizzled
+// at its tail.
+bool Fm4PlacedByObjectMatrix(const std::array<uint64_t, 4>& float_bitmap,
+                             const std::array<float, 16>& camera_registers);
+
 // Whether a world-view-projection (row-major for column vectors, y up) draws the scene turned
 // 180 degrees in clip space: world up landing on clip -y. Races draw it so and the post pass
 // turns it back; the showroom draws it upright, and treating it as turned handed the upscaler

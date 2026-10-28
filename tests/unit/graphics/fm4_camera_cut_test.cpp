@@ -181,3 +181,16 @@ TEST_CASE("a shader indexing its constants is placed by c0-c3, not the camera's 
   CHECK(Fm4MatrixRegister(all, true) == 0);
   CHECK(Fm4MatrixRegister({0x3, 0, 0, 0}, false) == UINT32_MAX);
 }
+
+TEST_CASE("a part reading the camera's registers as plain constants is placed by c0-c3",
+          "[graphics][camera]") {
+  // The 599 GTO's exhaust tips: c128-c131 hold constants and the tip's offset, no matrix.
+  const std::array<float, 16> constants = {0,     0,    0,     1, 0.77f, 0,     0,      1,
+                                           0.5f,  0,    0,     1, -0.9f, 0.24f, 0.04f, 1.07f};
+  const std::array<float, 16> camera = {1.5f, 0, 0, 0, 0, -2, 0, 0, 0, 0, 1, -0.3f, 0, 0, 1, 0};
+  const std::array<uint64_t, 4> both = {0xF, 0, 0xF, 0};
+  const std::array<uint64_t, 4> world = {0, 0, 0xF, 0};
+  CHECK(Fm4PlacedByObjectMatrix(both, constants));
+  CHECK_FALSE(Fm4PlacedByObjectMatrix(both, camera));
+  CHECK_FALSE(Fm4PlacedByObjectMatrix(world, constants));
+}
