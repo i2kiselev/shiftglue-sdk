@@ -505,11 +505,15 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
         static_cast<uint16_t>(rex::ui::ParseVirtualKey(REXCVAR_GET(keybind_start))),
         REXCVAR_GET(keybind_start));
   }
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !has_focus_ || !is_active())
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   bool newly_pressed = vk < 256 && !key_down_[vk];
+  // A key first pressed while the guest was gated (typing into a system
+  // dialog) belongs to the dialog until released, auto-repeat included.
+  if (newly_pressed && e.prev_state())
+    return;
   SetKeyState(vk, true);
   if (newly_pressed) {
     latched_buttons_ |= GetButtonsForKey(key_down_, vk);
@@ -532,7 +536,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
   // A tap is not a mouse: the on-screen controls read touches themselves.
-  if (!IsEnabled() || !has_focus_ || e.from_touch())
+  if (!IsEnabled() || !has_focus_ || e.from_touch() || !is_active())
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {

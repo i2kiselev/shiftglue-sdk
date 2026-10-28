@@ -35,6 +35,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
+#include <rex/kernel/xam/module.h>
 #include <rex/string/numeric.h>
 #include <rex/system.h>
 #include <rex/system/achievement_manager.h>
@@ -266,6 +267,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
   if (auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system())) {
     input_sys->SetActiveCallback([this]() {
       if (guest_input_captures_.load(std::memory_order_acquire) > 0)
+        return false;
+      // A XAM dialog (keyboard, message box) takes the input, as on the 360.
+      if (rex::kernel::xam::xeXamIsUIActive())
         return false;
       if (!imgui_drawer_ ||
           (!debug_overlay_ && !console_overlay_ && !settings_overlay_ && !achievements_overlay_))

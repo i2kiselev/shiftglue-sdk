@@ -30,6 +30,7 @@ add_executable(unit_tests
     input/fm4_mnk_bind_test.cpp
     input/xinputd_ffb_test.cpp
     input/rumble_sender_test.cpp
+    input/mnk_inactive_keys_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
