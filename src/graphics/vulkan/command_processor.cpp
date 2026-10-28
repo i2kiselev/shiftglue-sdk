@@ -6975,7 +6975,9 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
                                                 &pipeline_is_placeholder);
   // A program keeps only built pipelines.
   if (pipeline_is_placeholder) program_recordable = false;
-  if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder &&
+  // Without async_shader_compilation only these variants are built on the
+  // workers (VulkanPipelineCache::background_creation_queue_).
+  if (pipeline_is_placeholder &&
       (pixel_shader_modification.pixel.object_slot_output ||
        pixel_shader_modification.pixel.reactive_output ||
        pixel_shader_modification.pixel.reactive_shadow ||
@@ -7010,6 +7012,13 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
       pipeline_layout_provider = base_layout_provider;
       pipeline_is_placeholder = false;
       ++object_slot_fallback_draws_;
+    } else if (!REXCVAR_GET(async_shader_compilation)) {
+      // No base pipeline to draw with: wait for the variant, as building it
+      // here would have, rather than drop the draw.
+      pipeline_cache_->AwaitPipeline(pipeline_handle, INT32_MAX, nullptr);
+      pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline,
+                                                    pipeline_layout_provider,
+                                                    &pipeline_is_placeholder);
     }
   }
   // vulkan_async_pipeline_bind_on_replay: recorded with the pipeline bound

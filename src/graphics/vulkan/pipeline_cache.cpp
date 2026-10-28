@@ -345,6 +345,14 @@ void main() {
   return source;
 }
 
+// UP-1.7: a pixel shader variant writing a temporal upscaler's object slot or
+// masks.
+bool IsUpscalerVariant(uint64_t pixel_shader_modification) {
+  const SpirvShaderTranslator::Modification modification(pixel_shader_modification);
+  return modification.pixel.object_slot_output || modification.pixel.reactive_output ||
+         modification.pixel.reactive_shadow || modification.pixel.decal_slot_output;
+}
+
 }  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(VulkanCommandProcessor& command_processor,
@@ -1248,6 +1256,9 @@ void VulkanPipelineCache::Shutdown() {
     while (!creation_queue_.empty()) {
       creation_queue_.pop();
     }
+    while (!background_creation_queue_.empty()) {
+      background_creation_queue_.pop();
+    }
     creation_threads_busy_ = 0;
     startup_loading_ = false;
     creation_completion_set_event_ = false;
@@ -1763,8 +1774,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
                    (no_placeholder_ ||
                     (pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE));
+  const bool background_variant = !REXCVAR_GET(async_shader_compilation) &&
+                                  !creation_threads_.empty() && pipeline_handle_out &&
+                                  IsUpscalerVariant(description.pixel_shader_modification);
   uint8_t async_priority = pipeline_util::kPriorityLowest;
-  if (use_async) {
+  if (use_async || background_variant) {
     uint32_t bound_rts =
         pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
     uint32_t shader_writes_color_targets =
@@ -1782,8 +1796,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
       AwaitBackgroundPrewarm(it->second);
       found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
     }
-    if (found_pipeline == VK_NULL_HANDLE && use_async &&
-        no_placeholder_ &&
+    if (found_pipeline == VK_NULL_HANDLE && ((use_async && no_placeholder_) || background_variant) &&
         it->second.is_placeholder.load(std::memory_order_acquire)) {
       // A worker is still building it: the caller skips the draw.
       last_pipeline_ = nullptr;
@@ -1823,14 +1836,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
-  if (use_async && no_placeholder_ && pipeline_handle_out) {
+  if ((use_async && no_placeholder_ && pipeline_handle_out) || background_variant) {
     creation_arguments_real.priority = async_priority;
     pipeline.second.is_placeholder.store(true, std::memory_order_release);
     pipeline.second.pipeline_layout.store(creation_arguments_real.pipeline_layout,
                                           std::memory_order_release);
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
-      creation_queue_.push(creation_arguments_real);
+      (background_variant ? background_creation_queue_ : creation_queue_)
+          .push(creation_arguments_real);
     }
     creation_request_cond_.notify_one();
     if (pipeline_storage_file_ && !description.inspection_view) {
@@ -4665,9 +4679,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 void VulkanPipelineCache::CreationThread(size_t thread_index) {
   while (true) {
     PipelineCreationArguments creation_arguments;
+    bool background;
     {
       std::unique_lock<std::mutex> lock(creation_request_lock_);
-      if (thread_index >= creation_threads_shutdown_from_ || creation_queue_.empty()) {
+      background = creation_queue_.empty();
+      if (thread_index >= creation_threads_shutdown_from_ ||
+          (background && background_creation_queue_.empty())) {
         if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
           creation_completion_set_event_ = false;
           creation_completion_event_->Set();
@@ -4678,9 +4695,19 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
         creation_request_cond_.wait(lock);
         continue;
       }
-      creation_arguments = creation_queue_.top();
-      creation_queue_.pop();
-      ++creation_threads_busy_;
+      if (background) {
+        // A submission waiting for the queue must not wait for this one too.
+        if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
+          creation_completion_set_event_ = false;
+          creation_completion_event_->Set();
+        }
+        creation_arguments = background_creation_queue_.top();
+        background_creation_queue_.pop();
+      } else {
+        creation_arguments = creation_queue_.top();
+        creation_queue_.pop();
+        ++creation_threads_busy_;
+      }
     }
 
     bool created = EnsurePipelineCreated(creation_arguments);
@@ -4702,7 +4729,7 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       }
     }
 
-    {
+    if (!background) {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
     }

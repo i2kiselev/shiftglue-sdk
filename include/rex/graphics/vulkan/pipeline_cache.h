@@ -593,6 +593,14 @@ class VulkanPipelineCache {
   std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
                       PipelineCreationArgumentsPriorityComparator>
       creation_queue_;
+  // A temporal upscaler's variants of pipelines (slot or mask writing pixel
+  // shaders) while async_shader_compilation is off: their draws use the base
+  // pipeline until a worker has built them, so neither the submission's end
+  // nor creation_threads_busy_ waits for them. Workers take them only when
+  // creation_queue_ is empty.
+  std::priority_queue<PipelineCreationArguments, std::vector<PipelineCreationArguments>,
+                      PipelineCreationArgumentsPriorityComparator>
+      background_creation_queue_;
   size_t creation_threads_busy_ = 0;
   bool startup_loading_ = false;
   std::unique_ptr<rex::thread::Event> creation_completion_event_;
