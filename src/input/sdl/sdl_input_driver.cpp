@@ -278,7 +278,15 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
       sdl_events_unflushed_(0),
       sdl_pumpevents_queued_(false),
       controllers_(),
-      controllers_mutex_() {}
+      controllers_mutex_(),
+      rumble_([](uint32_t pad, uint16_t left, uint16_t right) {
+        // XInput vibration holds until the guest changes it, but SDL rumble
+        // expires, and a zero duration expires on the next
+        // SDL_UpdateJoysticks. Arm it for SDL's maximum instead; each call
+        // cancels the previous effect anyway. A pad closed meanwhile is
+        // looked up as null or rejected by SDL's handle check.
+        SDL_RumbleGamepad(SDL_GetGamepadFromID(pad), left, right, kRumbleDurationMs);
+      }) {}
 
 SDLInputDriver::~SDLInputDriver() {
   if (xinputd_ffb::GetSink() == this) {
@@ -396,6 +404,7 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
     }
     feedback_released_ = true;
+    rumble_.Stop();
     {
       auto guard = DrainAndLock();
       for (auto& controller : controllers_) {
@@ -473,12 +482,8 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
   for (const auto& controller : controllers_) {
     DeviceInfo info;
     info.id = controller.id;
-    const char* name = SDL_GetGamepadName(controller.sdl);
-    info.name = name ? name : "";
-    char guid_text[33] = {};
-    SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(controller.sdl)), guid_text,
-                     static_cast<int>(sizeof(guid_text)));
-    info.guid = guid_text;
+    info.name = controller.name;
+    info.guid = controller.guid;
     info.synthetic = false;
     info.family = controller.family;
     info.vendor_id = controller.vendor_id;
@@ -606,13 +611,11 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // XInput vibration holds until the guest changes it, but SDL rumble expires,
-  // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
-  // SDL's maximum instead; each call cancels the previous effect anyway.
-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
-                           vibration->right_motor_speed, kRumbleDurationMs)
-             ? X_ERROR_SUCCESS
-             : X_ERROR_FUNCTION_FAILED;
+  // Titles set vibration from their main loop, and SDL's rumble call waits for
+  // the radio over Bluetooth; the pad's own result is not waited for either.
+  rumble_.Post(controller->instance_id, vibration->left_motor_speed,
+               vibration->right_motor_speed);
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
@@ -864,6 +867,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.id = AllocateDeviceId();
   state.state_changed = true;  // XInput starts with packet_number = 1
   SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller);
+  state.instance_id = SDL_GetJoystickID(joystick);
   state.wheel_type = SDL_GetJoystickType(joystick) == SDL_JOYSTICK_TYPE_WHEEL;
   char guid_text[33] = {};
   SDL_GUIDToString(SDL_GetJoystickGUID(joystick), guid_text, static_cast<int>(sizeof(guid_text)));
@@ -877,6 +881,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   state.vendor_id = SDL_GetGamepadVendor(controller);
   state.product_id = SDL_GetGamepadProduct(controller);
   const char* pad_name = SDL_GetGamepadName(controller);
+  state.name = pad_name ? pad_name : "";
   state.steam_virtual = SDL_GetGamepadSteamHandle(controller) != 0 ||
                         (pad_name && std::string_view(pad_name) == "Steam Virtual Gamepad");
   const SDL_PropertiesID properties = SDL_GetGamepadProperties(controller);
@@ -1866,6 +1871,7 @@ void SDLInputDriver::ReleaseFeedback(bool crashing) {
   // send effects again after this.
   feedback_released_ = true;
   if (!crashing) {
+    rumble_.Stop();
     auto guard = DrainAndLock();
     for (auto& controller : controllers_) {
       ReleaseFeedbackLocked(controller);
@@ -1897,6 +1903,9 @@ void SDLInputDriver::ReleaseFeedback(bool crashing) {
       }
     };
     write_direct();
+    // After the direct writes: should the rumble thread be the one that
+    // crashed, this never returns and only the motors keep running.
+    rumble_.Stop();
     // SDL's own calls are thread-safe, so a lock held by a dead thread does
     // not stop these.
     for (auto& controller : controllers_) {
@@ -2235,12 +2244,7 @@ void SDLInputDriver::SetRumble(uint16_t left, uint16_t right) {
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
   // Loop through our controllers and try to match the given ID.
   for (size_t i = 0; i < controllers_.size(); i++) {
-    auto controller = controllers_.at(i).sdl;
-    auto joystick = SDL_GetGamepadJoystick(controller);
-    assert(joystick);
-    auto joy_instance_id = SDL_GetJoystickID(joystick);
-    assert(joy_instance_id >= 0);
-    if (joy_instance_id == instance_id) {
+    if (controllers_[i].instance_id == instance_id) {
       return i;
     }
   }

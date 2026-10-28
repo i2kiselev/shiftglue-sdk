@@ -36,10 +36,11 @@ target_include_directories(rexinput PUBLIC
 )
 if(WIN32)
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp sdl/joystick_mapping.cpp
-        sdl/wheel.cpp sdl/wheel_mapping.cpp sdl/hid_direct_win.cpp xinput/xinput_input_driver.cpp)
+        sdl/wheel.cpp sdl/wheel_mapping.cpp sdl/rumble_sender.cpp sdl/hid_direct_win.cpp
+        xinput/xinput_input_driver.cpp)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp sdl/joystick_mapping.cpp
-        sdl/wheel.cpp sdl/wheel_mapping.cpp)
+        sdl/wheel.cpp sdl/wheel_mapping.cpp sdl/rumble_sender.cpp)
 endif()
 
 target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)

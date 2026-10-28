@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/sdl/rumble_sender.h>
 #include <rex/input/sdl/wheel_mapping.h>
 #include <rex/input/xinputd_ffb.h>
 
@@ -90,6 +91,11 @@ class SDLInputDriver final : public InputDriver,
 
   struct ControllerState {
     SDL_Gamepad* sdl;
+    // Read once at open, like `guid`: every SDL call takes SDL's joystick
+    // lock, which a Bluetooth rumble write holds for 10 ms or more, and the
+    // title polls from its main loop.
+    SDL_JoystickID instance_id = 0;
+    std::string name;
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
     bool state_changed;
@@ -275,6 +281,8 @@ class SDLInputDriver final : public InputDriver,
   int player_led_hint_ = -1;
   uint64_t log_window_start_ns_ = 0;
   uint64_t log_window_reports_ = 0;
+  // Pads' vibration, by SDL joystick instance id.
+  RumbleSender rumble_;
 };
 
 }  // namespace rex::input::sdl
