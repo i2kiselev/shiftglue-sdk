@@ -41,6 +41,20 @@ TEST_CASE("Scene jitter colour surfaces ignore the format they are viewed throug
   CHECK_FALSE(Fm4SameColorSurface(0x0C0205000100, 0x0C0205000000));
 }
 
+TEST_CASE("A texture drawn through the scene's EDRAM is not the scene", "[jitter]") {
+  // The cockpit's dash displays: k_8_8_8_8 at the scene's base and pitch, before the scene,
+  // drawn in races through 2_10_10_10_FLOAT (3) and its 16_16_16_16 view (C).
+  CHECK(Fm4SceneEdramTexture(0x00005000000, 0xF, 0x30005000000));
+  CHECK(Fm4SceneEdramTexture(0x10005000000, 0xF, 0xC0005000000));
+  CHECK_FALSE(Fm4SceneEdramTexture(0xC0005000000, 0xF, 0x30005000000));
+  CHECK_FALSE(Fm4SceneEdramTexture(0xA0005000000, 0xF, 0x30005000000));
+  // Depth only, or another surface.
+  CHECK_FALSE(Fm4SceneEdramTexture(0x00005000000, 0, 0x30005000000));
+  CHECK_FALSE(Fm4SceneEdramTexture(0x00002800000, 0xF, 0x30005000000));
+  // A scene drawn in k_8_8_8_8 itself.
+  CHECK_FALSE(Fm4SceneEdramTexture(0x00005000000, 0xF, 0x00005000000));
+}
+
 TEST_CASE("Scene jitter takes placed draws on the scene's depth or colour", "[jitter]") {
   // A car layer testing the scene's depth without writing it.
   CHECK(Fm4JitterSceneDraw(Fm4DrawPlacement::kObject, true, true));

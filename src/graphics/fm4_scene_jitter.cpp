@@ -14,6 +14,13 @@ bool Fm4SameColorSurface(uint64_t a, uint64_t b) {
   return ((a ^ b) & kSurfaceBits) == 0;
 }
 
+bool Fm4SceneEdramTexture(uint64_t color_key, uint32_t color_mask, uint64_t scene_color_key) {
+  // k_8_8_8_8 and k_8_8_8_8_GAMMA.
+  const auto eight_bit = [](uint64_t key) { return ((key >> 40) & 0xF) <= 1; };
+  return (color_mask & 0xF) && Fm4SameColorSurface(color_key, scene_color_key) &&
+         eight_bit(color_key) && !eight_bit(scene_color_key);
+}
+
 bool Fm4JitterSceneDraw(Fm4DrawPlacement placement, bool tests_scene_depth,
                         bool writes_scene_color) {
   return placement != Fm4DrawPlacement::kUnplaced && (tests_scene_depth || writes_scene_color);

@@ -171,6 +171,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
       draw.memexport) {
     return;
   }
+  if (IsSceneEdramTexture()) return;
   const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
   draw_jittered_ =
       camera_scene_depth_valid_ &&
@@ -405,10 +406,16 @@ uint32_t Fh1NativeExecutor::SceneObjectMatrixRegister(const Shader& vertex_shade
   // behind it.
   const auto depth_control = register_file_.Get<reg::RB_DEPTHCONTROL>();
   if (!depth_control.z_enable || !depth_control.z_write_enable ||
-      CurrentDepthKey() != camera_scene_depth_) {
+      CurrentDepthKey() != camera_scene_depth_ || IsSceneEdramTexture()) {
     return UINT32_MAX;
   }
   return matrix_register;
+}
+
+bool Fh1NativeExecutor::IsSceneEdramTexture() const {
+  return camera_scene_depth_valid_ &&
+         Fm4SceneEdramTexture(CurrentColorKey(), register_file_.values[XE_GPU_REG_RB_COLOR_MASK],
+                              camera_scene_color_);
 }
 
 uint32_t Fh1NativeExecutor::DrawObjectMatrixRegister(const Shader& vertex_shader) const {

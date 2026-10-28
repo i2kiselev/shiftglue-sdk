@@ -662,6 +662,8 @@ class Fh1NativeExecutor {
   // As DrawObjectMatrixRegister, for draws testing and writing the scene's
   // depth while the camera is tracked; UINT32_MAX for others.
   uint32_t SceneObjectMatrixRegister(const Shader& vertex_shader) const;
+  // Whether the draw renders a texture through the scene's EDRAM (Fm4SceneEdramTexture).
+  bool IsSceneEdramTexture() const;
   uint32_t CurrentDepthKey() const;
   uint64_t DrawObjectKey(const Fh1DrawInfo& draw) const;
   uint32_t jitter_index_ = 0;

@@ -20,6 +20,13 @@ Fm4DrawPlacement Fm4JitterPlacement(const uint64_t (&float_bitmap)[4]);
 // surface, whatever format each draw views it through.
 bool Fm4SameColorSurface(uint64_t a, uint64_t b);
 
+// Whether a draw renders a texture through the scene's EDRAM rather than the scene: it writes
+// colour to the scene's surface in k_8_8_8_8 (or its gamma view) where the scene is drawn in
+// another format. The cockpit draws its dash displays so before the scene, testing the scene's
+// depth; jittered, they shook the displays' texture, and their object slots (near, with c0-c3
+// holding the screen size and colours) won over the cabin's in the slot image.
+bool Fm4SceneEdramTexture(uint64_t color_key, uint32_t color_mask, uint64_t scene_color_key);
+
 // Whether a draw is jittered: placed by a matrix, and testing the scene's depth or writing
 // the scene's colour surface.
 bool Fm4JitterSceneDraw(Fm4DrawPlacement placement, bool tests_scene_depth,

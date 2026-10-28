@@ -3694,6 +3694,12 @@ void main() {
     imageStore(motion, pixel, vec4(10.0 * reactive_value * c.size_inv.x, 0.0, 0.0, 0.0));
     return;
   }
+  // FM4's cockpit puts the cabin at the near plane after drawing the car (a depth-only mesh,
+  // stored depth 1), so the world behind it is rejected early: there the cabin's own depth is
+  // the nearest slotted fragment's. Where that is no object's (the sky dome, following the
+  // camera, fails the depth test nearer than the roof lining), the cabin stays still on the
+  // screen: it moves with the camera.
+  bool near_mask = stored_z > 1.0 - (1.0 / 65536.0);
   // UP-1.7: the nearest scene object drawn at the pixel, if it is what the
   // depth holds (not something drawn over it without a slot), moves with
   // its own reprojection.
@@ -3701,8 +3707,9 @@ void main() {
   uint object_count = c.object_count & 0xFFFFu;
   if (((c.object_count >> 16u) & 1u) != 0u) {
     uint key = all(lessThan(scene_pixel, slots_size)) ? imageLoad(object_slots, scene_pixel).r : 0u;
-    bool match = abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
-                 (1.0 / 65536.0);
+    bool match = near_mask ||
+                 abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
+                     (1.0 / 65536.0);
     imageStore(depth, pixel, vec4(z, 0.0, 0.0, 0.0));
     imageStore(motion, pixel,
                vec4(key != 0u ? vec2(float(key & 0xFFu) / 255.0 * 0.2, match ? 0.1 : -0.1)
@@ -3712,10 +3719,16 @@ void main() {
   if (object_count != 0u && all(lessThan(scene_pixel, slots_size))) {
     uint key = imageLoad(object_slots, scene_pixel).r;
     uint slot = key & 0xFFu;
+    float slot_z = float(key >> 8u) * (c.object_depth_scale / 16777215.0);
     if (slot != 0u && slot < object_count &&
-        abs(float(key >> 8u) * (c.object_depth_scale / 16777215.0) - stored_z) <
-            (1.0 / 65536.0)) {
+        (near_mask || abs(slot_z - stored_z) < (1.0 / 65536.0))) {
       reprojection = object_reprojections[slot];
+      if (near_mask) {
+        stored_z = slot_z;
+        z = 1.0 - slot_z;
+      }
+    } else if (near_mask) {
+      reprojection = mat4(1.0);
     }
   }
   // Other cars' ground shadows move with their part where they lie on what the
