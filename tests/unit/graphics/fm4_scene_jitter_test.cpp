@@ -75,3 +75,14 @@ TEST_CASE("Upscaler alpha to coverage takes one steady threshold", "[alpha_dithe
   CHECK(Fm4UpscalerAlphaToMask(0x78 | (1 << 8)) == (0xAA | (1u << 8) | kUniform));
   CHECK(Fm4UpscalerAlphaToMask(0xAA | (1 << 8)) == (0xAA | (1u << 8) | kUniform));
 }
+
+TEST_CASE("The rear-view mirror is the 384x128 colour resolve", "[mirror]") {
+  // Mugello, cockpit and hood cameras: the mirror's target resolved to a k_8_8_8_8 texture.
+  CHECK(Fm4MirrorResolve(384, 128, false));
+  CHECK_FALSE(Fm4MirrorResolve(384, 128, true));
+  // The windshield's reflection, a reflection cube face, the ground shadow and the scene.
+  CHECK_FALSE(Fm4MirrorResolve(640, 360, false));
+  CHECK_FALSE(Fm4MirrorResolve(256, 256, false));
+  CHECK_FALSE(Fm4MirrorResolve(512, 512, false));
+  CHECK_FALSE(Fm4MirrorResolve(1280, 720, false));
+}

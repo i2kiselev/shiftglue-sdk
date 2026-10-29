@@ -199,6 +199,9 @@ class Fh1NativeExecutor {
   // Other cars' ground shadows move with the part whose world matrix they read
   // (Fm4ShadowDecalDraw): they mark the third plane with that part's slot.
   void SetDecalMotion(bool enabled) { decal_motion_enabled_ = enabled; }
+  // FM4's mirror glass (Fm4MirrorResolve) is drawn unjittered into a slot of its own, which
+  // the swap pass marks for the frame to be put back over the upscale.
+  void SetMirrorComposite(bool enabled) { mirror_composite_enabled_ = enabled; }
   bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
@@ -237,6 +240,8 @@ class Fh1NativeExecutor {
   }
   // The ground shadow's slot in that table, 0 without one.
   uint32_t object_shadow_slot_ready() const { return object_shadow_slot_ready_; }
+  // The mirror glass's slot in that table, 0 without one.
+  uint32_t object_mirror_slot_ready() const { return object_mirror_slot_ready_; }
   // Host depth to the camera depth copy's (float24 depth is kept halved).
   float camera_depth_scale() const { return camera_depth_scale_; }
 
@@ -643,6 +648,14 @@ class Fh1NativeExecutor {
   std::unordered_map<uint64_t, std::array<float, 16>> object_previous_world_;
   std::vector<std::array<float, 16>> object_reprojections_ready_;
   uint32_t object_shadow_slot_ready_ = 0;
+  // The mirror's texture (its last resolve's destination, 0 before one), this frame's mirror
+  // slot (the first mirror draw's reprojection) and the swapped frame's.
+  bool mirror_composite_enabled_ = true;
+  uint32_t mirror_texture_base_ = 0;
+  uint32_t mirror_slot_ = 0;
+  uint32_t object_mirror_slot_ready_ = 0;
+  bool SamplesMirror(const Shader& pixel_shader) const;
+  uint32_t MirrorSlot(uint32_t slot);
   // The car's meshes this frame by vertex buffer: their object slots in the scene, and how
   // often each was drawn there and in the shadow map pass (once to be matched; Fm4ShadowSlot).
   struct ShadowPart {

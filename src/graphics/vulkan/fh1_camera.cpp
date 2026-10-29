@@ -180,6 +180,8 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                              CurrentDepthKey() == camera_scene_depth_,
                          (draw.normalized_color_mask & 0xF) &&
                              Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
+  const bool mirror = mirror_composite_enabled_ && draw.pixel_shader &&
+                      SamplesMirror(*draw.pixel_shader);
   if (DrawObjectMatrixRegister(*draw.vertex_shader) != kCameraFirstRegister) {
     // UP-1.7: a car, with its own matrix in c0-c3.
     if (!object_motion_enabled_ ||
@@ -228,6 +230,7 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
       object_slot_by_world_.emplace(WorldMatrixKey(), current_object_slot_);
     }
     if (shadow_motion_enabled_) NoteShadowPart(shadow_scene_parts_, draw, current_object_slot_);
+    if (mirror) current_object_slot_ = MirrorSlot(current_object_slot_);
     return;
   }
   if (!draw.normalized_depth_control.z_enable) return;
@@ -253,7 +256,40 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
     } else {
       current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp, std::nullopt);
     }
+    if (mirror) current_object_slot_ = MirrorSlot(current_object_slot_);
   }
+}
+
+bool Fh1NativeExecutor::SamplesMirror(const Shader& pixel_shader) const {
+  if (!mirror_texture_base_) return false;
+  const std::vector<Shader::TextureBinding>& bindings = pixel_shader.texture_bindings();
+  return std::any_of(bindings.begin(), bindings.end(),
+                     [this](const Shader::TextureBinding& binding) {
+                       return register_file_.GetTextureFetch(binding.fetch_constant).base_address
+                                  << 12 ==
+                              mirror_texture_base_;
+                     });
+}
+
+uint32_t Fh1NativeExecutor::MirrorSlot(uint32_t slot) {
+  // One a frame, not shared with the objects that move as the glass does. Without a previous
+  // match the glass stays still: the swap pass puts the frame back over it anyway.
+  if (!mirror_slot_) {
+    if (object_reprojections_.size() >= kMaxObjectSlots) {
+      Count("object_slots_full");
+      return slot;
+    }
+    if (object_reprojections_.empty()) object_reprojections_.emplace_back();
+    const std::array<float, 16> reprojection =
+        slot ? object_reprojections_[slot]
+             : std::array<float, 16>{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    object_reprojections_.push_back(reprojection);
+    mirror_slot_ = uint32_t(object_reprojections_.size() - 1);
+  }
+  // The frame put back must not shake by the jitter.
+  draw_jittered_ = false;
+  Count("mirror_draw");
+  return mirror_slot_;
 }
 
 uint64_t Fh1NativeExecutor::WorldMatrixKey() const {
@@ -498,6 +534,9 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   object_current_world_.clear();
   object_reprojections_ready_.clear();
   object_shadow_slot_ready_ = 0;
+  object_mirror_slot_ready_ = 0;
+  const uint32_t mirror_slot = mirror_slot_;
+  mirror_slot_ = 0;
   const uint32_t shadow_slot = TakeShadowSlot();
   if (!camera_tracking_enabled_ || camera_draws_.empty()) {
     camera_scene_depth_valid_ = false;
@@ -633,6 +672,7 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera_previous_objects_ = std::move(objects);
   if (!camera.cut) {
     if (shadow_slot < object_reprojections.size()) object_shadow_slot_ready_ = shadow_slot;
+    if (mirror_slot < object_reprojections.size()) object_mirror_slot_ready_ = mirror_slot;
     if (object_reprojections.size() > 1) Count("camera_object_frame");
     if ((frame_ % 600) == 0) {
       REXGPU_INFO("FH1 camera: {} object reprojections",

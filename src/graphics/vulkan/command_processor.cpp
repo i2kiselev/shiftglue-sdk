@@ -107,6 +107,11 @@ REXCVAR_DEFINE_BOOL(present_upscaler_decal_motion, true, "GPU",
                     "parts' (FM4): with the ground's, DLAA trailed them behind the cars and "
                     "fizzled at the tyres");
 
+REXCVAR_DEFINE_BOOL(present_upscaler_mirrors, true, "GPU",
+                    "Draw the game's mirrors (FM4) unjittered and put them back after a "
+                    "temporal upscale from the frame, as the HUD: their reflections move with "
+                    "the mirror's own camera, which the upscaler cannot follow, and smeared");
+
 REXCVAR_DEFINE_BOOL(present_upscaler_spin_free_wheels, true, "GPU",
                     "Give a temporal upscaler spinning wheels' motion without the spin (FM4): "
                     "the spin itself is too fast to follow and drew light lines along the car "
@@ -3646,6 +3651,10 @@ layout(push_constant) uniform SwapCameraConstants {
   // source depth's scale.
   uint object_count;
   float object_depth_scale;
+  // FM4's mirror glass's slot (0: none). Its reflection has no motion an upscaler could
+  // follow, so where it is what the depth holds the HUD-less image's alpha marks it, and the
+  // frame is put back over the upscale there as for the HUD.
+  uint mirror_slot;
 } c;
 layout(set = 0, binding = 0) uniform texture2D source_depth;
 layout(set = 0, binding = 1, r32f) writeonly uniform image2D depth;
@@ -3658,6 +3667,7 @@ layout(set = 0, binding = 4, std430) readonly buffer ObjectReprojections {
   layout(row_major) mat4 object_reprojections[];
 };
 layout(set = 0, binding = 5, r8) writeonly uniform image2D reactive;
+layout(set = 0, binding = 6, rgb10_a2) uniform image2D hudless;
 void main() {
   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
   if (any(greaterThanEqual(uvec2(pixel), c.size))) {
@@ -3723,6 +3733,27 @@ void main() {
     if (slot != 0u && slot < object_count &&
         (near_mask || abs(slot_z - stored_z) < (1.0 / 65536.0))) {
       reprojection = object_reprojections[slot];
+      // Faded in over three pixels from the glass's rim, which stays the upscaler's: the
+      // jittered frame around the glass moves over its edge pixels frame to frame, and a hard
+      // border showed the render's pixel steps along the curved edges.
+      if (slot == c.mirror_slot) {
+        const ivec2 kRing[8] = ivec2[8](ivec2(-1, -1), ivec2(0, -1), ivec2(1, -1), ivec2(-1, 0),
+                                        ivec2(1, 0), ivec2(-1, 1), ivec2(0, 1), ivec2(1, 1));
+        float inside = 0.0;
+        for (int radius = 1; radius <= 3; ++radius) {
+          bool ring = true;
+          for (int i = 0; i < 8 && ring; ++i) {
+            ivec2 neighbour = clamp(scene_pixel + radius * kRing[i], ivec2(0), slots_size - 1);
+            ring = (imageLoad(object_slots, neighbour).r & 0xFFu) == slot;
+          }
+          if (!ring) break;
+          inside += 1.0 / 3.0;
+        }
+        if (inside > 0.0) {
+          vec4 hudless_pixel = imageLoad(hudless, pixel);
+          imageStore(hudless, pixel, vec4(hudless_pixel.rgb, max(hudless_pixel.a, inside)));
+        }
+      }
       if (near_mask) {
         stored_z = slot_z;
         z = 1.0 - slot_z;
@@ -3777,8 +3808,8 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  VkDescriptorSetLayoutBinding bindings[6] = {};
-  for (uint32_t i = 0; i < 6; ++i) {
+  VkDescriptorSetLayoutBinding bindings[7] = {};
+  for (uint32_t i = 0; i < 7; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType = i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
                                  : i    ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
@@ -3788,7 +3819,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 6;
+  set_layout_info.bindingCount = 7;
   set_layout_info.pBindings = bindings;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &swap_camera_set_layout_) != VK_SUCCESS) {
@@ -3796,7 +3827,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(float) * 16 + sizeof(uint32_t) * 6};
+                                             sizeof(float) * 16 + sizeof(uint32_t) * 7};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -3810,7 +3841,7 @@ bool VulkanCommandProcessor::EnsureSwapCamera() {
   }
   VkDescriptorPoolSize pool_sizes[3] = {
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4 * kMaxFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5 * kMaxFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxFramesInFlight},
   };
   VkDescriptorPoolCreateInfo pool_info = {};
@@ -4168,6 +4199,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
     fh1_native_executor_->SetSpinFreeWheels(REXCVAR_GET(present_upscaler_spin_free_wheels));
     fh1_native_executor_->SetShadowMotion(REXCVAR_GET(present_upscaler_shadow_motion));
     fh1_native_executor_->SetDecalMotion(REXCVAR_GET(present_upscaler_decal_motion));
+    fh1_native_executor_->SetMirrorComposite(hudless_wanted &&
+                                             REXCVAR_GET(present_upscaler_mirrors));
     fh1_native_executor_->SetJitterPhases(camera_wanted ? presenter->GuestOutputJitterPhases()
                                                         : 0u);
     if (camera_wanted) {
@@ -4631,6 +4664,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           // upscaler: the scene before the HUD through the same gamma ramp,
           // then the HUD's coverage into its alpha. Not where a frame has no
           // snapshot (menus), whose guest output is all HUD.
+          bool hudless_written = false;
           VkPipeline hudless_gamma_pipeline = use_pwl_gamma_ramp
                                                   ? swap_apply_gamma_compute_pwl_pipeline_
                                                   : swap_apply_gamma_compute_256_entry_table_pipeline_;
@@ -4722,11 +4756,12 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_IMAGE_LAYOUT_GENERAL,
                                    ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
             vulkan_context.SetHudlessWritten();
+            hudless_written = true;
           }
 
           // UP-1.3 and UP-1.4: the depth and camera motion beside it.
           if (camera_depth_view != VK_NULL_HANDLE && EnsureSwapCamera() &&
-              vulkan_context.EnsureCameraImages()) {
+              vulkan_context.EnsureCameraImages() && vulkan_context.EnsureHudlessImage()) {
             const bool camera_written_before = vulkan_context.camera_ever_written_previously();
             for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image(),
                                   vulkan_context.reactive_image()}) {
@@ -4739,6 +4774,18 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                         : 0,
                   VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
             }
+            // Bound in every frame; marked (mirror glass) only in one with a HUD-less image.
+            const bool hudless_kept = vulkan_context.hudless_ever_written_previously();
+            PushImageMemoryBarrier(
+                vulkan_context.hudless_image(), guest_output_subresource_range,
+                hudless_kept ? ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask
+                             : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                hudless_kept ? ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask : 0,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                hudless_kept ? ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout
+                             : VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_GENERAL);
             SubmitBarriers(true);
             VkDescriptorSet camera_set = swap_camera_sets_[swap_frame_index];
             // UP-1.7: the object slots the scene's draws wrote, made
@@ -4776,18 +4823,19 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                   GetVulkanDevice(), swap_object_table_memories_[swap_frame_index],
                   swap_object_table_memory_types_[swap_frame_index]);
             }
-            VkDescriptorImageInfo camera_infos[6] = {
+            VkDescriptorImageInfo camera_infos[7] = {
                 {VK_NULL_HANDLE, camera_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                 {VK_NULL_HANDLE, vulkan_context.depth_image_view(), VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, vulkan_context.motion_image_view(), VK_IMAGE_LAYOUT_GENERAL},
                 {VK_NULL_HANDLE, object_slot_image_view_, VK_IMAGE_LAYOUT_GENERAL},
                 {},
                 {VK_NULL_HANDLE, vulkan_context.reactive_image_view(), VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, vulkan_context.hudless_image_view(), VK_IMAGE_LAYOUT_GENERAL},
             };
             const VkDescriptorBufferInfo object_table_info = {
                 swap_object_table_buffers_[swap_frame_index], 0, VK_WHOLE_SIZE};
-            VkWriteDescriptorSet camera_writes[6] = {};
-            for (uint32_t i = 0; i < 6; ++i) {
+            VkWriteDescriptorSet camera_writes[7] = {};
+            for (uint32_t i = 0; i < 7; ++i) {
               camera_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
               camera_writes[i].dstSet = camera_set;
               camera_writes[i].dstBinding = i;
@@ -4801,7 +4849,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                 camera_writes[i].pImageInfo = &camera_infos[i];
               }
             }
-            dfn.vkUpdateDescriptorSets(device, 6, camera_writes, 0, nullptr);
+            dfn.vkUpdateDescriptorSets(device, 7, camera_writes, 0, nullptr);
             deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                              swap_camera_pipeline_layout_, 0, 1,
                                                              &camera_set, 0, nullptr);
@@ -4811,6 +4859,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
               float size_inv[2];
               uint32_t object_count;
               float object_depth_scale;
+              uint32_t mirror_slot;
             } camera_constants;
             std::memcpy(camera_constants.reprojection, camera.reprojection,
                         sizeof(camera_constants.reprojection));
@@ -4837,6 +4886,11 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                   reactive_shadow_draws_, decal_draws_);
             }
             camera_constants.object_depth_scale = fh1_native_executor_->camera_depth_scale();
+            // Without this frame's HUD-less image the composite does not run.
+            camera_constants.mirror_slot =
+                object_slots_readable && hudless_written
+                    ? fh1_native_executor_->object_mirror_slot_ready()
+                    : 0u;
             object_slot_draws_ = 0;
             object_slot_fallback_draws_ = 0;
             reactive_draws_ = 0;
@@ -4852,7 +4906,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             ClearObjectSlotImage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
                                  VK_IMAGE_LAYOUT_GENERAL);
             for (VkImage image : {vulkan_context.depth_image(), vulkan_context.motion_image(),
-                                  vulkan_context.reactive_image()}) {
+                                  vulkan_context.reactive_image(), vulkan_context.hudless_image()}) {
               PushImageMemoryBarrier(image, guest_output_subresource_range,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,

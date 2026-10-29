@@ -12,6 +12,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/registers.h>
@@ -3135,6 +3136,9 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
     LogSkippedResolve(plan);
     Skip(plan.skip);
     return false;
+  }
+  if (plan.copy && Fm4MirrorResolve(plan.x1 - plan.x0, plan.y1 - plan.y0, plan.copying_depth)) {
+    mirror_texture_base_ = plan.info.copy_dest_base;
   }
   bool succeeded = true;
   if (inspection_ && plan.copy) InspectResolve(plan, untile_band);

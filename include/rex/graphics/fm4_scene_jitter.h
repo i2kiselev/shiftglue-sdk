@@ -32,6 +32,13 @@ bool Fm4SceneEdramTexture(uint64_t color_key, uint32_t color_mask, uint64_t scen
 bool Fm4JitterSceneDraw(Fm4DrawPlacement placement, bool tests_scene_depth,
                         bool writes_scene_color);
 
+// Whether a resolve copies FM4's rear-view mirror: drawn with a camera of its own into a
+// 384x128 target, then sampled in the scene by the mirror glass (the cockpit's mirrors, the
+// hood camera's mirror at the top of the screen). Its reflection moves with that
+// camera, not with the glass, so an upscaler given the glass's motion smeared it: the glass is
+// drawn unjittered and put back after the upscale from the frame, as the HUD is.
+bool Fm4MirrorResolve(int32_t width, int32_t height, bool depth);
+
 // Alpha to coverage (the alpha_to_mask system constant: 2-bit dither offsets by a pixel's
 // place in its 2x2 quad, bit 8 enabled) for a draw a temporal upscaler jitters: one steady
 // threshold, 0.5, in every pixel, and the bit below turns the shader's ordered dither over a
