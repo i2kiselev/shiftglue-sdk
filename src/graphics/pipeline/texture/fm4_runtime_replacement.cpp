@@ -3,6 +3,9 @@
  *
  * @brief       Texture replacements an app supplies at run time (FM4).
  *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */

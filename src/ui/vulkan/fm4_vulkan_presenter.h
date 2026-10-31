@@ -1,3 +1,12 @@
+/**
+ * @file        ui/vulkan/fm4_vulkan_presenter.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 
 // FM4's additions to VulkanPresenter: vulkan_present_mode and DXGI

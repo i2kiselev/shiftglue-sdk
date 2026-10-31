@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_decal_motion.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // The motion a temporal upscaler gets for FM4's other cars' ground shadows. Each car's shadow
 // is drawn after the scene as its parts flattened onto the ground (the body's mesh, a pair of

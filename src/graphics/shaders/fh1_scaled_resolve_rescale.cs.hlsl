@@ -1,3 +1,12 @@
+/**
+ * @file        graphics/shaders/fh1_scaled_resolve_rescale.cs.hlsl
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 // Resamples resolved data from one draw resolution scale's layout into
 // another's (nearest host texel), so a scale switch keeps what the title
 // rendered before it. Vulkan only, in the texture cache's load pipeline layout:

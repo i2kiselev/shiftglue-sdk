@@ -2,6 +2,9 @@
  * @file        tests/unit/filesystem/long_path_test.cpp
  * @brief       Host path mounts reach files whose host path exceeds MAX_PATH
  *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
  * @license     BSD 3-Clause License
  *              See LICENSE file in the project root for full license text.
  */

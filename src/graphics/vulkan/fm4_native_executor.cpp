@@ -1,3 +1,12 @@
+/**
+ * @file        graphics/vulkan/fm4_native_executor.cpp
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 // FM4's additions to the FH1 native executor (Vulkan), kept out of
 // fh1_native_executor.cpp so that upstream's changes there merge cleanly.
 // IsOneOffResolve and FlushResolveReadbacks replace upstream's definitions:

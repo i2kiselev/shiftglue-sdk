@@ -1,3 +1,12 @@
+/**
+ * @file        input/sdl/rumble_sender.cpp
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #include <rex/input/sdl/rumble_sender.h>
 
 namespace rex::input::sdl {

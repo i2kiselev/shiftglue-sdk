@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_scene_jitter.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // Which of FM4's draws a temporal upscaler's jitter moves. The upscaler takes the whole frame
 // as jittered, so a scene draw left still shakes by the jitter against the rest. FM4 draws

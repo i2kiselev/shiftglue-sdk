@@ -1,3 +1,12 @@
+/**
+ * @file        graphics/fm4_decal_motion.cpp
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #include <rex/graphics/fm4_decal_motion.h>
 
 namespace rex::graphics {

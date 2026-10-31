@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_resolve_readbacks.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // Which resolves the FH1 native executor reads back into guest memory for FM4,
 // over plain data so the rule is testable without a GPU.

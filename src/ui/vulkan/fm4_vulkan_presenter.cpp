@@ -1,3 +1,12 @@
+/**
+ * @file        ui/vulkan/fm4_vulkan_presenter.cpp
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #include "fm4_vulkan_presenter.h"
 
 #if REX_PLATFORM_WIN32

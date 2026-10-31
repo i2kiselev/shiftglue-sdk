@@ -1,3 +1,12 @@
+/**
+ * @file        rex/ui/fm4_dlss_preset.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // The DLSS preset present_dlss_preset=auto picks. NVIDIA's programming guide (310.6.0 table,
 // Performance mode to 1440p) has M at 1.2-1.3x K's cost on RTX 40 and later but about 2x

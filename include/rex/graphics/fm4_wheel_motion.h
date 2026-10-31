@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_wheel_motion.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // The motion a temporal upscaler gets for FM4's spinning wheels. A wheel's own matrix turns its
 // tread through tens of degrees a frame at speed (0.7 rad at 100 km/h and 120 fps), far past

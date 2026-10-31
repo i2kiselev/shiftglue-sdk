@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_camera_cut.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // Whether a temporal upscaler's history carries over between two frames, from how far the
 // camera's motion moves the picture on the screen. The reprojection matrix's raw entries

@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_shadow_motion.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // The motion a temporal upscaler gets for FM4's car ground shadow. The track draws darken the
 // ground under the car from the grey map, downsampled from the car's own shadow map, which the

@@ -1,3 +1,12 @@
+/**
+ * @file        rex/graphics/fm4_reactive_mask.h
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #pragma once
 // Which of FM4's draws mark a temporal upscaler's reactive mask (a debug option). Blended
 // draws test the scene's depth without writing it, so they take the motion of what is behind

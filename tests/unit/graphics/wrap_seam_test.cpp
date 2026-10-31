@@ -1,3 +1,12 @@
+/**
+ * @file        tests/unit/graphics/wrap_seam_test.cpp
+ *
+ * @copyright   Copyright (c) 2026 i2kiselev
+ *              All rights reserved.
+ *
+ * @license     BSD 3-Clause License
+ *              See LICENSE file in the project root for full license text.
+ */
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/graphics/pipeline/shader/wrap_seam.h>
