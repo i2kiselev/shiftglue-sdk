@@ -874,7 +874,8 @@ class VulkanCommandProcessor : public CommandProcessor {
       bool shader_32bit_index_dma, uint32_t compute_memexport_vertex_count,
       const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask);
-  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader);
+  bool UpdateBindings(const VulkanShader* vertex_shader, const VulkanShader* pixel_shader,
+                      Fm4DrawPlacement projection_placement = Fm4DrawPlacement::kUnplaced);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -1835,6 +1836,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
   uint64_t current_float_constant_map_pixel_[4];
+  // Restore unmodified registers when a scene draw is followed by UI/shadow work
+  // with the same shader register map and no intervening guest constant writes.
+  bool current_vertex_constants_aspect_corrected_ = false;
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;

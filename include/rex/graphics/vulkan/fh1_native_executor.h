@@ -25,6 +25,7 @@
 #include <rex/graphics/fh1_executor_counters.h>
 #include <rex/graphics/fh1_frame_inspector.h>
 #include <rex/graphics/fm4_resolve_readbacks.h>
+#include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw_extent_estimator.h>
@@ -176,6 +177,16 @@ class Fh1NativeExecutor {
     bool turned;
   };
   void SetCameraTrackingEnabled(bool enabled) { camera_tracking_enabled_ = enabled; }
+  // The live output used by free-aspect projection. 16:9 leaves projections untouched.
+  void SetFreeAspectOutput(uint32_t width, uint32_t height) {
+    free_aspect_width_ = width;
+    free_aspect_height_ = height;
+  }
+  uint32_t free_aspect_width() const { return free_aspect_width_; }
+  uint32_t free_aspect_height() const { return free_aspect_height_; }
+  // Which matrix layout the current draw needs expanded, or unplaced for UI and
+  // non-projected passes.
+  Fm4DrawPlacement AspectProjectionPlacement(const Fh1DrawInfo& draw) const;
   // After OnSwap: the swapped frame's depth (guest z in [0, 1], R32_SFLOAT,
   // readable from compute shaders) and camera, if the depth covers width x
   // height; null otherwise.
@@ -592,6 +603,8 @@ class Fh1NativeExecutor {
   bool EnsureCameraDepthPipelines();
   void DestroyCamera();
   bool camera_tracking_enabled_ = false;
+  uint32_t free_aspect_width_ = 1280;
+  uint32_t free_aspect_height_ = 720;
   std::vector<CameraDraw> camera_draws_;
   // The previous frame's scene objects and their matrices.
   std::unordered_map<uint64_t, std::array<float, 16>> camera_previous_objects_;

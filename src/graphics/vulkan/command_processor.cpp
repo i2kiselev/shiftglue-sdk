@@ -42,6 +42,7 @@
 #endif
 #include <rex/math.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/fm4_camera_cut.h>
 #include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/flags.h>
@@ -4160,6 +4161,15 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  uint32_t display_aspect_width = display_width;
+  uint32_t display_aspect_height = display_height;
+  if (REXCVAR_GET(present_free_aspect)) {
+    uint32_t surface_width, surface_height;
+    if (presenter->GetSurfaceSize(surface_width, surface_height)) {
+      display_aspect_width = surface_width;
+      display_aspect_height = surface_height;
+    }
+  }
 
   // present_hdr and the scene-only post: the scene before the HUD, for the
   // HUD's coverage. Without one (menus), the guest output stays opaque, all
@@ -4182,7 +4192,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
-    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
+    fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted ||
+                                                   REXCVAR_GET(present_free_aspect));
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
     const bool object_motion_wanted =
@@ -4210,7 +4221,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   }
 
   presenter->RefreshGuestOutput(
-      guest_output_width, guest_output_height, display_width, display_height,
+      guest_output_width, guest_output_height, display_aspect_width, display_aspect_height,
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
@@ -7315,7 +7326,10 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
-  if (!UpdateBindings(vertex_shader, pixel_shader)) {
+  const Fm4DrawPlacement projection_placement =
+      fh1_native_executor_ ? fh1_native_executor_->AspectProjectionPlacement(fh1_draw)
+                           : Fm4DrawPlacement::kUnplaced;
+  if (!UpdateBindings(vertex_shader, pixel_shader, projection_placement)) {
     return draw_fail("update_bindings");
   }
 
@@ -8680,7 +8694,17 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // Completed frames' timestamps first, so their slots are free for reuse.
     ReadFrameGpuTiming();
     BeginFrameGpuTiming();
-    if (fh1_native_executor_) fh1_native_executor_->GpuFrameOpened();
+    if (fh1_native_executor_) {
+      fh1_native_executor_->GpuFrameOpened();
+      uint32_t aspect_width = 1280, aspect_height = 720;
+      ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+      if (REXCVAR_GET(present_free_aspect) && presenter &&
+          presenter->GetSurfaceSize(aspect_width, aspect_height)) {
+        fh1_native_executor_->SetFreeAspectOutput(aspect_width, aspect_height);
+      } else {
+        fh1_native_executor_->SetFreeAspectOutput(1280, 720);
+      }
+    }
 
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
@@ -10642,7 +10666,8 @@ void VulkanCommandProcessor::CountConstantUpload(uint32_t buffer, const void* da
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
-                                            const VulkanShader* pixel_shader) {
+                                            const VulkanShader* pixel_shader,
+                                            Fm4DrawPlacement projection_placement) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -10667,6 +10692,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   const Shader::ConstantRegisterMap& float_constant_map_vertex =
       vertex_shader->constant_register_map();
   uint32_t float_constant_count_vertex = float_constant_map_vertex.float_count;
+  const float projection_scale =
+      projection_placement == Fm4DrawPlacement::kUnplaced
+          ? 1.0f
+          : Fm4AspectScaleX(fh1_native_executor_->free_aspect_width(),
+                            fh1_native_executor_->free_aspect_height());
+  const bool correct_projection = projection_scale > 0.0f && projection_scale != 1.0f;
+  if ((correct_projection || current_vertex_constants_aspect_corrected_) &&
+      float_constant_count_vertex) {
+    // Corrected and ordinary draws may share a bitmap without guest writes.
+    // Always restore the ordinary bank after a corrected upload.
+    current_constant_buffers_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex);
+  }
   for (uint32_t i = 0; i < 4; ++i) {
     if (current_float_constant_map_vertex_[i] != float_constant_map_vertex.float_bitmap[i]) {
       current_float_constant_map_vertex_[i] = float_constant_map_vertex.float_bitmap[i];
@@ -10793,8 +10831,23 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
-      GatherFloatConstants(mapping, current_float_constant_map_vertex_,
-                           &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+      if (!correct_projection) {
+        GatherFloatConstants(mapping, current_float_constant_map_vertex_,
+                             &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+      } else {
+        // The map addresses 256 float4 registers, not 256 scalar floats.
+        // Preserve every register that GatherFloatConstants may reference.
+        std::array<uint32_t, 256 * 4> corrected_constants;
+        std::memcpy(corrected_constants.data(),
+                    &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X],
+                    sizeof(corrected_constants));
+        Fm4ScaleVertexFloatConstantsForAspect(corrected_constants, projection_placement,
+                                              fh1_native_executor_->free_aspect_width(),
+                                              fh1_native_executor_->free_aspect_height());
+        GatherFloatConstants(mapping, current_float_constant_map_vertex_,
+                             corrected_constants.data());
+      }
+      current_vertex_constants_aspect_corrected_ = correct_projection;
       if (constant_census_enabled_) {
         CountConstantUpload(1, mapping, float_constants_size);
       }

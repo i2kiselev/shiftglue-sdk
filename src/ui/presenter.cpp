@@ -44,6 +44,10 @@ REXCVAR_DEFINE_BOOL(pinyon_shift_fh1_source_presentation, false, "Pinyon Shift",
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
+REXCVAR_DEFINE_BOOL(present_free_aspect, true, "UI/Presenter",
+                    "Expand FM4's 3D projection to the live output aspect instead of "
+                    "letterboxing or stretching the native 16:9 view")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
@@ -930,7 +934,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       output_height = rescale_unsigned(surface_height_in_paint_connection_, 100, present_safe_area);
       letterbox = true;
     }
-    if (letterbox && REXCVAR_GET(present_letterbox)) {
+    if (letterbox && REXCVAR_GET(present_letterbox) && !REXCVAR_GET(present_free_aspect)) {
       output_width = rescale_unsigned(surface_height_in_paint_connection_ * 100,
                                       properties.display_aspect_ratio_x,
                                       properties.display_aspect_ratio_y * present_safe_area);
@@ -965,7 +969,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       output_width = rescale_unsigned(surface_width_in_paint_connection_, 100, present_safe_area);
       letterbox = true;
     }
-    if (letterbox && REXCVAR_GET(present_letterbox)) {
+    if (letterbox && REXCVAR_GET(present_letterbox) && !REXCVAR_GET(present_free_aspect)) {
       output_height = rescale_unsigned(surface_width_in_paint_connection_ * 100,
                                        properties.display_aspect_ratio_y,
                                        properties.display_aspect_ratio_x * present_safe_area);
@@ -1365,6 +1369,7 @@ void Presenter::DisconnectPaintingFromSurfaceFromUIThread(SurfacePaintConnection
   surface_paint_connection_has_implicit_vsync_ = false;
   surface_width_in_paint_connection_ = 0;
   surface_height_in_paint_connection_ = 0;
+  surface_size_for_guest_output_thread_.store(0, std::memory_order_release);
 }
 
 void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_out,
@@ -1413,6 +1418,8 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
           surface_paint_connection_has_implicit_vsync_ = is_vsync_implicit;
           surface_width_in_paint_connection_ = surface_width;
           surface_height_in_paint_connection_ = surface_height;
+          surface_size_for_guest_output_thread_.store(
+              (uint64_t(surface_width) << 32) | surface_height, std::memory_order_release);
           if (!is_reconnect && repaint_needed_out) {
             *repaint_needed_out = true;
           }
