@@ -4922,6 +4922,28 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             upscaler_camera.cut = camera.cut;
             upscaler_camera.jitter_x = camera.jitter_x;
             upscaler_camera.jitter_y = camera.jitter_y;
+            upscaler_camera.frame_generation_matrices_valid =
+                camera.frame_generation_matrices_valid;
+            if (camera.frame_generation_matrices_valid) {
+              std::copy(camera.frame_generation.view_to_clip.begin(),
+                        camera.frame_generation.view_to_clip.end(), upscaler_camera.view_to_clip);
+              std::copy(camera.frame_generation.clip_to_view.begin(),
+                        camera.frame_generation.clip_to_view.end(), upscaler_camera.clip_to_view);
+              std::copy(camera.frame_generation.clip_to_previous.begin(),
+                        camera.frame_generation.clip_to_previous.end(),
+                        upscaler_camera.clip_to_previous);
+              std::copy(camera.frame_generation.previous_to_clip.begin(),
+                        camera.frame_generation.previous_to_clip.end(),
+                        upscaler_camera.previous_to_clip);
+              std::copy(camera.frame_generation.position.begin(),
+                        camera.frame_generation.position.end(), upscaler_camera.position);
+              std::copy(camera.frame_generation.right.begin(), camera.frame_generation.right.end(),
+                        upscaler_camera.right);
+              std::copy(camera.frame_generation.up.begin(), camera.frame_generation.up.end(),
+                        upscaler_camera.up);
+              std::copy(camera.frame_generation.forward.begin(),
+                        camera.frame_generation.forward.end(), upscaler_camera.forward);
+            }
             vulkan_context.SetCameraWritten(upscaler_camera);
           } else if (object_slot_image_ != VK_NULL_HANDLE) {
             // Without a camera the slots still start the next frame clear: a

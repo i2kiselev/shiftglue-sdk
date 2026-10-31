@@ -5,6 +5,7 @@ set(REXGLUE_VERSION_STRING "@REXGLUE_FULL_VERSION@")
 set(REXGLUE_SHARE_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/rexglue")
 set(REXGLUE_MOLTENVK_ICD
     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/vulkan/icd.d/MoltenVK_icd.json")
+set(REXGLUE_HAS_FSR_FRAMEGENERATION @REXGLUE_HAS_FSR_FRAMEGENERATION@)
 
 include(CMakeFindDependencyMacro)
 
@@ -21,6 +22,12 @@ set(REXGLUE_USE_VULKAN @REXGLUE_USE_VULKAN@)
 if(REXGLUE_USE_VULKAN)
     find_dependency(VulkanHeaders CONFIG)
     find_dependency(VulkanMemoryAllocator CONFIG)
+    if(REXGLUE_HAS_FSR_FRAMEGENERATION AND WIN32 AND NOT TARGET Vulkan::Vulkan)
+        add_library(Vulkan::Vulkan UNKNOWN IMPORTED)
+        set_target_properties(Vulkan::Vulkan PROPERTIES
+            IMPORTED_LOCATION
+                "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/fm4-vulkan-loader.lib")
+    endif()
     if(APPLE)
         if(NOT TARGET rex::vulkan-loader)
             add_library(rex::vulkan-loader SHARED IMPORTED)

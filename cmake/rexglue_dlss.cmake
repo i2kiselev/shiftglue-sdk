@@ -35,14 +35,21 @@ endif()
 # DLSS 310.9.16.
 set(_rexglue_dlss_commit 9981c6350dc58c0ce21f024fd65e31e851c31689)
 set(_rexglue_dlss_files
+    "include/nvsdk_ngx.h|dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848"
+    "include/nvsdk_ngx_loader.h|abdf5f66a692620538357d29fdf78e3e2a677ee8140b7a638962ecb766585e75"
     "include/nvsdk_ngx_defs.h|ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e"
     "include/nvsdk_ngx_defs_vk.h|0a24d0861ace7d6b9362a67b7f08bea1b33ea123c5ce730b19133de8a891d031"
     "include/nvsdk_ngx_params.h|943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
     "include/nvsdk_ngx_vk.h|2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d"
     "include/nvsdk_ngx_helpers_vk.h|c192bff72138f12f770db48e12c1d8f712dfc81ea0e8e055ebb27d8dd1b31623"
-    "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c")
+    "include/nvsdk_ngx_defs_dlssg.h|c29765ab9e0125f9d724ae9811cc2abe03738d17486ec8eee80d78a1504549e1"
+    "include/nvsdk_ngx_params_dlssg.h|c24fa5aa68ffa2808c828b75cfa32843f1606f80a145f84055ac450d7e6c74ad"
+    "include/nvsdk_ngx_helpers_dlssg_vk.h|b371d90b9f4372b9a415e68a0afbdc2f31b7b552e219a9637d848749bc965316"
+    "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c"
+    "lib/Windows_x86_64/x64/nvsdk_ngx_s.lib|7b9a5239c1145af5f645ab472aa066f9ea79db36ac819562312aae69d65f3765")
 set(_rexglue_dlss_runtime_files
     "lib/Windows_x86_64/rel/nvngx_dlss.dll|d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"
+    "lib/Windows_x86_64/rel/nvngx_dlssg.dll|8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7"
     "LICENSE.txt|d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0")
 
 if(REXGLUE_DLSS_SDK_DIR)
@@ -119,6 +126,7 @@ _rexglue_dlss_fetch(_rexglue_dlss_ok ${_rexglue_dlss_runtime_files})
 if(_rexglue_dlss_ok)
     set(_rexglue_dlss_runtime "${CMAKE_BINARY_DIR}/nvidia-dlss-runtime")
     file(COPY "${_rexglue_dlss_dir}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+              "${_rexglue_dlss_dir}/lib/Windows_x86_64/rel/nvngx_dlssg.dll"
               "${_rexglue_dlss_dir}/LICENSE.txt"
          DESTINATION "${_rexglue_dlss_runtime}")
     set(REXGLUE_DLSS_RUNTIME_DIR "${_rexglue_dlss_runtime}" CACHE INTERNAL "")

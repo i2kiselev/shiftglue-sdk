@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include <rex/ui/upscaler.h>
@@ -41,6 +42,19 @@ struct VulkanUpscalerInputs {
   UpscalerFrame frame;
 };
 
+struct VulkanFrameGenerationInputs {
+  // Colour at the output size, HUD-free and in GENERAL layout.
+  VulkanUpscalerImage color;
+  // Render-resolution depth and current-to-previous motion in normalized UV.
+  // Each provider scales UV motion by the render dimensions it passes to its SDK.
+  VulkanUpscalerImage depth;
+  VulkanUpscalerImage motion_vectors;
+  UpscalerCamera camera;
+  float frame_delta_ms = 16.667f;
+  bool reset = true;
+  uint64_t render_frame_index = 0;
+};
+
 class VulkanUpscaler {
  public:
   virtual ~VulkanUpscaler() = default;
@@ -55,6 +69,20 @@ class VulkanUpscaler {
   virtual bool Dispatch(VkCommandBuffer command_buffer, const VulkanUpscalerInputs& inputs) = 0;
   // Frees the resources Prepare made (the GPU must be done with them).
   virtual void Release() = 0;
+
+  // Optional frame-interpolation path. Generated outputs are in GENERAL layout
+  // and remain owned by the caller until its GPU and presentation work ends.
+  virtual bool FrameGenerationAvailable() const { return false; }
+  virtual uint32_t FrameGenerationMaxGenerated() const { return 0; }
+  virtual bool PrepareFrameGeneration(uint32_t output_width, uint32_t output_height,
+                                      VkFormat output_format) {
+    return false;
+  }
+  virtual uint32_t DispatchFrameGeneration(
+      VkCommandBuffer command_buffer, const VulkanFrameGenerationInputs& inputs,
+      std::span<VulkanUpscalerImage> outputs, uint32_t requested_factor) {
+    return 0;
+  }
 };
 
 // The temporal providers built into this build, available or not.

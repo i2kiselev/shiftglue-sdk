@@ -14,9 +14,12 @@
 #include <rex/ui/vulkan/upscaler.h>
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 #include <filesystem>
+#include <limits>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -29,6 +32,7 @@
 
 #if defined(REX_HAS_DLSS) && REX_HAS_DLSS
 #include <nvsdk_ngx_helpers_vk.h>
+#include <nvsdk_ngx_helpers_dlssg_vk.h>
 #endif
 
 REXCVAR_DEFINE_STRING(present_dlss_runtime, "", "UI/Presenter",
@@ -95,6 +99,7 @@ struct NgxSetup {
   NVSDK_NGX_FeatureDiscoveryInfo discovery = {};
   // Whether any folder holds a runtime.
   bool runtime_found = false;
+  bool frame_generation_runtime_found = false;
 };
 
 const NgxSetup& GetNgxSetup() {
@@ -102,6 +107,7 @@ const NgxSetup& GetNgxSetup() {
   static std::once_flag once;
   std::call_once(once, [] {
     constexpr const char* kRuntime = "nvngx_dlss.dll";
+    constexpr const char* kFrameGenerationRuntime = "nvngx_dlssg.dll";
     std::vector<std::filesystem::path> folders;
     const std::string configured = REXCVAR_GET(present_dlss_runtime);
     if (!configured.empty()) {
@@ -128,6 +134,12 @@ const NgxSetup& GetNgxSetup() {
         setup.runtime_found = true;
         setup.paths.push_back(folder.wstring());
       }
+      const bool frame_generation_runtime =
+          std::filesystem::is_regular_file(folder / kFrameGenerationRuntime, error);
+      if (frame_generation_runtime && (!setup.runtime_found || setup.paths.back() != folder.wstring())) {
+        setup.paths.push_back(folder.wstring());
+      }
+      setup.frame_generation_runtime_found |= frame_generation_runtime;
     }
     for (const std::wstring& path : setup.paths) {
       setup.path_pointers.push_back(path.c_str());
@@ -154,6 +166,8 @@ const NgxSetup& GetNgxSetup() {
     } else {
       REXLOG_INFO("DLSS runtime unavailable: {} not found in upscalers/dlss", kRuntime);
     }
+    REXLOG_INFO("DLSS Frame Generation runtime: {}",
+                setup.frame_generation_runtime_found ? "found" : "not found");
   });
   return setup;
 }
@@ -250,6 +264,16 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
       return;
     }
     info_.available = true;
+    int frame_generation_available = 0;
+    NVSDK_NGX_Parameter_GetI(parameters_, NVSDK_NGX_Parameter_FrameGeneration_Available,
+                             &frame_generation_available);
+    frame_generation_available_ = frame_generation_available != 0;
+    if (frame_generation_available_) {
+      unsigned int maximum = 1;
+      NVSDK_NGX_Parameter_GetUI(parameters_, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax,
+                                &maximum);
+      frame_generation_max_ = std::clamp(maximum, 1u, 3u);
+    }
     // The runtime folders are named after the DLSS version.
     info_.version = std::filesystem::path(setup.paths[0]).filename().string();
     REXLOG_INFO("DLSS available on {}", device->properties().deviceName);
@@ -257,6 +281,7 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
 
   ~VulkanDlssUpscaler() override {
     Release();
+    ReleaseFrameGeneration();
     if (parameters_) {
       NVSDK_NGX_VULKAN_DestroyParameters(parameters_);
       parameters_ = nullptr;
@@ -366,7 +391,173 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
     }
   }
 
+  bool FrameGenerationAvailable() const override {
+    return info_.available && frame_generation_available_;
+  }
+
+  uint32_t FrameGenerationMaxGenerated() const override {
+    return FrameGenerationAvailable() ? frame_generation_max_ : 0;
+  }
+
+  bool PrepareFrameGeneration(uint32_t output_width, uint32_t output_height,
+                              VkFormat output_format) override {
+    if (!FrameGenerationAvailable() || !output_width || !output_height ||
+        output_format == VK_FORMAT_UNDEFINED) {
+      return false;
+    }
+    if (frame_generation_feature_ &&
+        (output_width != frame_generation_width_ || output_height != frame_generation_height_ ||
+         output_format != frame_generation_format_)) {
+      ReleaseFrameGeneration();
+    }
+    frame_generation_width_ = output_width;
+    frame_generation_height_ = output_height;
+    frame_generation_format_ = output_format;
+    return true;
+  }
+
+  uint32_t DispatchFrameGeneration(VkCommandBuffer command_buffer,
+                                   const VulkanFrameGenerationInputs& inputs,
+                                   std::span<VulkanUpscalerImage> outputs,
+                                   uint32_t requested_factor) override {
+    if (!FrameGenerationAvailable() || !inputs.color.image || !inputs.depth.image ||
+        !inputs.motion_vectors.image || outputs.empty() ||
+        !inputs.camera.frame_generation_matrices_valid) {
+      return 0;
+    }
+    const uint32_t requested_count =
+        std::min({requested_factor - 1u, frame_generation_max_,
+                  static_cast<uint32_t>(outputs.size())});
+    if (!requested_count) return 0;
+    if (!frame_generation_feature_ &&
+        !CreateFrameGenerationFeature(command_buffer, frame_generation_width_,
+                                      frame_generation_height_, frame_generation_format_)) {
+      return 0;
+    }
+
+    const auto wrap = [](const VulkanUpscalerImage& image, bool writable) {
+      VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      if (image.format == VK_FORMAT_D32_SFLOAT) range.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      return NVSDK_NGX_Create_ImageView_Resource_VK(image.view, image.image, range, image.format,
+                                                    image.width, image.height, writable);
+    };
+    NVSDK_NGX_Resource_VK color = wrap(inputs.color, false);
+    NVSDK_NGX_Resource_VK depth = wrap(inputs.depth, false);
+    NVSDK_NGX_Resource_VK motion = wrap(inputs.motion_vectors, false);
+
+    NVSDK_NGX_DLSSG_Opt_Eval_Params parameters{};
+    const UpscalerCamera& camera = inputs.camera;
+    std::memcpy(parameters.cameraViewToClip, camera.view_to_clip, sizeof(camera.view_to_clip));
+    std::memcpy(parameters.clipToCameraView, camera.clip_to_view, sizeof(camera.clip_to_view));
+    std::memcpy(parameters.clipToPrevClip, camera.clip_to_previous,
+                sizeof(camera.clip_to_previous));
+    std::memcpy(parameters.prevClipToClip, camera.previous_to_clip,
+                sizeof(camera.previous_to_clip));
+    std::memcpy(parameters.cameraPos, camera.position, sizeof(camera.position));
+    std::memcpy(parameters.cameraUp, camera.up, sizeof(camera.up));
+    std::memcpy(parameters.cameraRight, camera.right, sizeof(camera.right));
+    std::memcpy(parameters.cameraFwd, camera.forward, sizeof(camera.forward));
+    for (int i = 0; i < 4; ++i) parameters.clipToLensClip[i][i] = 1.0f;
+    parameters.jitterOffset[0] = camera.jitter_x;
+    parameters.jitterOffset[1] = camera.jitter_y;
+    parameters.mvecScale[0] = float(inputs.motion_vectors.width);
+    parameters.mvecScale[1] = float(inputs.motion_vectors.height);
+    parameters.cameraNear = camera.near_plane;
+    parameters.cameraFar = camera.far_plane;
+    parameters.cameraFOV = camera.fov_y;
+    parameters.cameraAspectRatio =
+        camera.view_to_clip[0] != 0.0f
+            ? camera.view_to_clip[5] / camera.view_to_clip[0]
+            : float(inputs.color.width) / std::max(1u, inputs.color.height);
+    parameters.cameraMotionIncluded = true;
+    parameters.reset = inputs.reset;
+    parameters.depthInverted = false;
+    parameters.colorBuffersHDR = false;
+    parameters.motionVectorsInvalidValue = std::numeric_limits<float>::max();
+    parameters.multiFrameCount = requested_count + 1;
+    NVSDK_NGX_Parameter_SetULL(frame_generation_parameters_,
+                               NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID,
+                               inputs.render_frame_index);
+
+    for (uint32_t i = 0; i < requested_count; ++i) {
+      VkImageMemoryBarrier output_to_general = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      output_to_general.srcAccessMask = 0;
+      output_to_general.dstAccessMask =
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      output_to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      output_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      output_to_general.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      output_to_general.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      output_to_general.image = outputs[i].image;
+      output_to_general.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      device_->functions().vkCmdPipelineBarrier(
+          command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+          &output_to_general);
+      NVSDK_NGX_Resource_VK output = wrap(outputs[i], true);
+      NVSDK_NGX_VK_DLSSG_Eval_Params images{};
+      images.pBackbuffer = &color;
+      images.pDepth = &depth;
+      images.pMVecs = &motion;
+      images.pOutputInterpFrame = &output;
+      parameters.multiFrameIndex = i + 1;
+      const NVSDK_NGX_Result result =
+          NGX_VK_EVALUATE_DLSSG(command_buffer, frame_generation_feature_,
+                                frame_generation_parameters_, &images, &parameters);
+      if (NVSDK_NGX_FAILED(result)) {
+        if (!frame_generation_failure_logged_) {
+          frame_generation_failure_logged_ = true;
+          REXLOG_WARN("DLSS Frame Generation evaluation failed with 0x{:08X}",
+                      uint32_t(result));
+        }
+        ReleaseFrameGeneration();
+        return 0;
+      }
+    }
+    return inputs.reset ? 0 : requested_count;
+  }
+
  private:
+  void ReleaseFrameGeneration() {
+    if (frame_generation_feature_) {
+      NVSDK_NGX_VULKAN_ReleaseFeature(frame_generation_feature_);
+      frame_generation_feature_ = nullptr;
+    }
+    if (frame_generation_parameters_) {
+      NVSDK_NGX_VULKAN_DestroyParameters(frame_generation_parameters_);
+      frame_generation_parameters_ = nullptr;
+    }
+  }
+
+  bool CreateFrameGenerationFeature(VkCommandBuffer command_buffer, uint32_t width,
+                                    uint32_t height, VkFormat format) {
+    if (!FrameGenerationAvailable()) return false;
+    ReleaseFrameGeneration();
+    if (NVSDK_NGX_FAILED(
+            NVSDK_NGX_VULKAN_AllocateParameters(&frame_generation_parameters_))) {
+      return false;
+    }
+    NVSDK_NGX_DLSSG_Create_Params create{};
+    create.Width = width;
+    create.Height = height;
+    create.NativeBackbufferFormat = format;
+    const NVSDK_NGX_Result result =
+        NGX_VK_CREATE_DLSSG(command_buffer, 1, 1, &frame_generation_feature_,
+                            frame_generation_parameters_, &create);
+    if (NVSDK_NGX_FAILED(result) || !frame_generation_feature_) {
+      if (!frame_generation_failure_logged_) {
+        frame_generation_failure_logged_ = true;
+        REXLOG_WARN("DLSS Frame Generation feature creation failed with 0x{:08X}",
+                    uint32_t(result));
+      }
+      ReleaseFrameGeneration();
+      return false;
+    }
+    REXLOG_INFO("DLSS Frame Generation feature created: {}x{}, native presenter 2x "
+                "(runtime advertises up to {}x)", width, height, frame_generation_max_ + 1);
+    return true;
+  }
+
   bool CreateFeature(VkCommandBuffer command_buffer, const UpscalerFrame& frame) {
     const uint32_t render_width = std::max(render_width_, frame.render_width);
     const uint32_t render_height = std::max(render_height_, frame.render_height);
@@ -423,6 +614,14 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
   bool initialized_ = false;
   NVSDK_NGX_Parameter* parameters_ = nullptr;
   NVSDK_NGX_Handle* feature_ = nullptr;
+  NVSDK_NGX_Parameter* frame_generation_parameters_ = nullptr;
+  NVSDK_NGX_Handle* frame_generation_feature_ = nullptr;
+  bool frame_generation_available_ = false;
+  uint32_t frame_generation_max_ = 1;
+  uint32_t frame_generation_width_ = 0;
+  uint32_t frame_generation_height_ = 0;
+  VkFormat frame_generation_format_ = VK_FORMAT_UNDEFINED;
+  bool frame_generation_failure_logged_ = false;
   uint32_t render_width_ = 0;
   uint32_t render_height_ = 0;
   uint32_t output_width_ = 0;
@@ -438,16 +637,28 @@ class VulkanDlssUpscaler final : public VulkanUpscaler {
 
 std::vector<const char*> GetVulkanUpscalerInstanceExtensions() {
   const NgxSetup& setup = GetNgxSetup();
-  if (!setup.runtime_found) {
+  if (!setup.runtime_found && !setup.frame_generation_runtime_found) {
     return {};
   }
-  uint32_t count = 0;
-  VkExtensionProperties* properties = nullptr;
-  if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(
-          &setup.discovery, &count, &properties))) {
-    return {};
-  }
-  return KeepExtensionNames(properties, count);
+  std::vector<const char*> names;
+  const auto append = [&](NVSDK_NGX_Feature feature) {
+    NVSDK_NGX_FeatureDiscoveryInfo discovery = setup.discovery;
+    discovery.FeatureID = feature;
+    uint32_t count = 0;
+    VkExtensionProperties* properties = nullptr;
+    if (NVSDK_NGX_FAILED(
+            NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&discovery, &count,
+                                                                    &properties))) {
+      return;
+    }
+    std::vector<const char*> feature_names = KeepExtensionNames(properties, count);
+    for (const char* name : feature_names) {
+      if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+    }
+  };
+  if (setup.runtime_found) append(NVSDK_NGX_Feature_SuperSampling);
+  if (setup.frame_generation_runtime_found) append(NVSDK_NGX_Feature_FrameGeneration);
+  return names;
 }
 
 std::vector<const char*> GetVulkanUpscalerDeviceExtensions(VkInstance instance,
@@ -457,16 +668,27 @@ std::vector<const char*> GetVulkanUpscalerDeviceExtensions(VkInstance instance,
     return {};
   }
   const NgxSetup& setup = GetNgxSetup();
-  if (!setup.runtime_found) {
+  if (!setup.runtime_found && !setup.frame_generation_runtime_found) {
     return {};
   }
-  uint32_t count = 0;
-  VkExtensionProperties* properties = nullptr;
-  if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
-          instance, physical_device, &setup.discovery, &count, &properties))) {
-    return {};
-  }
-  return KeepExtensionNames(properties, count);
+  std::vector<const char*> names;
+  const auto append = [&](NVSDK_NGX_Feature feature) {
+    NVSDK_NGX_FeatureDiscoveryInfo discovery = setup.discovery;
+    discovery.FeatureID = feature;
+    uint32_t count = 0;
+    VkExtensionProperties* properties = nullptr;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
+            instance, physical_device, &discovery, &count, &properties))) {
+      return;
+    }
+    std::vector<const char*> feature_names = KeepExtensionNames(properties, count);
+    for (const char* name : feature_names) {
+      if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
+    }
+  };
+  if (setup.runtime_found) append(NVSDK_NGX_Feature_SuperSampling);
+  if (setup.frame_generation_runtime_found) append(NVSDK_NGX_Feature_FrameGeneration);
+  return names;
 }
 
 std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice* device) {

@@ -55,6 +55,11 @@ class InputSystem : public system::IInputSystem {
   void SetKeyboardStateFilter(std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& gamepad)>
                                   filter);
 
+  /// Hooks around a real guest gamepad read (not host UI reads). Reflex uses
+  /// them to sleep before sampling input and to timestamp the sample.
+  void SetGuestStateReadCallbacks(std::function<void()> before,
+                                  std::function<void()> after);
+
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   /// The user's merged physical pads for host-drawn UI: live even while the
@@ -114,6 +119,8 @@ class InputSystem : public system::IInputSystem {
 
   std::function<bool()> active_callback_;
   std::function<void(uint32_t, X_INPUT_GAMEPAD&)> keyboard_state_filter_;
+  std::function<void()> guest_state_read_before_;
+  std::function<void()> guest_state_read_after_;
 
   // DualSense feedback, per guest user.
   std::array<dualsense::TriggerModel, kMaxGuestUsers> trigger_models_;

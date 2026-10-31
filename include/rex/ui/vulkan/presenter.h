@@ -25,7 +25,9 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/frame_generation.h>
 #include <rex/ui/vulkan/instance.h>
+#include <rex/ui/vulkan/reflex.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/upscaler.h>
@@ -459,6 +461,9 @@ class VulkanPresenter final : public Presenter {
       // image, since a present may still be waiting for it when the next
       // paint submission comes around (VUID-vkQueueSubmit-pSignalSemaphores-00067).
       VkSemaphore present_semaphore;
+      // Consumes the real paint's signal when that acquired image is first
+      // reused for an interpolated presentation. Owned per swapchain image.
+      VkSemaphore interpolated_present_semaphore = VK_NULL_HANDLE;
     };
 
     // present_hdr: the swapchain is scRGB, and everything above paints into an
@@ -504,6 +509,7 @@ class VulkanPresenter final : public Presenter {
     // Connection-indepedent.
 
     const VulkanDevice* vulkan_device;
+    Reflex* reflex = nullptr;
 
     std::array<std::unique_ptr<PaintContext::Submission>, kSubmissionCount> submissions;
     VulkanSubmissionTracker submission_tracker;
@@ -610,6 +616,7 @@ class VulkanPresenter final : public Presenter {
         ui_samplers_(ui_samplers),
         guest_output_image_refresher_submission_tracker_(vulkan_device),
         ui_submission_tracker_(vulkan_device),
+        frame_generation_submission_tracker_(vulkan_device),
         paint_context_(vulkan_device) {
     assert_not_null(vulkan_device);
     assert_not_null(ui_samplers);
@@ -643,6 +650,16 @@ class VulkanPresenter final : public Presenter {
                                       const VulkanUpscaler& upscaler, const UpscalerFrame& frame);
   // The temporal provider for the selected effect, or null.
   VulkanUpscaler* GetTemporalUpscaler(const GuestOutputPaintConfig& config);
+  // Presents HUD-composited generated images before the real endpoint. The
+  // provider images stay GPU-owned until their copy submission completes.
+  bool PresentGeneratedFrames(const GuestOutputImage& source, uint32_t source_width,
+                              uint32_t source_height, uint32_t output_width,
+                              uint32_t output_height, uint64_t reflex_frame_id,
+                              uint64_t paint_submission_index,
+                              uint32_t& real_swapchain_image_index,
+                              VkSemaphore& real_present_semaphore,
+                              bool& real_endpoint_prepared,
+                              std::chrono::steady_clock::time_point deadline);
   // Records the temporal upscale of the flow's temporal slot from source into
   // output (UP-1.1: once per new guest frame, its history reset only when it
   // must be). False if nothing usable was recorded; the slot then falls back
@@ -697,10 +714,26 @@ class VulkanPresenter final : public Presenter {
   // Advanced by every guest output refresh (refresher thread; the consumer
   // reads the copy in GuestOutputImageInstance).
   uint64_t guest_output_refresh_serial_ = 0;
-
   // Temporal upscaler providers (rex/ui/vulkan/upscaler.h) and the state of
   // the last temporal dispatch, used by painting only.
   std::vector<std::unique_ptr<VulkanUpscaler>> upscalers_;
+  std::array<std::unique_ptr<PaintContext::Submission>, FrameGeneration::kMaxImages>
+      frame_generation_submissions_;
+  VulkanSubmissionTracker frame_generation_submission_tracker_;
+  std::deque<std::pair<uint64_t, uint64_t>> pending_frame_generation_;
+  std::chrono::steady_clock::time_point last_real_present_time_{};
+  std::chrono::nanoseconds last_source_period_{16666667};
+  uint64_t fg_timing_source_count_ = 0;
+  uint64_t fg_timing_presented_count_ = 0;
+  uint64_t fg_timing_skipped_count_ = 0;
+  std::chrono::nanoseconds fg_timing_source_period_sum_{0};
+  std::chrono::nanoseconds fg_timing_present_period_sum_{0};
+  std::chrono::nanoseconds fg_timing_min_gap_{0};
+  std::chrono::nanoseconds fg_timing_max_gap_{0};
+  uint64_t fg_timing_interval_count_ = 0;
+  std::chrono::steady_clock::time_point fg_timing_last_present_{};
+  std::unique_ptr<FrameGeneration> frame_generation_;
+  std::unique_ptr<Reflex> reflex_;
   struct TemporalUpscaleState {
     VulkanUpscaler* upscaler = nullptr;
     VkImage output_image = VK_NULL_HANDLE;
@@ -714,6 +747,8 @@ class VulkanPresenter final : public Presenter {
     uint64_t dispatch_count = 0;
     uint64_t reset_count = 0;
     uint64_t repeat_count = 0;
+    uint32_t generated_count = 0;
+    std::chrono::nanoseconds source_period{16666667};
   };
   TemporalUpscaleState temporal_upscale_;
   // UP-1.2: whether the last paint fed a temporal upscaler the guest output
@@ -734,6 +769,9 @@ class VulkanPresenter final : public Presenter {
   VkPipeline upscale_debug_view_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool upscale_hud_composite_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, PaintContext::kSubmissionCount> upscale_hud_composite_sets_ = {};
+  VkDescriptorPool frame_generation_hud_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, FrameGeneration::kMaxImages>
+      frame_generation_hud_composite_sets_ = {};
   VkQueryPool temporal_upscale_query_pool_ = VK_NULL_HANDLE;
   std::array<uint64_t, 8> temporal_upscale_query_submissions_ = {};
   double temporal_upscale_gpu_ns_ = 0.0;

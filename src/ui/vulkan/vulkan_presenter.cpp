@@ -18,6 +18,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -199,6 +200,7 @@ std::atomic<uint32_t> hdr_output_rotation = 0;
 // CapturePresentedOutput: whether the current swapchain was created readable
 // (present_capture_readable, if the surface allowed it).
 std::atomic<bool> swapchain_capturable = false;
+std::atomic<bool> swapchain_supports_transfer_dst = false;
 
 VkExtent2D HdrSwapchainImageExtent(VkExtent2D extent) {
   return hdr_output_rotation.load(std::memory_order_relaxed)
@@ -289,6 +291,9 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 
 VulkanPresenter::~VulkanPresenter() {
   // Retirement drains drawing and presentation before releasing their objects.
+  if (reflex_) {
+    reflex_->OnSwapchainDestroying(paint_context_.swapchain);
+  }
   paint_context_.DestroySwapchainAndVulkanSurface();
 
   // Await completion of the usage of everything before destroying anything
@@ -297,6 +302,10 @@ VulkanPresenter::~VulkanPresenter() {
   // just one sleep will likely be needed.
   ui_submission_tracker_.Shutdown();
   guest_output_image_refresher_submission_tracker_.Shutdown();
+  paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+  frame_generation_submission_tracker_.Shutdown();
+  frame_generation_.reset();
+  reflex_.reset();
   for (std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
     upscaler->Release();
   }
@@ -317,6 +326,8 @@ VulkanPresenter::~VulkanPresenter() {
                              upscale_hud_composite_pipeline_layout_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                              upscale_hud_composite_descriptor_pool_);
+  util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                             frame_generation_hud_descriptor_pool_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                              upscale_hud_composite_set_layout_);
 
@@ -496,6 +507,32 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
     REXLOG_ERROR("VulkanPresenter: Failed to allocate the upscale HUD composite descriptor sets");
     return false;
   }
+  VkDescriptorPoolSize frame_generation_pool_sizes[2] = {
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * FrameGeneration::kMaxImages},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, FrameGeneration::kMaxImages},
+  };
+  VkDescriptorPoolCreateInfo frame_generation_pool_info = {};
+  frame_generation_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  frame_generation_pool_info.maxSets = FrameGeneration::kMaxImages;
+  frame_generation_pool_info.poolSizeCount = 2;
+  frame_generation_pool_info.pPoolSizes = frame_generation_pool_sizes;
+  if (dfn.vkCreateDescriptorPool(device, &frame_generation_pool_info, nullptr,
+                                 &frame_generation_hud_descriptor_pool_) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to create the frame-generation HUD descriptor pool");
+    return false;
+  }
+  VkDescriptorSetAllocateInfo frame_generation_set_info = {};
+  frame_generation_set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  frame_generation_set_info.descriptorPool = frame_generation_hud_descriptor_pool_;
+  std::array<VkDescriptorSetLayout, FrameGeneration::kMaxImages> frame_generation_layouts;
+  frame_generation_layouts.fill(upscale_hud_composite_set_layout_);
+  frame_generation_set_info.descriptorSetCount = FrameGeneration::kMaxImages;
+  frame_generation_set_info.pSetLayouts = frame_generation_layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device, &frame_generation_set_info,
+                                   frame_generation_hud_composite_sets_.data()) != VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: Failed to allocate the frame-generation HUD descriptor set");
+    return false;
+  }
   upscale_hud_composite_pipeline_ = util::CreateComputePipeline(
       vulkan_device_, upscale_hud_composite_pipeline_layout_, shaders::upscale_hud_composite_cs,
       sizeof(shaders::upscale_hud_composite_cs));
@@ -611,6 +648,22 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     paint_context_.submission_tracker.AwaitSubmissionCompletion(
         paint_context_.guest_output_image_paint_last_submission - 1);
   }
+  if (frame_generation_ && state.output_width &&
+      (state.output_width != output_width || state.output_height != output_height)) {
+    paint_context_.submission_tracker.AwaitAllSubmissionsCompletion();
+    frame_generation_submission_tracker_.AwaitAllSubmissionsCompletion();
+    for (const auto& queue : vulkan_device_->queue_families()) {
+      for (const auto& queue_instance : queue.queues) {
+        if (queue_instance) {
+          vulkan_device_->functions().vkQueueWaitIdle(queue_instance->queue);
+        }
+      }
+    }
+    while (!pending_frame_generation_.empty()) {
+      frame_generation_->Retire(pending_frame_generation_.front().second);
+      pending_frame_generation_.pop_front();
+    }
+  }
   if (!upscaler.Prepare(source_width, source_height, output_width, output_height, false)) {
     state.output_valid = false;
     return false;
@@ -632,6 +685,8 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
       same_target && state.last_dispatch_us
           ? std::clamp(float(now_us - state.last_dispatch_us) / 1000.0f, 1.0f, 100.0f)
           : 16.667f;
+  state.source_period = std::chrono::nanoseconds(
+      static_cast<int64_t>(std::llround(frame.frame_delta_ms * 1000000.0f)));
   // The history is dropped only when it cannot be continued: a new provider,
   // source or output size, or a recreated output image.
   frame.reset = !same_target || (camera && camera->cut);
@@ -676,6 +731,40 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
     temporal_upscale_query_submissions_[query_slot] =
         paint_context_.guest_output_image_paint_last_submission;
   }
+  state.generated_count = 0;
+  bool native_vulkan_present = true;
+#if REX_PLATFORM_WIN32
+  native_vulkan_present = paint_context_.dxgi_swapchain == nullptr;
+#endif
+  if (frame_generation_ && native_vulkan_present && camera_source && camera &&
+      camera->frame_generation_matrices_valid &&
+      !paint_context_.swapchain_hdr &&
+      swapchain_supports_transfer_dst.load(std::memory_order_relaxed) &&
+      camera_source->hudless_ever_written &&
+      frame_generation_->Configure(output_width, output_height, kGuestOutputFormat)) {
+    VulkanFrameGenerationInputs generation_inputs;
+    constexpr VkImageUsageFlags kGuestOutputUsage =
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    generation_inputs.color = {output_image, output_view, kGuestOutputFormat, output_width,
+                               output_height, kGuestOutputUsage};
+    generation_inputs.depth = {camera_source->depth_image(), camera_source->depth_view(),
+                               kGuestOutputDepthFormat, source_width, source_height,
+                               VK_IMAGE_USAGE_SAMPLED_BIT};
+    generation_inputs.motion_vectors = {
+        camera_source->motion_image(), camera_source->motion_view(), kGuestOutputMotionFormat,
+        source_width, source_height, VK_IMAGE_USAGE_SAMPLED_BIT};
+    generation_inputs.camera = *camera;
+    generation_inputs.frame_delta_ms = frame.frame_delta_ms;
+    generation_inputs.reset = frame.reset;
+    generation_inputs.render_frame_index = guest_output_refresh_serial;
+    state.generated_count = frame_generation_->Record(
+        command_buffer, generation_inputs,
+        uint32_t(REXCVAR_GET(present_frame_generation_multiplier)));
+    pending_frame_generation_.emplace_back(
+        paint_context_.guest_output_image_paint_last_submission,
+        guest_output_refresh_serial);
+  }
   state.upscaler = &upscaler;
   state.output_image = output_image;
   state.source_width = source_width;
@@ -692,6 +781,345 @@ bool VulkanPresenter::DispatchTemporalUpscaler(
   if ((state.dispatch_count & 1023) == 0) {
     REXLOG_DEBUG("VulkanPresenter: {} temporal upscales, {} history resets, {} repeated paints",
                  state.dispatch_count, state.reset_count, state.repeat_count);
+  }
+  return true;
+}
+
+bool VulkanPresenter::PresentGeneratedFrames(const GuestOutputImage& source,
+                                             uint32_t source_width, uint32_t source_height,
+                                             uint32_t output_width, uint32_t output_height,
+                                             uint64_t reflex_frame_id,
+                                             uint64_t paint_submission_index,
+                                             uint32_t& real_swapchain_image_index,
+                                             VkSemaphore& real_present_semaphore,
+                                             bool& real_endpoint_prepared,
+                                             std::chrono::steady_clock::time_point deadline) {
+  (void)paint_submission_index;
+  const uint32_t image_count =
+      std::min(temporal_upscale_.generated_count, uint32_t(FrameGeneration::kMaxImages));
+  if (!frame_generation_ || image_count != 1 || paint_context_.swapchain_hdr ||
+      !source.hudless_ever_written || paint_context_.swapchain == VK_NULL_HANDLE) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now > deadline + last_source_period_) return false;
+  if (now < deadline) std::this_thread::sleep_until(deadline);
+
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  // Never acquire/present a second image ahead of the real paint's acquired
+  // image. Some WSI implementations (and capture layers) block that present
+  // until the earlier acquisition is presented. Save the finished real image,
+  // present interpolation through the first acquisition, then acquire its real
+  // endpoint. Image 1 is reserved for this snapshot in the 2x integration.
+  const VulkanUpscalerImage& real_snapshot = frame_generation_->images()[1];
+  auto& original_framebuffer =
+      paint_context_.swapchain_framebuffers[real_swapchain_image_index];
+  if (original_framebuffer.interpolated_present_semaphore == VK_NULL_HANDLE) {
+    VkSemaphoreCreateInfo info = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (dfn.vkCreateSemaphore(device, &info, nullptr,
+          &original_framebuffer.interpolated_present_semaphore) != VK_SUCCESS) return false;
+  }
+  bool presented_any = false;
+  for (uint32_t i = 0; i < image_count; ++i) {
+    uint64_t submission_index = frame_generation_submission_tracker_.GetCurrentSubmission();
+    constexpr uint64_t kSubmissionCount = FrameGeneration::kMaxImages;
+    if (submission_index >= kSubmissionCount) {
+      frame_generation_submission_tracker_.AwaitSubmissionCompletion(submission_index -
+                                                                     kSubmissionCount);
+    }
+    PaintContext::Submission& submission =
+        *frame_generation_submissions_[submission_index % kSubmissionCount];
+    if (dfn.vkResetCommandPool(device, submission.draw_command_pool(), 0) != VK_SUCCESS) {
+      break;
+    }
+    VkCommandBuffer command_buffer = submission.draw_command_buffer();
+    VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (dfn.vkBeginCommandBuffer(command_buffer, &begin_info) != VK_SUCCESS) {
+      break;
+    }
+
+    const VulkanUpscalerImage& generated = frame_generation_->images()[i];
+    VkImageMemoryBarrier to_compute = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_compute.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_compute.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    to_compute.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_compute.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_compute.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_compute.image = generated.image;
+    to_compute.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_compute);
+
+    VkDescriptorSet composition_set =
+        frame_generation_hud_composite_sets_[submission_index % kSubmissionCount];
+    VkDescriptorImageInfo images[3] = {
+        {ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge], source.view(),
+         kGuestOutputInternalLayout},
+        {ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge],
+         source.hudless_view(), kGuestOutputInternalLayout},
+        {VK_NULL_HANDLE, generated.view, VK_IMAGE_LAYOUT_GENERAL},
+    };
+    VkWriteDescriptorSet writes[3] = {};
+    for (uint32_t j = 0; j < 3; ++j) {
+      writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      writes[j].dstSet = composition_set;
+      writes[j].dstBinding = j;
+      writes[j].descriptorCount = 1;
+      writes[j].descriptorType =
+          j == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      writes[j].pImageInfo = &images[j];
+    }
+    dfn.vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    struct {
+      uint32_t output_size[2];
+      float output_size_inv[2];
+      float source_uv_scale[2];
+    } constants = {
+        {output_width, output_height},
+        {1.0f / float(output_width), 1.0f / float(output_height)},
+        {float(source_width) / float(source.extent().width),
+         float(source_height) / float(source.extent().height)},
+    };
+    dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          upscale_hud_composite_pipeline_);
+    dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                upscale_hud_composite_pipeline_layout_, 0, 1,
+                                &composition_set, 0, nullptr);
+    dfn.vkCmdPushConstants(command_buffer, upscale_hud_composite_pipeline_layout_,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+    dfn.vkCmdDispatch(command_buffer, (output_width + 15) / 16, (output_height + 7) / 8, 1);
+
+    VkImageMemoryBarrier to_transfer = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_transfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_transfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.image = generated.image;
+    to_transfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_transfer);
+
+    const uint32_t swapchain_image_index = real_swapchain_image_index;
+    const VkImage swapchain_image = paint_context_.swapchain_images[swapchain_image_index];
+    VkImageMemoryBarrier preserve[2] = {};
+    for (auto& barrier : preserve) {
+      barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
+    preserve[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    preserve[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    preserve[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    preserve[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    preserve[0].image = swapchain_image;
+    preserve[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    preserve[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    preserve[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    preserve[1].image = real_snapshot.image;
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             2, preserve);
+    VkImageBlit preserve_blit = {};
+    preserve_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    preserve_blit.srcOffsets[1] = {int32_t(paint_context_.swapchain_extent.width),
+                                  int32_t(paint_context_.swapchain_extent.height), 1};
+    preserve_blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    preserve_blit.dstOffsets[1] = {int32_t(output_width), int32_t(output_height), 1};
+    dfn.vkCmdBlitImage(command_buffer, swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       real_snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &preserve_blit, VK_FILTER_NEAREST);
+    VkImageMemoryBarrier snapshot_read = preserve[1];
+    snapshot_read.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    snapshot_read.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    snapshot_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    snapshot_read.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &snapshot_read);
+    VkImageMemoryBarrier to_copy = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_copy.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    to_copy.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_copy.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_copy.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_copy.image = swapchain_image;
+    to_copy.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_copy);
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(output_width), int32_t(output_height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {int32_t(paint_context_.swapchain_extent.width),
+                          int32_t(paint_context_.swapchain_extent.height), 1};
+    dfn.vkCmdBlitImage(command_buffer, generated.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchain_image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    VkImageMemoryBarrier to_present = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_present.dstAccessMask = 0;
+    to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_present.image = swapchain_image;
+    to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &to_present);
+    VkImageMemoryBarrier generated_reuse = to_transfer;
+    generated_reuse.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    generated_reuse.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    generated_reuse.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    generated_reuse.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &generated_reuse);
+    if (dfn.vkEndCommandBuffer(command_buffer) != VK_SUCCESS) break;
+
+    const uint64_t physical_present_id = ++paint_context_.swapchain_last_present_id;
+    VkSemaphore present_semaphore =
+        original_framebuffer.interpolated_present_semaphore;
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkLatencySubmissionPresentIdNV latency_submission = {
+        VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV};
+    latency_submission.presentID = reflex_frame_id;
+    VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit_info.pNext =
+        reflex_ && reflex_->active() && reflex_frame_id ? &latency_submission : nullptr;
+    submit_info.waitSemaphoreCount = 1;
+    const VkSemaphore acquire_semaphore = real_present_semaphore;
+    submit_info.pWaitSemaphores = &acquire_semaphore;
+    submit_info.pWaitDstStageMask = &wait_stage;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &present_semaphore;
+    VkResult submit_result = VK_ERROR_UNKNOWN;
+    {
+      VulkanSubmissionTracker::FenceAcquisition fence =
+          frame_generation_submission_tracker_.AcquireFenceToAdvanceSubmission();
+      const auto queue = vulkan_device_->AcquireQueue(
+          vulkan_device_->queue_family_graphics_compute(), 0);
+      submit_result = dfn.vkQueueSubmit(queue.queue(), 1, &submit_info, fence.fence());
+      if (submit_result != VK_SUCCESS) fence.SubmissionFailedOrDropped();
+    }
+    if (submit_result != VK_SUCCESS) break;
+    real_endpoint_prepared = false;
+    frame_generation_submission_tracker_.AwaitSubmissionCompletion(submission_index);
+
+    VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &present_semaphore;
+    present_info.swapchainCount = 1;
+    present_info.pSwapchains = &paint_context_.swapchain;
+    const uint32_t image_index = swapchain_image_index;
+    present_info.pImageIndices = &image_index;
+    VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+    present_id_info.swapchainCount = 1;
+    present_id_info.pPresentIds = &physical_present_id;
+    if (vulkan_device_->properties().presentId) present_info.pNext = &present_id_info;
+    if (reflex_ && reflex_->active() && reflex_frame_id) {
+      reflex_->OutOfBandPresentStart(reflex_frame_id);
+    }
+    const auto present_queue = vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    const VkResult present_result = dfn.vkQueuePresentKHR(present_queue.queue(), &present_info);
+    if (reflex_ && reflex_->active() && reflex_frame_id) {
+      reflex_->OutOfBandPresentEnd(reflex_frame_id);
+    }
+    if (present_result != VK_SUCCESS && present_result != VK_SUBOPTIMAL_KHR) break;
+    presented_any = true;
+  }
+  if (!presented_any) return false;
+
+  // Acquire the endpoint only after the interpolation using the earlier
+  // acquisition was presented. This keeps WSI acquisition/presentation FIFO.
+  const uint64_t endpoint_submission_index =
+      frame_generation_submission_tracker_.GetCurrentSubmission();
+  if (endpoint_submission_index >= FrameGeneration::kMaxImages) {
+    frame_generation_submission_tracker_.AwaitSubmissionCompletion(
+        endpoint_submission_index - FrameGeneration::kMaxImages);
+  }
+  auto& endpoint_submission = *frame_generation_submissions_[
+      endpoint_submission_index % FrameGeneration::kMaxImages];
+  uint32_t endpoint_image_index = UINT32_MAX;
+  const VkResult acquired = dfn.vkAcquireNextImageKHR(
+      device, paint_context_.swapchain, UINT64_C(50000000),
+      endpoint_submission.acquire_semaphore(), VK_NULL_HANDLE, &endpoint_image_index);
+  if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return true;
+  if (dfn.vkResetCommandPool(device, endpoint_submission.draw_command_pool(), 0) != VK_SUCCESS)
+    return true;
+  const VkCommandBuffer endpoint_command = endpoint_submission.draw_command_buffer();
+  VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn.vkBeginCommandBuffer(endpoint_command, &begin) != VK_SUCCESS) return true;
+  const VkImage endpoint_image = paint_context_.swapchain_images[endpoint_image_index];
+  VkImageMemoryBarrier endpoint_barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  endpoint_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  endpoint_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  endpoint_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  endpoint_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  endpoint_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  endpoint_barrier.image = endpoint_image;
+  endpoint_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  dfn.vkCmdPipelineBarrier(endpoint_command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                           1, &endpoint_barrier);
+  VkImageBlit endpoint_blit = {};
+  endpoint_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  endpoint_blit.srcOffsets[1] = {int32_t(output_width), int32_t(output_height), 1};
+  endpoint_blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  endpoint_blit.dstOffsets[1] = {int32_t(paint_context_.swapchain_extent.width),
+                                int32_t(paint_context_.swapchain_extent.height), 1};
+  dfn.vkCmdBlitImage(endpoint_command, real_snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     endpoint_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &endpoint_blit, VK_FILTER_NEAREST);
+  endpoint_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  endpoint_barrier.dstAccessMask = 0;
+  endpoint_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  endpoint_barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+  dfn.vkCmdPipelineBarrier(endpoint_command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr,
+                           1, &endpoint_barrier);
+  if (dfn.vkEndCommandBuffer(endpoint_command) != VK_SUCCESS) return true;
+  const VkSemaphore endpoint_acquired = endpoint_submission.acquire_semaphore();
+  const VkSemaphore endpoint_ready =
+      paint_context_.swapchain_framebuffers[endpoint_image_index].present_semaphore;
+  VkPipelineStageFlags endpoint_wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  VkLatencySubmissionPresentIdNV endpoint_latency = {
+      VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV};
+  endpoint_latency.presentID = reflex_frame_id;
+  VkSubmitInfo endpoint_submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  endpoint_submit.pNext = reflex_ && reflex_->active() && reflex_frame_id ? &endpoint_latency : nullptr;
+  endpoint_submit.waitSemaphoreCount = 1;
+  endpoint_submit.pWaitSemaphores = &endpoint_acquired;
+  endpoint_submit.pWaitDstStageMask = &endpoint_wait_stage;
+  endpoint_submit.commandBufferCount = 1;
+  endpoint_submit.pCommandBuffers = &endpoint_command;
+  endpoint_submit.signalSemaphoreCount = 1;
+  endpoint_submit.pSignalSemaphores = &endpoint_ready;
+  VkResult endpoint_result;
+  {
+    auto fence = frame_generation_submission_tracker_.AcquireFenceToAdvanceSubmission();
+    const auto queue = vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+    endpoint_result = dfn.vkQueueSubmit(queue.queue(), 1, &endpoint_submit, fence.fence());
+    if (endpoint_result != VK_SUCCESS) fence.SubmissionFailedOrDropped();
+  }
+  if (endpoint_result == VK_SUCCESS) {
+    real_swapchain_image_index = endpoint_image_index;
+    real_present_semaphore = endpoint_ready;
+    real_endpoint_prepared = true;
   }
   return true;
 }
@@ -1131,6 +1559,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, surface_unusable);
+    if (reflex_ && paint_context_.swapchain != VK_NULL_HANDLE) {
+      reflex_->OnSwapchainCreated(paint_context_.swapchain);
+    }
     // Destroy the old swapchain that may be retired now.
     if (old_swapchain != VK_NULL_HANDLE) {
       dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
@@ -1239,6 +1670,9 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         VK_NULL_HANDLE, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo,
         paint_context_.swapchain_hdr, surface_unusable);
+    if (reflex_ && paint_context_.swapchain != VK_NULL_HANDLE) {
+      reflex_->OnSwapchainCreated(paint_context_.swapchain);
+    }
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Failed to create the swapchain for the new Vulkan surface - destroy the
       // Vulkan surface.
@@ -1901,7 +2335,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // Create the swapchain.
   VkSwapchainCreateInfoKHR swapchain_create_info;
   swapchain_create_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-  swapchain_create_info.pNext = nullptr;
+  VkSwapchainLatencyCreateInfoNV latency_info = {
+      VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV};
+  latency_info.latencyModeEnable =
+      vulkan_device->extensions().ext_NV_low_latency2 &&
+              REXCVAR_GET(present_reflex) != "off"
+          ? VK_TRUE
+          : VK_FALSE;
+  swapchain_create_info.pNext =
+      vulkan_device->extensions().ext_NV_low_latency2 ? &latency_info : nullptr;
   swapchain_create_info.flags = 0;
   swapchain_create_info.surface = surface;
   swapchain_create_info.minImageCount =
@@ -1915,6 +2357,15 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.imageExtent = image_extent;
   swapchain_create_info.imageArrayLayers = 1;
   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  constexpr VkImageUsageFlags kFrameGenerationTransferUsage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const bool transfer_dst_supported =
+      (surface_capabilities.supportedUsageFlags & kFrameGenerationTransferUsage) ==
+      kFrameGenerationTransferUsage;
+  swapchain_supports_transfer_dst.store(transfer_dst_supported, std::memory_order_relaxed);
+  if (REXCVAR_GET(present_frame_generation) != "off" && transfer_dst_supported) {
+    swapchain_create_info.imageUsage |= kFrameGenerationTransferUsage;
+  }
   const bool capturable =
       REXCVAR_GET(present_capture_readable) &&
       (surface_capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -2078,6 +2529,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
     dfn.vkDestroyFramebuffer(device, framebuffer.framebuffer, nullptr);
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
     dfn.vkDestroySemaphore(device, framebuffer.present_semaphore, nullptr);
+    if (framebuffer.interpolated_present_semaphore != VK_NULL_HANDLE) {
+      dfn.vkDestroySemaphore(device, framebuffer.interpolated_present_semaphore, nullptr);
+    }
   }
   swapchain_framebuffers.clear();
   for (const HdrImage& hdr_image : hdr_images) {
@@ -2099,6 +2553,9 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
 }
 
 void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+  if (reflex) {
+    reflex->OnSwapchainDestroying(swapchain);
+  }
 #if REX_PLATFORM_MAC
   mac_metal_layer = nullptr;
 #endif
@@ -2254,6 +2711,16 @@ bool VulkanPresenter::GuestOutputImage::CreateImage(VkImage& image, VkDeviceMemo
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  temporal_upscale_.generated_count = 0;
+  if (frame_generation_) {
+    const uint64_t completed =
+        paint_context_.submission_tracker.UpdateAndGetCompletedSubmission();
+    while (!pending_frame_generation_.empty() &&
+           pending_frame_generation_.front().first <= completed) {
+      frame_generation_->Retire(pending_frame_generation_.front().second);
+      pending_frame_generation_.pop_front();
+    }
+  }
   // present_hdr switched (#442): recreate the swapchain in the other format
   // through the reconnection. Where the surface offers no scRGB, nothing
   // changes.
@@ -3302,6 +3769,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   command_buffers[command_buffer_count++] = draw_command_buffer;
   VkSemaphore present_semaphore =
       paint_context_.swapchain_framebuffers[swapchain_image_index].present_semaphore;
+  const uint64_t reflex_frame_id = Fm4ReflexCurrentFrameId();
+  const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
+  const bool wants_present_id =
+      (reflex_ && reflex_->active() && reflex_frame_id) ||
+      (device_properties.presentId && device_properties.presentWait &&
+       REXCVAR_GET(vulkan_present_wait));
+  VkLatencySubmissionPresentIdNV reflex_submit_present_id = {
+      VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV};
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
@@ -3315,6 +3790,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 #if REX_PLATFORM_WIN32
   if (dxgi_swapchain) dxgi_swapchain->ChainSubmission(submit_info);
 #endif
+  if (reflex_ && reflex_->active() && reflex_frame_id) {
+    // vkLatencySleepNV owns and signals its sleep timeline. GPU rendering must
+    // never signal it as well: the driver and this queue could race to signal
+    // the same value, or a later sleep could overtake an older queue signal.
+    reflex_submit_present_id.presentID = reflex_frame_id;
+    submit_info.pNext = &reflex_submit_present_id;
+    reflex_->RenderSubmitStart(reflex_frame_id);
+  }
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
@@ -3330,6 +3813,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+      if (reflex_ && reflex_->active() && reflex_frame_id) {
+        reflex_->RenderSubmitEnd(reflex_frame_id);
+      }
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
         if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
                               ui_fence_acquisition.fence()) != VK_SUCCESS) {
@@ -3364,6 +3850,50 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   if (dxgi_swapchain) return PresentDxgi();
 #endif
 
+  const bool has_generated_frame =
+      guest_output_image && temporal_upscale_.generated_count &&
+      swapchain_supports_transfer_dst.load(std::memory_order_relaxed);
+  if (has_generated_frame) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index);
+  }
+  const auto now = std::chrono::steady_clock::now();
+  last_source_period_ = std::clamp(temporal_upscale_.source_period,
+                                   std::chrono::nanoseconds(2'000'000),
+                                   std::chrono::nanoseconds(100'000'000));
+  const auto generated_deadline = now;
+  const auto real_deadline = now + last_source_period_ / 2;
+  bool generated_presented = false;
+  bool real_endpoint_prepared = true;
+  std::chrono::steady_clock::time_point generated_present_time{};
+  if (reflex_ && reflex_->active() && reflex_frame_id) {
+    reflex_->PresentStart(reflex_frame_id);
+  }
+  if (has_generated_frame && now <= real_deadline) {
+    generated_presented = PresentGeneratedFrames(
+        *guest_output_image, temporal_upscale_.source_width,
+        temporal_upscale_.source_height, temporal_upscale_.output_width,
+        temporal_upscale_.output_height, reflex_frame_id, current_paint_submission_index,
+        swapchain_image_index, present_semaphore, real_endpoint_prepared,
+        generated_deadline);
+    if (generated_presented) {
+      generated_present_time = std::chrono::steady_clock::now();
+    }
+  }
+  if (!real_endpoint_prepared) {
+    if (reflex_ && reflex_->active() && reflex_frame_id) reflex_->PresentEnd(reflex_frame_id);
+    return PaintResult::kNotPresentedConnectionOutdated;
+  }
+  if (frame_generation_ && guest_output_image &&
+      REXCVAR_GET(present_frame_generation) != "off") {
+    frame_generation_->MarkPresented(generated_presented);
+  }
+  if (generated_presented) {
+    const auto real_deadline_now =
+        std::max(real_deadline, std::chrono::steady_clock::now() + last_source_period_ / 2);
+    std::this_thread::sleep_until(real_deadline_now);
+  }
+  const uint64_t present_id =
+      wants_present_id ? ++paint_context_.swapchain_last_present_id : 0;
   VkPresentInfoKHR present_info;
   present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
   present_info.pNext = nullptr;
@@ -3375,11 +3905,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pResults = nullptr;
   // IDs grow on each swapchain (a new swapchain starts again from 1).
   VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
-  uint64_t present_id = 0;
-  const VulkanDevice::Properties& device_properties = vulkan_device_->properties();
-  if (device_properties.presentId && device_properties.presentWait &&
-      REXCVAR_GET(vulkan_present_wait)) {
-    present_id = ++paint_context_.swapchain_last_present_id;
+  if (present_id) {
     present_id_info.swapchainCount = 1;
     present_id_info.pPresentIds = &present_id;
     present_info.pNext = &present_id_info;
@@ -3393,10 +3919,76 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  const auto real_present_time = std::chrono::steady_clock::now();
+  if (REXCVAR_GET(present_fg_timing) && guest_output_image &&
+      REXCVAR_GET(present_frame_generation) != "off" &&
+      (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
+    ++fg_timing_source_count_;
+    if (last_real_present_time_ != std::chrono::steady_clock::time_point{}) {
+      fg_timing_source_period_sum_ +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(real_present_time -
+                                                               last_real_present_time_);
+    }
+    if (generated_presented) {
+      ++fg_timing_presented_count_;
+    } else {
+      ++fg_timing_skipped_count_;
+    }
+    const auto record_interval = [this](std::chrono::nanoseconds interval) {
+      if (interval <= std::chrono::nanoseconds(0)) return;
+      fg_timing_present_period_sum_ += interval;
+      ++fg_timing_interval_count_;
+      if (!fg_timing_min_gap_.count() || interval < fg_timing_min_gap_) {
+        fg_timing_min_gap_ = interval;
+      }
+      if (interval > fg_timing_max_gap_) fg_timing_max_gap_ = interval;
+    };
+    if (generated_present_time != std::chrono::steady_clock::time_point{}) {
+      if (fg_timing_last_present_ != std::chrono::steady_clock::time_point{}) {
+        record_interval(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            generated_present_time - fg_timing_last_present_));
+      }
+      record_interval(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          real_present_time - generated_present_time));
+    } else if (fg_timing_last_present_ != std::chrono::steady_clock::time_point{}) {
+      record_interval(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          real_present_time - fg_timing_last_present_));
+    }
+    fg_timing_last_present_ = real_present_time;
+    if (fg_timing_source_count_ >= 120) {
+      const double mean_source_ns =
+          double(fg_timing_source_period_sum_.count()) / double(fg_timing_source_count_);
+      const double mean_present_ns =
+          fg_timing_interval_count_
+              ? double(fg_timing_present_period_sum_.count()) / double(fg_timing_interval_count_)
+              : 0.0;
+      REXLOG_INFO(
+          "Frame generation timing: sources={} generated={} skipped={} source_fps={:.3f} "
+          "presented_fps={:.3f} gap_ms={:.3f}..{:.3f} mean_gap_ms={:.3f}",
+          fg_timing_source_count_, fg_timing_presented_count_, fg_timing_skipped_count_,
+          mean_source_ns > 0.0 ? 1.0e9 / mean_source_ns : 0.0,
+          mean_present_ns > 0.0 ? 1.0e9 / mean_present_ns : 0.0,
+          double(fg_timing_min_gap_.count()) / 1.0e6,
+          double(fg_timing_max_gap_.count()) / 1.0e6, mean_present_ns / 1.0e6);
+      fg_timing_source_count_ = 0;
+      fg_timing_presented_count_ = 0;
+      fg_timing_skipped_count_ = 0;
+      fg_timing_source_period_sum_ = std::chrono::nanoseconds(0);
+      fg_timing_present_period_sum_ = std::chrono::nanoseconds(0);
+      fg_timing_min_gap_ = std::chrono::nanoseconds(0);
+      fg_timing_max_gap_ = std::chrono::nanoseconds(0);
+      fg_timing_interval_count_ = 0;
+    }
+  }
+  last_real_present_time_ = real_present_time;
+  if (reflex_ && reflex_->active() && reflex_frame_id) {
+    reflex_->PresentEnd(reflex_frame_id);
+  }
 #if REX_PLATFORM_WIN32
   paint_context_.RecomposeWindowIfPresentStalled(present_start);
 #endif
-  if (present_id > 1 && (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
+  if (present_id > 1 && device_properties.presentWait && dfn.vkWaitForPresentKHR &&
+      (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR)) {
     // At most one present in flight: the previous one must have reached the
     // display before the next frame is painted.
     dfn.vkWaitForPresentKHR(vulkan_device_->device(), paint_context_.swapchain, present_id - 1,
@@ -3659,6 +4251,12 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       return false;
     }
   }
+  for (size_t i = 0; i < frame_generation_submissions_.size(); ++i) {
+    frame_generation_submissions_[i] = PaintContext::Submission::Create(vulkan_device_);
+    if (!frame_generation_submissions_[i]) {
+      return false;
+    }
+  }
 
   // Guest output paint pipelines drawing to intermediate images, not depending
   // on runtime state unlike ones drawing to the swapchain images as those
@@ -3741,6 +4339,17 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
                   info.unavailable_reason);
     }
   }
+
+  VulkanUpscaler* dlss_provider = nullptr;
+  for (const std::unique_ptr<VulkanUpscaler>& upscaler : upscalers_) {
+    if (upscaler->info().id == "dlss") {
+      dlss_provider = upscaler.get();
+      break;
+    }
+  }
+  frame_generation_ = std::make_unique<FrameGeneration>(vulkan_device_, dlss_provider);
+  reflex_ = std::make_unique<Reflex>(vulkan_device_);
+  paint_context_.reflex = reflex_.get();
 
   return InitializeCommonSurfaceIndependent();
 }

@@ -19,6 +19,7 @@
 
 #include <rex/graphics/fm4_camera_cut.h>
 #include <rex/graphics/fm4_decal_motion.h>
+#include <rex/graphics/fm4_frame_generation_camera.h>
 #include <rex/graphics/fm4_reactive_mask.h>
 #include <rex/graphics/fm4_scene_jitter.h>
 #include <rex/graphics/fm4_shadow_motion.h>
@@ -612,6 +613,14 @@ void Fh1NativeExecutor::FinishCameraFrame() {
   camera.fov_y = lens_fov_y_;
   camera.near_plane = lens_near_;
   camera.far_plane = lens_far_;
+  camera.frame_generation_matrices_valid = false;
+  if (projection) {
+    if (const auto frame_generation =
+            Fm4FactorFrameGenerationCamera(current, lens_fov_y_, lens_near_, lens_far_)) {
+      camera.frame_generation = *frame_generation;
+      camera.frame_generation_matrices_valid = true;
+    }
+  }
 
   // The previous frame's matrix for the same objects.
   std::unordered_map<std::array<float, 16>, size_t, MatrixHash> previous_matches;
@@ -658,6 +667,19 @@ void Fh1NativeExecutor::FinishCameraFrame() {
     camera.cut = false;
   }
   for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
+  if (camera.frame_generation_matrices_valid) {
+    for (size_t i = 0; i < 16; ++i) {
+      camera.frame_generation.clip_to_previous[i] = float(reprojection[i]);
+    }
+    Matrix previous_inverse;
+    if (Invert(reprojection, previous_inverse)) {
+      for (size_t i = 0; i < 16; ++i) {
+        camera.frame_generation.previous_to_clip[i] = float(previous_inverse[i]);
+      }
+    } else {
+      camera.frame_generation_matrices_valid = false;
+    }
+  }
   if (camera.cut) Count("camera_cut");
   Count("camera_frame");
   if ((frame_ % 600) == 0) {
