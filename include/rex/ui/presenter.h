@@ -449,6 +449,15 @@ class Presenter {
     return painted_guest_output_rect_;
   }
 
+  // The connected drawable's physical size, safe to read while the guest output
+  // thread records a frame.
+  bool GetSurfaceSize(uint32_t& width_out, uint32_t& height_out) const {
+    const uint64_t size = surface_size_for_guest_output_thread_.load(std::memory_order_acquire);
+    width_out = uint32_t(size >> 32);
+    height_out = uint32_t(size);
+    return width_out && height_out;
+  }
+
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
@@ -1003,6 +1012,8 @@ class Presenter {
   // painting.
   uint32_t surface_width_in_paint_connection_ = 0;
   uint32_t surface_height_in_paint_connection_ = 0;
+  // Packed (width << 32 | height), published for the guest output thread.
+  std::atomic<uint64_t> surface_size_for_guest_output_thread_{0};
 
   // Can be set by both the UI thread and the guest output thread before doing
   // window_->RequestPaint() - whether an extra painting (preceded by

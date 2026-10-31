@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
+#include <bit>
 #include <cmath>
 #include <limits>
 
@@ -133,6 +134,114 @@ TEST_CASE("an object's matrix registers are the columns of its world-view-projec
   }
   // The origin: clip w is the car's distance.
   CHECK_THAT(rows[15], WithinAbs(33.3736, 1.0e-4));
+}
+
+TEST_CASE("free aspect expands FM4's horizontal projection without changing the vertical scale",
+          "[graphics][camera][aspect]") {
+  // Ultrawide contracts clip x relative to FM4's native 16:9, keeping clip y and
+  // depth unchanged. Taller output constraints clip x to keep its vertical FOV.
+  CHECK_THAT(Fm4AspectScaleX(3440, 1440), WithinAbs(16.0 * 1440.0 / (9.0 * 3440.0), 1.0e-6));
+  CHECK_THAT(Fm4AspectScaleX(1280, 720), WithinAbs(1.0, 1.0e-6));
+  CHECK_THAT(Fm4AspectScaleX(1920, 1200), WithinAbs(10.0 / 9.0, 1.0e-6));
+  CHECK_THAT(Fm4AspectScaleX(1080, 1920), WithinAbs(256.0 / 81.0, 1.0e-6));
+  CHECK(Fm4AspectScaleX(0, 600) == 0.0f);
+  CHECK(Fm4AspectScaleX(800, 0) == 0.0f);
+
+  std::array<float, 16> camera = {};
+  std::array<float, 16> object = {};
+  for (size_t i = 0; i < camera.size(); ++i) {
+    camera[i] = float(i + 1);
+    object[i] = float(i + 1);
+  }
+  REQUIRE(Fm4ScaleProjectionForAspect(camera, Fm4DrawPlacement::kCamera, 3440, 1440));
+  REQUIRE(Fm4ScaleProjectionForAspect(object, Fm4DrawPlacement::kObject, 3440, 1440));
+  const float scale = Fm4AspectScaleX(3440, 1440);
+  for (size_t i = 0; i < camera.size(); ++i) {
+    const bool object_axis = i == 0 || i == 4 || i == 8 || i == 12;
+    CHECK_THAT(object[i], WithinAbs(float(i + 1) * (object_axis ? scale : 1.0f), 1.0e-6));
+    CHECK_THAT(camera[i],
+               WithinAbs(float(i + 1) * (i < 4 ? scale : 1.0f), 1.0e-6));
+  }
+
+  std::array<float, 16> unchanged = {7};
+  CHECK_FALSE(Fm4ScaleProjectionForAspect(unchanged, Fm4DrawPlacement::kUnplaced, 3440, 1440));
+  CHECK(unchanged[0] == 7);
+
+  // At z = 1 with an identity view, the native 16:9 edge moves inside the
+  // viewport while the ultrawide horizontal edge lands at physical x = 1.
+  const double native_x = 16.0 / 9.0;
+  const double target_x = 3440.0 / 1440.0;
+  std::array<float, 16> projection = {
+      float(1.0 / native_x), 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  REQUIRE(Fm4ScaleProjectionForAspect(projection, Fm4DrawPlacement::kCamera, 3440, 1440));
+  CHECK_THAT(target_x * projection[0], WithinAbs(1.0, 1.0e-6));
+  CHECK_THAT(projection[5], WithinAbs(1.0, 1.0e-6));
+  CHECK_THAT(projection[10], WithinAbs(1.0, 1.0e-6));
+}
+
+TEST_CASE("free aspect changes only the selected matrix in all 256 float4 registers",
+          "[graphics][camera][aspect]") {
+  std::array<float, 256 * 4> original;
+  for (size_t i = 0; i < original.size(); ++i) original[i] = float(i) - 777.0f;
+
+  const float scale = Fm4AspectScaleX(3440, 1440);
+  auto matches = [&](const std::array<float, 256 * 4>& actual, size_t changed_first,
+                     const std::array<size_t, 4>& changed) {
+    for (size_t i = 0; i < actual.size(); ++i) {
+      bool is_changed = false;
+      for (size_t relative : changed) is_changed |= i == changed_first + relative;
+      if (is_changed) {
+        CHECK_THAT(actual[i], WithinAbs(original[i] * scale, 1.0e-5));
+      } else {
+        CHECK(actual[i] == original[i]);
+      }
+    }
+  };
+
+  std::array<float, 256 * 4> camera = original;
+  REQUIRE(Fm4ScaleVertexFloatConstantsForAspect(camera, Fm4DrawPlacement::kCamera, 3440, 1440));
+  matches(camera, 128 * 4, {0, 1, 2, 3});
+
+  std::array<float, 256 * 4> object = original;
+  REQUIRE(Fm4ScaleVertexFloatConstantsForAspect(object, Fm4DrawPlacement::kObject, 3440, 1440));
+  matches(object, 0, {0, 4, 8, 12});
+
+  std::array<float, 256 * 4> unchanged = original;
+  CHECK_FALSE(
+      Fm4ScaleVertexFloatConstantsForAspect(unchanged, Fm4DrawPlacement::kUnplaced, 3440, 1440));
+  CHECK(unchanged == original);
+  CHECK(Fm4ScaleVertexFloatConstantsForAspect(unchanged, Fm4DrawPlacement::kCamera, 1280, 720));
+  CHECK(unchanged == original);
+  CHECK_FALSE(
+      Fm4ScaleVertexFloatConstantsForAspect(unchanged, Fm4DrawPlacement::kCamera, 0, 720));
+  CHECK(unchanged == original);
+}
+
+TEST_CASE("raw vertex register uploads preserve all non-matrix bits",
+          "[graphics][camera][aspect]") {
+  std::array<uint32_t, 256 * 4> original;
+  for (size_t i = 0; i < original.size(); ++i) {
+    original[i] = std::bit_cast<uint32_t>(float(i) * 0.125f + 1.0f);
+  }
+  original[900] = 0x7FC12345u;  // Preserve unrelated NaN payloads, too.
+  for (Fm4DrawPlacement placement : {Fm4DrawPlacement::kCamera, Fm4DrawPlacement::kObject}) {
+    auto bank = original;
+    REQUIRE(Fm4ScaleVertexFloatConstantsForAspect(bank, placement, 1720, 720));
+    for (size_t i = 0; i < bank.size(); ++i) {
+      const bool changed = placement == Fm4DrawPlacement::kCamera
+                               ? (i >= 512 && i < 516)
+                               : (i == 0 || i == 4 || i == 8 || i == 12);
+      if (changed) {
+        CHECK_THAT(std::bit_cast<float>(bank[i]),
+                   WithinAbs(std::bit_cast<float>(original[i]) * (1280.0f / 1720.0f), 1.0e-5));
+      } else {
+        CHECK(bank[i] == original[i]);
+      }
+    }
+  }
+  auto bank = original;
+  CHECK_FALSE(Fm4ScaleVertexFloatConstantsForAspect(bank, Fm4DrawPlacement::kCamera, 0, 720));
+  CHECK(bank == original);
 }
 
 TEST_CASE("a race draws the scene turned 180 degrees, the showroom upright",

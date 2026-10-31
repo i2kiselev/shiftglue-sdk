@@ -10,6 +10,8 @@
 #include <optional>
 #include <vector>
 
+#include <rex/graphics/fm4_scene_jitter.h>
+
 namespace rex::graphics {
 
 // A shift of an eighth of the screen in one frame or more is a cut. Below it the matched
@@ -50,6 +52,26 @@ uint32_t Fm4SceneDepth(const std::vector<Fm4DepthCandidate>& candidates);
 // are, from its c0-c3. FM4's object shaders take the registers as columns (x * c0 + y * c1 +
 // z * c2 + c3); read as rows, every moving car's reprojection was wrong.
 std::array<float, 16> Fm4ObjectMatrix(const std::array<float, 16>& registers);
+
+// FM4's cameras use a 16:9 horizontal projection. A free-aspect output keeps the vertical
+// field of view and scales clip x by the ratio between 16:9 and the output's aspect.
+// Returns 0 for an invalid output size.
+float Fm4AspectScaleX(uint32_t output_width, uint32_t output_height);
+
+// Scales the clip-x part of an FM4 world-view-projection in place. Camera registers at
+// c128-c131 are rows; object registers at c0-c3 are columns.
+bool Fm4ScaleProjectionForAspect(std::array<float, 16>& registers, Fm4DrawPlacement placement,
+                                 uint32_t output_width, uint32_t output_height);
+
+// The vertex shader float constant bank is 256 float4 registers (1024 scalars). Scale only
+// the matrix the placement names: c128-c131 for a camera, or the clip-x row of c0-c3 for an
+// object. Every unrelated register is preserved exactly.
+bool Fm4ScaleVertexFloatConstantsForAspect(std::array<float, 256 * 4>& constants,
+                                           Fm4DrawPlacement placement, uint32_t output_width,
+                                           uint32_t output_height);
+bool Fm4ScaleVertexFloatConstantsForAspect(std::array<uint32_t, 256 * 4>& constants,
+                                           Fm4DrawPlacement placement, uint32_t output_width,
+                                           uint32_t output_height);
 
 // The first register of a vertex shader's world-view-projection, from the float constants it
 // reads: 128 for the camera's (the world), 0 for an object's own, UINT32_MAX for neither. A

@@ -163,6 +163,55 @@ struct MatrixHash {
 
 }  // namespace
 
+Fm4DrawPlacement Fh1NativeExecutor::AspectProjectionPlacement(const Fh1DrawInfo& draw) const {
+  if (!initialized_ || !draw.vertex_shader || !draw.rasterization_done || draw.memexport ||
+      hud_draw_) {
+    return Fm4DrawPlacement::kUnplaced;
+  }
+  if (!camera_scene_depth_valid_) return Fm4DrawPlacement::kUnplaced;
+  const bool tests_scene_depth =
+      draw.normalized_depth_control.z_enable && CurrentDepthKey() == camera_scene_depth_;
+  const bool writes_scene_color =
+      (draw.normalized_color_mask & 0xF) &&
+      Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_);
+  if (!tests_scene_depth && !writes_scene_color) return Fm4DrawPlacement::kUnplaced;
+  const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
+  const auto bitmap = std::to_array(map.float_bitmap);
+  const uint32_t matrix_register = Fm4MatrixRegister(bitmap, map.float_dynamic_addressing);
+  if (matrix_register == kCameraFirstRegister) {
+    if ((bitmap[0] & 0xF) == 0xF) {
+      std::array<float, 16> camera_registers;
+      std::memcpy(camera_registers.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                         kCameraFirstRegister * 4],
+                  sizeof(camera_registers));
+      if (Fm4PlacedByObjectMatrix(bitmap, camera_registers)) {
+        return Fm4DrawPlacement::kObject;
+      }
+    }
+    std::array<float, 16> camera_rows;
+    std::memcpy(camera_rows.data(),
+                &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                       kCameraFirstRegister * 4],
+                sizeof(camera_rows));
+    return Fm4OrthographicMatrix(camera_rows) ? Fm4DrawPlacement::kUnplaced
+                                              : Fm4DrawPlacement::kCamera;
+  }
+  // Object projections are 3D when depth testing. Screen-space UI and glyph
+  // passes keep their authored coordinates.
+  if (matrix_register == kObjectFirstRegister && draw.normalized_depth_control.z_enable) {
+    std::array<float, 16> object_registers;
+    std::memcpy(object_registers.data(),
+                &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                       kObjectFirstRegister * 4],
+                sizeof(object_registers));
+    if (!Fm4OrthographicMatrix(Fm4ObjectMatrix(object_registers))) {
+      return Fm4DrawPlacement::kObject;
+    }
+  }
+  return Fm4DrawPlacement::kUnplaced;
+}
+
 void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   draw_jittered_ = false;
   current_object_slot_ = 0;
@@ -193,6 +242,8 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
                 &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
                                        kObjectFirstRegister * 4],
                 sizeof(registers));
+    Fm4ScaleProjectionForAspect(registers, Fm4DrawPlacement::kObject, free_aspect_width_,
+                                free_aspect_height_);
     const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
     const bool reads_world = Fm4ReadsWorldMatrix(std::to_array(map.float_bitmap));
     if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
@@ -238,6 +289,11 @@ void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
   std::memcpy(noted.wvp.data(),
               &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + kCameraFirstRegister * 4],
               sizeof(noted.wvp));
+  const Fm4DrawPlacement aspect_placement = AspectProjectionPlacement(draw);
+  if (aspect_placement == Fm4DrawPlacement::kCamera) {
+    Fm4ScaleProjectionForAspect(noted.wvp, Fm4DrawPlacement::kCamera, free_aspect_width_,
+                                free_aspect_height_);
+  }
   noted.object = DrawObjectKey(draw);
   noted.depth_key = CurrentDepthKey();
   noted.color_key = CurrentColorKey();
