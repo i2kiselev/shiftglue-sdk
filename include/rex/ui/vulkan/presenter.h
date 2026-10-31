@@ -29,6 +29,7 @@
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/upscaler.h>
+#include <rex/ui/vulkan/vulkan_neural_rendering.h>
 
 namespace rex {
 namespace ui {
@@ -142,8 +143,8 @@ class VulkanPresenter final : public Presenter {
     // z in [0, 1], kGuestOutputDepthFormat), the motion of each pixel to its
     // place in the previous frame (in UV units, kGuestOutputMotionFormat) and
     // the reactive mask (0 keeps the history, 1 takes the current frame;
-    // kGuestOutputReactiveFormat), at the guest output's size. Sampled and storage usage; released to
-    // kGuestOutputInternal* like the guest output. Created on first use.
+    // kGuestOutputReactiveFormat), at the guest output's size. Sampled and storage usage; released
+    // to kGuestOutputInternal* like the guest output. Created on first use.
     bool EnsureCameraImages();
     VkImage depth_image() const;
     VkImageView depth_image_view() const;
@@ -491,8 +492,8 @@ class VulkanPresenter final : public Presenter {
     static VkSwapchainKHR CreateSwapchainForVulkanSurface(
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
-        VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& hdr_out, bool& ui_surface_unusable_out);
+        VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out, bool& hdr_out,
+        bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -622,10 +623,8 @@ class VulkanPresenter final : public Presenter {
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
       GuestOutputPaintEffect effect, VkRenderPass render_pass,
       VkShaderModule fragment_shader = VK_NULL_HANDLE,
-      VkColorComponentFlags color_write_mask = VK_COLOR_COMPONENT_R_BIT |
-                                               VK_COLOR_COMPONENT_G_BIT |
-                                               VK_COLOR_COMPONENT_B_BIT |
-                                               VK_COLOR_COMPONENT_A_BIT,
+      VkColorComponentFlags color_write_mask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
       VkPipelineLayout layout = VK_NULL_HANDLE);
   bool CreateHdrSwapchainImages(VkFormat swapchain_format);
 #if REX_PLATFORM_WIN32
@@ -649,10 +648,9 @@ class VulkanPresenter final : public Presenter {
   // to FSR 1 EASU.
   bool DispatchTemporalUpscaler(VkCommandBuffer command_buffer, VulkanUpscaler& upscaler,
                                 VkImage source_image, VkImageView source_view,
-                                uint32_t source_width, uint32_t source_height,
-                                VkImage output_image, VkImageView output_view,
-                                uint32_t output_width, uint32_t output_height,
-                                uint64_t guest_output_refresh_serial,
+                                uint32_t source_width, uint32_t source_height, VkImage output_image,
+                                VkImageView output_view, uint32_t output_width,
+                                uint32_t output_height, uint64_t guest_output_refresh_serial,
                                 const GuestOutputImage* camera_source = nullptr,
                                 const UpscalerCamera* camera = nullptr);
 
@@ -701,6 +699,7 @@ class VulkanPresenter final : public Presenter {
   // Temporal upscaler providers (rex/ui/vulkan/upscaler.h) and the state of
   // the last temporal dispatch, used by painting only.
   std::vector<std::unique_ptr<VulkanUpscaler>> upscalers_;
+  std::unique_ptr<VulkanNeuralRendering> neural_rendering_;
   struct TemporalUpscaleState {
     VulkanUpscaler* upscaler = nullptr;
     VkImage output_image = VK_NULL_HANDLE;

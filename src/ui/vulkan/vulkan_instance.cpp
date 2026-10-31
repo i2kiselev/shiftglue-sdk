@@ -23,6 +23,7 @@
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/upscaler.h>
 #include <rex/ui/vulkan/presenter.h>
+#include <rex/ui/vulkan/vulkan_neural_rendering.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_validation_sync, false, "UI/Vulkan",
                     "Diagnostics: with vulkan_validation_enabled, also enable the validation "
@@ -97,7 +98,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   }
   if (!loader_loaded)
 #endif
-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
   if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;
@@ -197,6 +198,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   for (const char* name : GetVulkanUpscalerInstanceExtensions()) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  std::deque<bool> neural_rendering_extensions_enabled;
+  for (const char* name : GetVulkanNeuralRenderingInstanceExtensions()) {
+    neural_rendering_extensions_enabled.push_back(false);
+    requested_extensions.emplace(name, &neural_rendering_extensions_enabled.back());
   }
 
   std::vector<const char*> enabled_extensions;

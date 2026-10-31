@@ -67,6 +67,24 @@ if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
     )
 endif()
 
+if(REXGLUE_NR_BRIDGE_AVAILABLE AND TARGET bbport_nr)
+    install(TARGETS bbport_nr
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+install(FILES
+    ${REXGLUE_ROOT}/src/ui/vulkan/nr_bridge/LICENSE.txt
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/bbport-nr
+)
+if(REXGLUE_DLSS_RUNTIME_DIR AND
+   EXISTS "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt")
+    install(FILES
+        "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/bbport-nr
+        RENAME NVIDIA-DLSS-LICENSE.txt
+    )
+endif()
+
 # Install public headers
 install(DIRECTORY include/rex
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
@@ -175,6 +193,7 @@ install(FILES
 
 install(FILES
     ${CMAKE_SOURCE_DIR}/cmake/rexglue_helpers.cmake
+    ${CMAKE_SOURCE_DIR}/cmake/rexglue_nr.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rexglue
 )
 
