@@ -40,7 +40,8 @@ set(_rexglue_dlss_files
     "include/nvsdk_ngx_params.h|943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc"
     "include/nvsdk_ngx_vk.h|2d364ce7132881eb669e9498fd570d74cba563b1fbebc82c235f8e1ad2dd8b6d"
     "include/nvsdk_ngx_helpers_vk.h|c192bff72138f12f770db48e12c1d8f712dfc81ea0e8e055ebb27d8dd1b31623"
-    "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c")
+    "lib/Windows_x86_64/x64/nvsdk_ngx_d.lib|bc43df9ec032004fde681d3e3afd01cde239e03a0125b822e88674c84287f99c"
+    "lib/Windows_x86_64/x64/nvsdk_ngx_s.lib|7b9a5239c1145af5f645ab472aa066f9ea79db36ac819562312aae69d65f3765")
 set(_rexglue_dlss_runtime_files
     "lib/Windows_x86_64/rel/nvngx_dlss.dll|d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"
     "LICENSE.txt|d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0")
@@ -111,6 +112,8 @@ if(NOT _rexglue_dlss_ok)
 endif()
 set(REXGLUE_DLSS_INCLUDE_DIR "${_rexglue_dlss_dir}/include" CACHE INTERNAL "")
 set(REXGLUE_DLSS_LIBRARY "${_rexglue_dlss_dir}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+    CACHE INTERNAL "")
+set(REXGLUE_DLSS_STATIC_LIBRARY "${_rexglue_dlss_dir}/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
     CACHE INTERNAL "")
 
 # The runtime is staged beside the game; without it DLSS is listed as

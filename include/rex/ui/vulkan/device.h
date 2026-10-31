@@ -100,6 +100,7 @@ class VulkanDevice {
 
     bool robustBufferAccess = false;
     bool timelineSemaphore = false;
+    VkBool32 bufferDeviceAddress = VK_FALSE;
     bool fullDrawIndexUint32 = false;
     bool independentBlend = false;
     bool geometryShader = false;
@@ -306,8 +307,8 @@ class VulkanDevice {
   // failure and treated unfinished submissions as done.
   VkResult WaitForFences(uint32_t fence_count, const VkFence* fences, VkBool32 wait_all) const {
     for (;;) {
-      const VkResult result = functions_.vkWaitForFences(device_, fence_count, fences, wait_all,
-                                                         UINT64_C(1000000000));
+      const VkResult result =
+          functions_.vkWaitForFences(device_, fence_count, fences, wait_all, UINT64_C(1000000000));
       if (result != VK_TIMEOUT) {
         return result;
       }

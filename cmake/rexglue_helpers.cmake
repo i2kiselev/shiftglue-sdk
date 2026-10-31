@@ -37,6 +37,46 @@ function(_rexglue_stage_dlss_runtime target_name)
     endif()
 endfunction()
 
+# The Neural Rendering bridge adapted from MIT source and, when the application
+# provides one, the user-installed NVIDIA model runtime. Keeping them together
+# in upscalers/dlss-nr also lets the bridge find the model beside its own module.
+function(_rexglue_stage_nr_bridge target_name)
+    set(_bridge "")
+    set(_depends "")
+    if(TARGET bbport_nr)
+        set(_bridge "$<TARGET_FILE:bbport_nr>")
+        list(APPEND _depends bbport_nr)
+    elseif(REXGLUE_NR_BRIDGE_DLL AND EXISTS "${REXGLUE_NR_BRIDGE_DLL}")
+        set(_bridge "${REXGLUE_NR_BRIDGE_DLL}")
+    endif()
+    if(NOT _bridge)
+        return()
+    endif()
+
+    set(_files ${_bridge})
+    set(_dependencies ${_depends})
+    if(REXGLUE_NR_BRIDGE_LICENSE AND EXISTS "${REXGLUE_NR_BRIDGE_LICENSE}")
+        list(APPEND _files "${REXGLUE_NR_BRIDGE_LICENSE}")
+    endif()
+    if(REXGLUE_NR_NVIDIA_LICENSE AND EXISTS "${REXGLUE_NR_NVIDIA_LICENSE}")
+        list(APPEND _files "${REXGLUE_NR_NVIDIA_LICENSE}")
+    endif()
+    if(REXGLUE_NR_RUNTIME_DLL)
+        if(NOT EXISTS "${REXGLUE_NR_RUNTIME_DLL}")
+            message(WARNING
+                "REXGLUE_NR_RUNTIME_DLL does not exist: ${REXGLUE_NR_RUNTIME_DLL}")
+        else()
+            list(APPEND _files "${REXGLUE_NR_RUNTIME_DLL}")
+        endif()
+    endif()
+
+    _rexglue_stage_upscaler_files(${target_name} "dlss-nr" ${_files})
+    if(_dependencies)
+        string(MAKE_C_IDENTIFIER "dlss-nr" _stage_name)
+        add_dependencies(${target_name}-stage-${_stage_name} ${_dependencies})
+    endif()
+endfunction()
+
 # The FidelityFX library the FSR provider loads, staged in
 # upscalers/fidelityfx/<version>/ beside the executable: on Windows AMD's
 # signed runtime (cmake/rexglue_ffx_api_headers.cmake), on Linux and macOS
@@ -331,6 +371,7 @@ function(rexglue_configure_target target_name)
     endif()
     _rexglue_stage_fidelityfx_runtime(${target_name})
     _rexglue_stage_dlss_runtime(${target_name})
+    _rexglue_stage_nr_bridge(${target_name})
 endfunction()
 
 #==========================================================

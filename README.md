@@ -18,6 +18,14 @@
 
 ReXGlue converts Xbox 360 PowerPC code into portable C++ that runs natively on modern platforms.
 
+## NVIDIA Neural Rendering
+
+64-bit Windows Vulkan builds can optionally build the runtime-loaded DLSS
+Neural Rendering bridge. It is disabled at runtime by default and requires a
+user-supplied `nvngx_dlssnr.dll`; no NVIDIA model or runtime is redistributed.
+See [docs/NEURAL_RENDERING.md](docs/NEURAL_RENDERING.md) for build options,
+CVars, staging paths, and fallback behavior.
+
 ReXGlue is heavily rooted on the foundations of [Xenia](https://github.com/xenia-project), the Xbox 360 emulator. Rather than interpreting or JIT-compiling PPC instructions at runtime, ReXGlue takes a different path: it generates C++ source code ahead of time, an approach inspired by [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and [rexdex's recompiler](https://github.com/rexdex/recompiler).
 
 Latest SDK builds and releases are published on [GitHub Releases](https://github.com/rexglue/rexglue-sdk/releases). Join the [Discord server](https://discord.gg/CNTxwSNZfT) for updates and share what you have created.

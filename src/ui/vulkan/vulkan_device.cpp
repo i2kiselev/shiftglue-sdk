@@ -27,6 +27,7 @@
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/upscaler.h>
+#include <rex/ui/vulkan/vulkan_neural_rendering.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
@@ -51,21 +52,23 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
 // without it and vertex shader memory export is skipped (pixel shader memory
 // export still works), logged once per shader. Skipping drops guest memory
 // writes, so results may differ from parity even when the title runs.
-REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
-                    "Require vertexPipelineStoresAndAtomics for Vulkan GPU emulation (experimental: "
-                    "false allows devices without it, skipping vertex shader memory export and "
-                    "its guest memory writes)")
+REXCVAR_DEFINE_BOOL(
+    vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
+    "Require vertexPipelineStoresAndAtomics for Vulkan GPU emulation (experimental: "
+    "false allows devices without it, skipping vertex shader memory export and "
+    "its guest memory writes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid,
 // and many mobile drivers (Mali, older Adreno, the emulator over MoltenVK)
 // lack one or both; default both to false there so the device can still be
 // selected and the vertex-shader expansion paths are used.
-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID,
+                    "UI/Vulkan",
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid,
-                    !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID,
+                    "UI/Vulkan",
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -124,7 +127,7 @@ void LogCapabilityReport(const VulkanInstance* vulkan_instance, VkPhysicalDevice
   add("driver_version", fmt::format("{}", properties.driverVersion));
 
   std::string feature_list = "{";
-#define REX_REPORT_FEATURE(name) \
+#define REX_REPORT_FEATURE(name)                                                        \
   feature_list += fmt::format("{}\"" #name "\":{}", feature_list.size() > 1 ? "," : "", \
                               features.name ? "true" : "false");
   REX_REPORT_FEATURE(independentBlend)
@@ -184,11 +187,9 @@ void LogCapabilityReport(const VulkanInstance* vulkan_instance, VkPhysicalDevice
   ifn.vkGetPhysicalDeviceMemoryProperties(physical_device, &memory);
   std::string heap_list = "[";
   for (uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
-    heap_list += fmt::format("{}{{\"bytes\":{},\"device_local\":{}}}", i ? "," : "",
-                             memory.memoryHeaps[i].size,
-                             (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                                 ? "true"
-                                 : "false");
+    heap_list += fmt::format(
+        "{}{{\"bytes\":{},\"device_local\":{}}}", i ? "," : "", memory.memoryHeaps[i].size,
+        (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? "true" : "false");
   }
   add("memory_heaps", heap_list + "]");
 
@@ -235,14 +236,13 @@ void LogCapabilityReport(const VulkanInstance* vulkan_instance, VkPhysicalDevice
   };
   constexpr VkFormatFeatureFlags kDepth =
       VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
-  constexpr VkFormatFeatureFlags kGuestOutput =
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+  constexpr VkFormatFeatureFlags kGuestOutput = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
   std::string missing_list = "[";
   const auto missing = [&](const char* what, const char* instead) {
     missing_list += fmt::format("{}{{\"what\":{},\"instead\":{}}}",
-                                missing_list.size() > 1 ? "," : "", quoted(what),
-                                quoted(instead));
+                                missing_list.size() > 1 ? "," : "", quoted(what), quoted(instead));
   };
   const bool depth24 = (format_features(VK_FORMAT_D24_UNORM_S8_UINT) & kDepth) == kDepth;
   const bool depth32 = (format_features(VK_FORMAT_D32_SFLOAT_S8_UINT) & kDepth) == kDepth;
@@ -256,7 +256,8 @@ void LogCapabilityReport(const VulkanInstance* vulkan_instance, VkPhysicalDevice
             "nothing: the guest output image cannot be created, unsupported");
   }
   if (!features.textureCompressionBC) {
-    missing("textureCompressionBC", "BC textures decoded to RGBA8 on the GPU, 4 to 8 times the memory");
+    missing("textureCompressionBC",
+            "BC textures decoded to RGBA8 on the GPU, 4 to 8 times the memory");
   }
   if (!features.geometryShader) {
     missing("geometryShader", "rectangle and point lists expanded in the vertex shader");
@@ -386,8 +387,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // Enable needed extensions.
 
   std::unique_ptr<VulkanDevice> device(new VulkanDevice(vulkan_instance, physical_device));
-  device->object_names_enabled_ = vulkan_instance->extensions().ext_EXT_debug_utils &&
-                                  REXCVAR_GET(vulkan_debug_object_names);
+  device->object_names_enabled_ =
+      vulkan_instance->extensions().ext_EXT_debug_utils && REXCVAR_GET(vulkan_debug_object_names);
 
   const bool get_physical_device_properties2_supported =
       vulkan_instance->extensions().ext_1_1_KHR_get_physical_device_properties2;
@@ -526,10 +527,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   // supported.
   std::deque<bool> upscaler_extensions_enabled;
   for (const char* name : GetVulkanUpscalerDeviceExtensions(vulkan_instance->instance(),
-                                                            physical_device,
-                                                            properties.vendorID)) {
+                                                            physical_device, properties.vendorID)) {
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
+  }
+  // Neural Rendering's NGX feature needs binary import and image-view-handle
+  // extensions on NVIDIA devices. Share a duplicate bufferDeviceAddress request
+  // with the upscaler provider when both ask for it.
+  std::deque<bool> neural_rendering_extensions_enabled;
+  bool* neural_rendering_buffer_device_address = nullptr;
+  for (const char* name : GetVulkanNeuralRenderingDeviceExtensions(
+           vulkan_instance->instance(), physical_device, properties.vendorID)) {
+    neural_rendering_extensions_enabled.push_back(false);
+    const auto existing = requested_extensions.find(name);
+    bool* enabled = existing != requested_extensions.end()
+                        ? existing->second
+                        : &neural_rendering_extensions_enabled.back();
+    requested_extensions.emplace(name, enabled);
+    if (std::string_view(name) == "VK_KHR_buffer_device_address") {
+      neural_rendering_buffer_device_address = enabled;
+    }
   }
 
   std::vector<const char*> enabled_extensions;
@@ -603,7 +620,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
   VkPhysicalDeviceSubgroupProperties properties_1_1_subgroup = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
-  VkPhysicalDeviceIDProperties properties_1_1_id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+  VkPhysicalDeviceIDProperties properties_1_1_id = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
   VulkanFeatures<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
@@ -636,6 +654,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
       features_KHR_fragment_shading_rate;
+  VulkanFeatures<VkPhysicalDeviceBufferDeviceAddressFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR>
+      features_KHR_buffer_device_address;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -701,6 +722,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
       features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
+    }
+    if (properties.apiVersion < VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+        neural_rendering_buffer_device_address && *neural_rendering_buffer_device_address) {
+      features_KHR_buffer_device_address.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -980,6 +1005,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+    if (VulkanNeuralRenderingRequiresBufferDeviceAddress()) {
+      XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
+    }
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
@@ -1003,6 +1031,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, timelineSemaphore);
     }
   } else {
+    if (neural_rendering_buffer_device_address && *neural_rendering_buffer_device_address) {
+      XE_UI_VULKAN_FEATURE_2(features_KHR_buffer_device_address, bufferDeviceAddress);
+    }
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
     }

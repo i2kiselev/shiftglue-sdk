@@ -41,6 +41,7 @@ set(REXUI_VULKAN_SOURCES
     vulkan/spirv_tools_context.cpp
     vulkan/ui_samplers.cpp
     vulkan/vulkan_dlss_upscaler.cpp
+    vulkan/vulkan_neural_rendering.cpp
     vulkan/vulkan_ffx_upscaler.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
