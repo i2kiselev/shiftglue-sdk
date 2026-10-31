@@ -33,6 +33,7 @@ function(_rexglue_stage_dlss_runtime target_name)
     if(REXGLUE_DLSS_RUNTIME_DIR AND REXGLUE_DLSS_INCLUDE_DIR)
         _rexglue_stage_upscaler_files(${target_name} "dlss/${REXGLUE_DLSS_VERSION}"
             "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlss.dll"
+            "${REXGLUE_DLSS_RUNTIME_DIR}/nvngx_dlssg.dll"
             "${REXGLUE_DLSS_RUNTIME_DIR}/LICENSE.txt")
     endif()
 endfunction()
@@ -331,6 +332,9 @@ function(rexglue_configure_target target_name)
     endif()
     _rexglue_stage_fidelityfx_runtime(${target_name})
     _rexglue_stage_dlss_runtime(${target_name})
+    if(COMMAND fm4_stage_rendering_notices)
+        fm4_stage_rendering_notices(${target_name})
+    endif()
 endfunction()
 
 #==========================================================

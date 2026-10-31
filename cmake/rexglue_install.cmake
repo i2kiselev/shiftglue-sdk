@@ -43,6 +43,18 @@ endif()
 if(TARGET amd_fidelityfx_dx12)
     list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS amd_fidelityfx_dx12)
 endif()
+if(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6)
+    list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS
+        ffx_vulkan_portable
+        ffx_vulkan_fsr3_vk_framegeneration_3_1_6)
+    install(DIRECTORY thirdparty/fm4-fsr-vulkan/include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+    # The renderer loads Vulkan dynamically. Match its source build in a
+    # prebuilt SDK without requiring a separately installed Vulkan SDK.
+    install(FILES "${REXGLUE_FSR_VULKAN_IMPORT_LIBRARY}"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 install(TARGETS ${REXGLUE_INSTALL_TARGETS}
     EXPORT rexglueTargets

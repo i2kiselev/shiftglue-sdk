@@ -423,6 +423,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_EXTENSION(KHR_portability_subset)
     // #197
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_driver_properties, 1, 2)
+#if defined(REX_HAS_FSR_FRAMEGENERATION) && REX_HAS_FSR_FRAMEGENERATION
+    // Needed by the FSR 3.1.6 optical-flow and frame-interpolation shaders.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_compute_shader_derivatives)
+#endif
   }
 
   // Used by the Vulkan Memory Allocator and potentially by Xenia.
@@ -460,6 +464,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_id)
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_present_wait)
     }
+    XE_UI_VULKAN_STRUCT_EXTENSION(NV_low_latency2)
     // #106, for HDR10 output (present_hdr).
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_hdr_metadata)
   }
@@ -531,7 +536,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     upscaler_extensions_enabled.push_back(false);
     requested_extensions.emplace(name, &upscaler_extensions_enabled.back());
   }
-
   std::vector<const char*> enabled_extensions;
   {
     uint32_t supported_extension_count = 0;
@@ -636,6 +640,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
       features_KHR_fragment_shading_rate;
+#if defined(REX_HAS_FSR_FRAMEGENERATION) && REX_HAS_FSR_FRAMEGENERATION
+  VulkanFeatures<VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR>
+      features_KHR_compute_shader_derivatives;
+#endif
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -702,6 +711,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
       features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
     }
+#if defined(REX_HAS_FSR_FRAMEGENERATION) && REX_HAS_FSR_FRAMEGENERATION
+    if (device->extensions_.ext_KHR_compute_shader_derivatives) {
+      features_KHR_compute_shader_derivatives.Link(supported_features_2, device_create_info);
+    }
+#endif
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
   }
@@ -978,6 +992,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
     XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
   }
+#if defined(REX_HAS_FSR_FRAMEGENERATION) && REX_HAS_FSR_FRAMEGENERATION
+  XE_UI_VULKAN_FEATURE(shaderStorageImageReadWithoutFormat)
+  XE_UI_VULKAN_FEATURE(shaderStorageImageWriteWithoutFormat)
+#endif
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation) {
@@ -1099,6 +1117,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
   }
+#if defined(REX_HAS_FSR_FRAMEGENERATION) && REX_HAS_FSR_FRAMEGENERATION
+  if (device->extensions_.ext_KHR_compute_shader_derivatives) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupQuads)
+    XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupLinear)
+  }
+#endif
 
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT

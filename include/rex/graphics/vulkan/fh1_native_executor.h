@@ -24,6 +24,7 @@
 #include <rex/graphics/fh1_edram_tiles.h>
 #include <rex/graphics/fh1_executor_counters.h>
 #include <rex/graphics/fh1_frame_inspector.h>
+#include <rex/graphics/fm4_frame_generation_camera.h>
 #include <rex/graphics/fm4_resolve_readbacks.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/registers.h>
@@ -164,6 +165,10 @@ class Fh1NativeExecutor {
     float far_plane;
     // Vertical field of view, radians.
     float fov_y;
+    // Camera-space transform for frame generation, valid only when the c128
+    // matrix was a recognisable projective camera rather than a world transform.
+    bool frame_generation_matrices_valid;
+    Fm4FrameGenerationCamera frame_generation;
     // No continuation of the previous frame (a cut, a load, a rebase): the
     // reprojection is the identity and the upscaler's history should go.
     bool cut;

@@ -5,6 +5,7 @@
 #include <limits>
 
 #include <rex/graphics/fm4_camera_cut.h>
+#include <rex/graphics/fm4_frame_generation_camera.h>
 
 using namespace rex::graphics;
 using Catch::Matchers::WithinAbs;
@@ -133,6 +134,128 @@ TEST_CASE("an object's matrix registers are the columns of its world-view-projec
   }
   // The origin: clip w is the car's distance.
   CHECK_THAT(rows[15], WithinAbs(33.3736, 1.0e-4));
+}
+
+TEST_CASE("frame-generation camera factors P times a translated rotated view",
+          "[graphics][camera]") {
+  constexpr double kPi = 3.14159265358979323846;
+  const double fov_y = 60.0 * kPi / 180.0;
+  const double near_plane = 0.1;
+  const double far_plane = 7500.0;
+  const std::array<double, 3> expected_position = {3.0, -2.0, 17.0};
+
+  const double yaw = 37.0 * kPi / 180.0;
+  const double pitch = 12.0 * kPi / 180.0;
+  const std::array<double, 3> forward = {std::cos(pitch) * std::sin(yaw), std::sin(pitch),
+                                         std::cos(pitch) * std::cos(yaw)};
+  const auto cross = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
+    return std::array<double, 3>{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+                                 a[0] * b[1] - a[1] * b[0]};
+  };
+  const auto dot = [](const std::array<double, 3>& a, const std::array<double, 3>& b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  };
+  const auto normalized = [](const std::array<double, 3>& value) {
+    const double length =
+        std::sqrt(value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+    return std::array<double, 3>{value[0] / length, value[1] / length, value[2] / length};
+  };
+  const std::array<double, 3> right = normalized(cross({0.0, 1.0, 0.0}, forward));
+  const std::array<double, 3> up = normalized(cross(forward, right));
+  const Matrix view = {
+      right[0],   right[1],   right[2],   -dot(right, expected_position),
+      up[0],      up[1],      up[2],      -dot(up, expected_position),
+      forward[0], forward[1], forward[2], -dot(forward, expected_position),
+      0.0,        0.0,        0.0,        1.0,
+  };
+
+  const double scale = 1.0 / std::tan(fov_y / 2.0);
+  const double depth_scale = far_plane / (far_plane - near_plane);
+  const double depth_bias = -near_plane * far_plane / (far_plane - near_plane);
+  for (const double projection_y_sign : {1.0, -1.0}) {
+    CAPTURE(projection_y_sign);
+    for (const double aspect : {16.0 / 9.0, 9.0 / 16.0}) {
+      CAPTURE(aspect);
+      const Matrix expected_projection = {
+          scale / aspect,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          projection_y_sign * scale,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          depth_scale,
+          depth_bias,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+      };
+      const Matrix world_view_projection = Multiply(expected_projection, view);
+      std::array<float, 16> world_view_projection_f32;
+      for (size_t i = 0; i < world_view_projection.size(); ++i) {
+        world_view_projection_f32[i] = float(world_view_projection[i]);
+      }
+
+      const auto camera = Fm4FactorFrameGenerationCamera(world_view_projection_f32, float(fov_y),
+                                                         float(near_plane), float(far_plane));
+      REQUIRE(camera);
+
+      Matrix view_to_clip;
+      Matrix clip_to_view;
+      for (size_t i = 0; i < 16; ++i) {
+        view_to_clip[i] = camera->view_to_clip[i];
+        clip_to_view[i] = camera->clip_to_view[i];
+        CHECK_THAT(camera->view_to_clip[i], WithinAbs(expected_projection[i], 2.0e-5));
+      }
+      const Matrix identity = Multiply(view_to_clip, clip_to_view);
+      for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+          CHECK_THAT(identity[r * 4 + c], WithinAbs(r == c ? 1.0 : 0.0, 2.0e-5));
+        }
+      }
+
+      for (size_t i = 0; i < 3; ++i) {
+        CHECK_THAT(camera->position[i], WithinAbs(expected_position[i], 2.0e-4));
+        CHECK_THAT(camera->right[i], WithinAbs(right[i], 2.0e-5));
+        CHECK_THAT(camera->up[i], WithinAbs(up[i], 2.0e-5));
+        CHECK_THAT(camera->forward[i], WithinAbs(forward[i], 2.0e-5));
+      }
+      const auto basis_length = [](const std::array<float, 3>& basis) {
+        return std::sqrt(basis[0] * basis[0] + basis[1] * basis[1] + basis[2] * basis[2]);
+      };
+      CHECK_THAT(basis_length(camera->right), WithinAbs(1.0, 2.0e-6));
+      CHECK_THAT(basis_length(camera->up), WithinAbs(1.0, 2.0e-6));
+      CHECK_THAT(basis_length(camera->forward), WithinAbs(1.0, 2.0e-6));
+    }
+  }
+}
+
+TEST_CASE("frame-generation camera rejects a non-projective c128 transform", "[graphics][camera]") {
+  std::array<float, 16> identity{};
+  for (int i = 0; i < 4; ++i)
+    identity[i * 4 + i] = 1.0f;
+  CHECK_FALSE(Fm4FactorFrameGenerationCamera(identity, 1.0472f, 0.1f, 1000.0f));
+
+  const std::array<float, 16> world_transform = {1.5f, 0.0f, 0.0f, 10.0f, 0.0f, -2.0f, 0.0f, 20.0f,
+                                                 0.0f, 0.0f, 1.0f, 30.0f, 0.0f, 0.0f,  0.0f, 1.0f};
+  CHECK_FALSE(Fm4FactorFrameGenerationCamera(world_transform, 0.9272952f, 0.3f, 0.0f));
+}
+
+TEST_CASE("frame-generation camera preserves the observed turned c128 signs", "[graphics][camera]") {
+  const std::array<float, 16> camera_registers = {
+      1.5f, 0.0f, 0.0f, 0.0f, 0.0f, -2.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 1.0f, -0.3f, 0.0f, 0.0f, 1.0f, 0.0f};
+  const auto camera = Fm4FactorFrameGenerationCamera(camera_registers, 0.9272952f, 0.3f, 0.0f);
+  REQUIRE(camera);
+  CHECK_THAT(camera->view_to_clip[0], WithinAbs(1.5f, 1.0e-6));
+  CHECK_THAT(camera->view_to_clip[5], WithinAbs(-2.0f, 1.0e-6));
+  CHECK_THAT(camera->position[0], WithinAbs(0.0f, 1.0e-6));
+  CHECK_THAT(camera->position[1], WithinAbs(0.0f, 1.0e-6));
+  CHECK_THAT(camera->position[2], WithinAbs(0.0f, 1.0e-6));
 }
 
 TEST_CASE("a race draws the scene turned 180 degrees, the showroom upright",

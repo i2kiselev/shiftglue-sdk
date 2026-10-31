@@ -121,6 +121,13 @@ void InputSystem::SetKeyboardStateFilter(
   keyboard_state_filter_ = std::move(filter);
 }
 
+void InputSystem::SetGuestStateReadCallbacks(std::function<void()> before,
+                                             std::function<void()> after) {
+  std::lock_guard<std::mutex> lock(devices_mutex_);
+  guest_state_read_before_ = std::move(before);
+  guest_state_read_after_ = std::move(after);
+}
+
 void InputSystem::RefreshDevices() {
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
@@ -303,8 +310,21 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                       [&] { return GetKeystrokeImpl(user_index, flags, out_keystroke); });
 }
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  std::function<void()> before;
+  std::function<void()> after;
+  {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    before = guest_state_read_before_;
+    after = guest_state_read_after_;
+  }
   return SessionInput(session_probe::Kind::kInputResult, session_probe::Kind::kInputState,
-                      user_index, out_state, [&] { return GetMergedState(user_index, false, out_state); });
+                      user_index, out_state, [&] {
+                        if (before) before();
+                        const X_RESULT result =
+                            GetMergedState(user_index, false, out_state);
+                        if (after) after();
+                        return result;
+                      });
 }
 
 X_RESULT InputSystem::GetHostPadState(uint32_t user_index, X_INPUT_STATE* out_state) {

@@ -86,6 +86,18 @@ struct UpscalerCamera {
   // The frame's sub-pixel jitter in render pixels, as UpscalerFrame.
   float jitter_x = 0.0f;
   float jitter_y = 0.0f;
+  // Frame generation needs the clip-space transforms, not just the lens.
+  // Matrices are row-major. view_to_clip is the current projection, clip_to_view
+  // is its inverse, and clip_to_previous maps current clip space to the previous.
+  bool frame_generation_matrices_valid = false;
+  float view_to_clip[16] = {};
+  float clip_to_view[16] = {};
+  float clip_to_previous[16] = {};
+  float previous_to_clip[16] = {};
+  float position[3] = {};
+  float right[3] = {};
+  float up[3] = {};
+  float forward[3] = {};
 };
 
 struct UpscalerFrame {

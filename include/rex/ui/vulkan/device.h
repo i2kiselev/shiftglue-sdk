@@ -122,6 +122,8 @@ class VulkanDevice {
     bool fragmentStoresAndAtomics = false;
     bool shaderClipDistance = false;
     bool shaderCullDistance = false;
+    bool shaderStorageImageReadWithoutFormat = false;
+    bool shaderStorageImageWriteWithoutFormat = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
 
@@ -136,6 +138,11 @@ class VulkanDevice {
     // VK_EXT_scalar_block_layout (#222, promoted to 1.2)
 
     bool scalarBlockLayout = false;
+
+    // VK_KHR_compute_shader_derivatives
+
+    bool computeDerivativeGroupQuads = false;
+    bool computeDerivativeGroupLinear = false;
 
     // VK_KHR_portability_subset (#164)
 
@@ -236,6 +243,8 @@ class VulkanDevice {
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
     // Has optional features not implied by this being true.
+    bool ext_KHR_compute_shader_derivatives = false;
+    // Has optional features not implied by this being true.
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
     bool ext_EXT_robustness2 = false;
@@ -251,6 +260,8 @@ class VulkanDevice {
     // Have optional features not implied by these being true.
     bool ext_KHR_present_id = false;    // #295
     bool ext_KHR_present_wait = false;  // #249
+    // NVIDIA Reflex frame attribution and latency pacing.
+    bool ext_NV_low_latency2 = false;
     // The mastering levels of an HDR10 swapchain.
     bool ext_EXT_hdr_metadata = false;  // #106
     // Only with vulkan_pipeline_statistics.
