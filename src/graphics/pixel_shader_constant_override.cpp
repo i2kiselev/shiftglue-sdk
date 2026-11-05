@@ -12,20 +12,58 @@
 #include <bit>
 #include <charconv>
 
+#if defined(__APPLE__)
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <xlocale.h>
+#endif
+
 namespace rex::graphics {
 
 namespace {
 
 template <typename T>
 bool ParseWhole(std::string_view text, T& value, int base = 10) {
-  const char* end = text.data() + text.size();
-  std::from_chars_result result;
-  if constexpr (std::is_floating_point_v<T>) {
-    result = std::from_chars(text.data(), end, value);
-  } else {
-    result = std::from_chars(text.data(), end, value, base);
+  if (text.empty()) {
+    return false;
   }
-  return !text.empty() && result.ec == std::errc() && result.ptr == end;
+  if constexpr (std::is_floating_point_v<T>) {
+#if defined(__APPLE__)
+    // Older deployment targets lack floating-point from_chars. Keep its
+    // locale-independent grammar and out-of-range rejection in the fallback.
+    if (text.front() == '+' || std::isspace(static_cast<unsigned char>(text.front()))) {
+      return false;
+    }
+    const auto unsigned_text = text.front() == '-' ? text.substr(1) : text;
+    if (unsigned_text.starts_with("0x") || unsigned_text.starts_with("0X")) {
+      return false;
+    }
+    static const locale_t c_locale = newlocale(LC_NUMERIC_MASK, "C", nullptr);
+    if (!c_locale) {
+      return false;
+    }
+    char* parse_end = nullptr;
+    const std::string s(text);
+    const int saved_errno = errno;
+    errno = 0;
+    const float parsed = strtof_l(s.c_str(), &parse_end, c_locale);
+    const bool valid = errno != ERANGE && parse_end == s.c_str() + s.size();
+    errno = saved_errno;
+    if (valid) {
+      value = parsed;
+    }
+    return valid;
+#else
+    const char* end = text.data() + text.size();
+    std::from_chars_result result = std::from_chars(text.data(), end, value);
+    return result.ec == std::errc() && result.ptr == end;
+#endif
+  } else {
+    const char* end = text.data() + text.size();
+    std::from_chars_result result = std::from_chars(text.data(), end, value, base);
+    return result.ec == std::errc() && result.ptr == end;
+  }
 }
 
 std::optional<PixelShaderConstantOverride> ParseEntry(std::string_view entry) {

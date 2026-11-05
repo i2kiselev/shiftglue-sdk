@@ -20,6 +20,7 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/logging.h>
 #include <rex/thread/sync_census.h>
 
 REXCVAR_DEFINE_BOOL(fh1_narrow_cpu_invalidation, false, "GPU/D3D12",
@@ -122,8 +123,52 @@ void SharedMemory::ShutdownCommon() {
   num_system_page_flags_ = 0;
 }
 
+bool SharedMemory::CheckUnprotectedGpuPages(bool consume) {
+  if (!unprotected_gpu_pages_pending_.load(std::memory_order_acquire) &&
+      !unprotected_gpu_pages_changed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
+  bool changed = false;
+  if (unprotected_gpu_pages_pending_.load(std::memory_order_relaxed)) {
+    for (auto it = unprotected_gpu_pages_.begin(); it != unprotected_gpu_pages_.end();) {
+      const uint32_t page = it->first;
+      const uint64_t bit = uint64_t(1) << (page & 63);
+      const bool gpu_valid = (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) != 0;
+      if (gpu_valid && std::memcmp(it->second.data(),
+                                  memory().TranslatePhysical(page << page_size_log2_),
+                                  it->second.size()) == 0) {
+        ++it;
+        continue;
+      }
+      if (gpu_valid) {
+        system_page_flags_valid_[page >> 6] &= ~bit;
+        system_page_flags_valid_and_gpu_written_[page >> 6] &= ~bit;
+        FireWatches(page, page, false);
+        changed = true;
+      }
+      it = unprotected_gpu_pages_.erase(it);
+    }
+    unprotected_gpu_pages_pending_.store(!unprotected_gpu_pages_.empty(), std::memory_order_release);
+    if (changed) {
+      unprotected_gpu_pages_changed_.store(true, std::memory_order_release);
+      static std::atomic<bool> reported{false};
+      if (!reported.exchange(true, std::memory_order_relaxed)) {
+        REXGPU_INFO("GPU memory: detected changed CPU bytes in preserved, unprotected guest pages");
+      }
+    }
+  }
+  if (!consume) {
+    return changed || unprotected_gpu_pages_changed_.load(std::memory_order_relaxed);
+  }
+  return unprotected_gpu_pages_changed_.exchange(false, std::memory_order_acq_rel);
+}
+
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
+  unprotected_gpu_pages_.clear();
+  unprotected_gpu_pages_pending_.store(false, std::memory_order_release);
+  unprotected_gpu_pages_changed_.store(false, std::memory_order_release);
 
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
@@ -391,6 +436,15 @@ void SharedMemory::CopyReadbackToGuest(uint32_t start, const uint8_t* source, ui
     if (valid) {
       if (uint8_t* destination = memory().TranslatePhysical(address)) {
         std::memcpy(destination, source + offset, chunk);
+        // This is a GPU readback, not a guest CPU store. Update only these
+        // bytes of a preserved page's CPU baseline, leaving any unrelated
+        // hidden stores detectable.
+        auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
+        auto snapshot = unprotected_gpu_pages_.find(page);
+        if (snapshot != unprotected_gpu_pages_.end()) {
+          std::memcpy(snapshot->second.data() + (address & (page_size - 1)),
+                      source + offset, chunk);
+        }
       }
     }
     offset += chunk;
@@ -433,6 +487,24 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
 
   {
     auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
+
+    if (unprotected_gpu_pages_pending_.load(std::memory_order_relaxed)) {
+      for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
+        auto snapshot = unprotected_gpu_pages_.find(page);
+        if (snapshot == unprotected_gpu_pages_.end()) continue;
+        if (written_by_gpu) {
+          // A new GPU result supersedes the old one. Keep monitoring the CPU
+          // bytes through protection rearming, starting from their new baseline.
+          std::memcpy(snapshot->second.data(),
+                      memory().TranslatePhysical(page << page_size_log2_),
+                      snapshot->second.size());
+        } else {
+          unprotected_gpu_pages_.erase(snapshot);
+        }
+      }
+      unprotected_gpu_pages_pending_.store(!unprotected_gpu_pages_.empty(),
+                                            std::memory_order_release);
+    }
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -518,6 +590,7 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 }
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  CheckUnprotectedGpuPages(false);
   if (ranges == nullptr || !count) {
     return true;
   }
@@ -796,6 +869,21 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       uint64_t keep_bits = system_page_flags_valid_and_gpu_written_[i] &
                            PageBlockMask(i, keep_page_first, keep_page_last) &
                            ~PageBlockMask(i, exact_page_first, exact_page_last);
+      // Snapshot before the faulting store resumes. It may be part of a
+      // memcpy that subsequently overwrites the other guest pages while the
+      // entire host page is writable, without another protection fault.
+      for (uint64_t remaining = keep_bits; remaining; remaining &= remaining - 1) {
+        uint32_t bit;
+        rex::bit_scan_forward(remaining, &bit);
+        const uint32_t page = (i << 6) + bit;
+        auto [snapshot, inserted] = unprotected_gpu_pages_.try_emplace(page);
+        if (inserted) {
+          std::memcpy(snapshot->second.data(),
+                      memory().TranslatePhysical(page << page_size_log2_),
+                      snapshot->second.size());
+        }
+      }
+      if (keep_bits) unprotected_gpu_pages_pending_.store(true, std::memory_order_release);
       invalidate_bits &= ~keep_bits;
       any_kept |= keep_bits != 0;
     }

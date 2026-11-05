@@ -6220,6 +6220,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const bool program_timed = draw_cost_.enabled && draw_program_;
   const auto program_start =
       program_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+  // Texture request memos and vertex residency bits must observe CPU writes
+  // hidden by a larger host page before deciding that a binding is unchanged.
+  if (shared_memory_->CheckUnprotectedGpuPages()) {
+    InvalidateAllVertexBufferResidency();
+  }
   const bool issued =
       IssueDrawImpl(prim_type, index_count, index_buffer_info, major_mode_explicit);
   if (draw_cost_.enabled) {

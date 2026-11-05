@@ -92,7 +92,8 @@ TEST_CASE("Stamping an identical manifest SDK version preserves its timestamp", 
   fs::last_write_time(manifest, sentinel);
 
   REQUIRE(ManifestConfig::WriteSdkVersionStamp(manifest, "0.10.0"));
-  CHECK(fs::last_write_time(manifest) == sentinel);
+  // Apple file clocks may use __int128, which Catch2 cannot stringify.
+  CHECK((fs::last_write_time(manifest) == sentinel));
 }
 
 TEST_CASE("Changed codegen flag changes the fingerprint", "[output_stamp]") {

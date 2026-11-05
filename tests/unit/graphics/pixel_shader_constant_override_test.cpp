@@ -91,3 +91,16 @@ TEST_CASE("A masked constant override keeps the other components", "[ps_constant
                                              std::bit_cast<uint32_t>(0.25f),
                                              std::bit_cast<uint32_t>(0.125f)});
 }
+
+TEST_CASE("Constant override float parsing rejects partial and out-of-range values",
+          "[ps_constant_override]") {
+  for (const auto value : {"", "+1", " 1", "1 ", "1oops", "0x1p0", "-0x1p0",
+                           "1e100", "1e-100"}) {
+    INFO(value);
+    CHECK_FALSE(ParsePixelShaderConstantOverrides(std::string("B85EF04779ABD438:c57.y=") + value));
+  }
+  const auto parsed = ParsePixelShaderConstantOverrides("B85EF04779ABD438:c57.y=-1.25e-2");
+  REQUIRE(parsed);
+  REQUIRE(parsed->size() == 1);
+  CHECK(parsed->front().value[1] == -0.0125f);
+}

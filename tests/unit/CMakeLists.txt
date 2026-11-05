@@ -46,6 +46,7 @@ add_executable(unit_tests
     graphics/pixel_shader_constant_override_test.cpp
     graphics/wrap_seam_test.cpp
     graphics/texture_cache_test.cpp
+    graphics/shared_memory_subpage_test.cpp
     graphics/fh1_edram_resolve_test.cpp
     graphics/fm4_resolve_plan_test.cpp
     graphics/fm4_scaled_resolve_test.cpp

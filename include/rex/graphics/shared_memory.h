@@ -11,6 +11,8 @@
  */
 
 #include <atomic>
+#include <array>
+#include <unordered_map>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -36,6 +38,10 @@ class SharedMemory {
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
+  // Detect stores to GPU-owned guest pages sharing an unprotected host page.
+  // Returns whether cached bindings may need to request their memory again.
+  // If consume is true, resets the latched change flag (e.g. for IssueDraw).
+  bool CheckUnprotectedGpuPages(bool consume = true);
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -242,6 +248,13 @@ class SharedMemory {
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
+
+  // A host write fault reports one address, but makes the whole host page
+  // writable. Neighboring 4 KB GPU pages must be checked for subsequent stores
+  // that cannot fault. Snapshots contain CPU bytes, not GPU resolve contents.
+  std::unordered_map<uint32_t, std::array<uint8_t, 4096>> unprotected_gpu_pages_;
+  std::atomic<bool> unprotected_gpu_pages_pending_{false};
+  std::atomic<bool> unprotected_gpu_pages_changed_{false};
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);

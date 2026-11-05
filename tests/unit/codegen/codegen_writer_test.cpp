@@ -125,7 +125,8 @@ TEST_CASE("Unchanged files keep their modification time", "[codegen_writer]") {
   CodegenWriter second(*fx.ctx);
   REQUIRE(second.write(false));
 
-  CHECK(fs::last_write_time(probe) == before);
+  // Apple file clocks may use __int128, which Catch2 cannot stringify.
+  CHECK((fs::last_write_time(probe) == before));
 }
 
 TEST_CASE("Stale generated files are swept after the write", "[codegen_writer]") {

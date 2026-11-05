@@ -41,7 +41,7 @@ SDLAudioDriver::~SDLAudioDriver() {
 bool SDLAudioDriver::Initialize() {
   // Set audio category for proper OS audio handling
   SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
-#if REX_PLATFORM_ANDROID
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_MAC
   // 10 ms callbacks (SDL's AAudio default is 20 ms, with twice that
   // buffered): with the stereo stream below the low latency path keeps the
   // output close to the game.
@@ -75,8 +75,13 @@ bool SDLAudioDriver::OpenDevice() {
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
   desired_spec.format = SDL_AUDIO_F32LE;
+#if REX_PLATFORM_ANDROID || REX_PLATFORM_MAC
+  desired_spec.channels = 2;
+  sdl_device_channels_ = 2;
+#else
   desired_spec.channels = frame_channels_;
   sdl_device_channels_ = frame_channels_;
+#endif
   sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
                                           SDLCallback, this);
   if (!sdl_stream_) {
@@ -100,7 +105,9 @@ bool SDLAudioDriver::OpenDevice() {
   // reports 6 channels for a phone's stereo speakers, and a 6-channel stream
   // misses its low latency mixer (about 130 ms behind on a Snapdragon 8
   // Elite), so it always gets the stereo fold.
-  if (obtained_spec.channels <= 2 || REX_PLATFORM_ANDROID) {
+  // macOS / MacBook Pro also reports 6 channels for its built-in stereo speakers;
+  // submitting 6 channels un-downmixed drives internal woofers directly.
+  if (obtained_spec.channels <= 2 && sdl_device_channels_ != 2) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
