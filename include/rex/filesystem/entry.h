@@ -104,6 +104,10 @@ class Entry {
   virtual bool SetAccessTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetWriteTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   void SetForDeletion(bool delete_on_close) { delete_on_close_ = delete_on_close; }
+  void AddOpenHandle();
+  // Deletes the entry, and so destroys it, when this was its last handle and it
+  // is marked for deletion.
+  void ReleaseOpenHandle();
 
   bool is_read_only() const;
 
@@ -169,6 +173,13 @@ class Entry {
   uint64_t write_timestamp_;
   std::vector<std::unique_ptr<Entry>> children_;
   bool delete_on_close_ = false;
+  uint32_t open_handles_ = 0;
+  // Deleted from its parent while it or an entry below it was still open.
+  bool detached_ = false;
+
+ private:
+  static std::vector<std::unique_ptr<Entry>>& detached_entries();
+  bool HasOpenHandles() const;
 };
 
 }  // namespace rex::filesystem

@@ -14,6 +14,8 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/entry.h>
+#include <rex/filesystem/file.h>
+#include <rex/logging.h>
 #include <rex/string.h>
 
 namespace rex::filesystem {
@@ -122,6 +124,14 @@ bool Entry::Delete(Entry* entry) {
   }
   for (auto it = children_.begin(); it != children_.end(); ++it) {
     if (it->get() == entry) {
+      // An open file still points at its entry (a save device shares delete
+      // access, and POSIX always deletes open files): keep it until the last
+      // handle closes.
+      if (entry->HasOpenHandles()) {
+        entry->parent_ = nullptr;
+        entry->detached_ = true;
+        detached_entries().push_back(std::move(*it));
+      }
       children_.erase(it);
       break;
     }
@@ -130,9 +140,62 @@ bool Entry::Delete(Entry* entry) {
   return true;
 }
 
+std::vector<std::unique_ptr<Entry>>& Entry::detached_entries() {
+  static std::vector<std::unique_ptr<Entry>> entries;
+  return entries;
+}
+
+bool Entry::HasOpenHandles() const {
+  return open_handles_ != 0 ||
+         std::any_of(children_.cbegin(), children_.cend(),
+                     [](const auto& child) { return child->HasOpenHandles(); });
+}
+
 bool Entry::Delete() {
   assert_not_null(parent_);
   return parent_->Delete(this);
+}
+
+void Entry::AddOpenHandle() {
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
+  ++open_handles_;
+}
+
+void Entry::ReleaseOpenHandle() {
+  std::lock_guard<std::recursive_mutex> tree_lock(tree_mutex());
+  --open_handles_;
+  if (open_handles_ == 0 && delete_on_close_ && parent_) {
+    const std::string path = absolute_path_;
+    if (!parent_->Delete(this)) {
+      REXFS_WARN("Could not delete {} on close", path);
+    }
+    return;
+  }
+  Entry* root = this;
+  while (root->parent_) {
+    root = root->parent_;
+  }
+  if (!root->detached_ || root->HasOpenHandles()) {
+    return;
+  }
+  auto& detached = detached_entries();
+  auto it = std::find_if(detached.begin(), detached.end(),
+                         [root](const auto& entry) { return entry.get() == root; });
+  if (it != detached.end()) {
+    detached.erase(it);
+  }
+}
+
+File::File(uint32_t file_access, Entry* entry) : file_access_(file_access), entry_(entry) {
+  if (entry_) {
+    entry_->AddOpenHandle();
+  }
+}
+
+File::~File() {
+  if (entry_) {
+    entry_->ReleaseOpenHandle();
+  }
 }
 
 X_STATUS Entry::Rename(const std::filesystem::path& file_path) {

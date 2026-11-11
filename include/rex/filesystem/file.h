@@ -22,8 +22,10 @@ class Entry;
 
 class File {
  public:
-  File(uint32_t file_access, Entry* entry) : file_access_(file_access), entry_(entry) {}
-  virtual ~File() = default;
+  File(uint32_t file_access, Entry* entry);
+  // Runs after a derived file has closed its host handle, so an entry marked
+  // for deletion can be removed on the host here.
+  virtual ~File();
 
   virtual void Destroy() = 0;
 

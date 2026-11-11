@@ -39,6 +39,7 @@ add_executable(unit_tests
     codegen/host_local_lr_test.cpp
     codegen/register_locals_test.cpp
     filesystem/cache_mount_test.cpp
+    filesystem/delete_on_close_test.cpp
     filesystem/long_path_test.cpp
     graphics/shader_storage_initialization_test.cpp
     graphics/startup_pipeline_compilation_test.cpp
