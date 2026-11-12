@@ -803,7 +803,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
       temporal_effect_selected =
           guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
-          guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
+          guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3 ||
+          guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr4;
 #endif
       auto is_temporal_easu_effect = [&]([[maybe_unused]] size_t effect_index) {
 #if defined(REX_HAS_FIDELITYFX_SDK)

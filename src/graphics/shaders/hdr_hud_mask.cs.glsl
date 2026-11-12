@@ -17,6 +17,10 @@ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(push_constant) uniform HdrHudMaskConstants {
   uvec2 size;
+  // fh1_native_hud: the frame's HUD goes to the presenter in a layer of its
+  // own, so nothing is marked here (the camera pass still marks the mirror
+  // glass after this).
+  uint no_hud;
 } constants;
 
 layout(set = 0, binding = 0) uniform texture2D frame;
@@ -43,7 +47,7 @@ void main() {
     return;
   }
   bool hud = false;
-  for (int y = -1; y <= 1 && !hud; ++y) {
+  for (int y = -1; y <= 1 && !hud && constants.no_hud == 0u; ++y) {
     for (int x = -1; x <= 1 && !hud; ++x) {
       hud = Changed(pixel + ivec2(x, y));
     }

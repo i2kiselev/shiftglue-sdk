@@ -39,7 +39,7 @@ const char* GetUpscalerModeName(UpscalerMode mode);
 
 struct UpscalerInfo {
   // Stable name for cvars and settings ("bilinear", "cas", "fsr", "fsr2",
-  // "fsr3"); present_effect takes it.
+  // "fsr3", "fsr4"); present_effect takes it.
   std::string id;
   // Shown to players.
   std::string name;
@@ -65,6 +65,10 @@ std::vector<UpscalerInfo> GetSpatialUpscalerInfos();
 // motion blur and depth of field. Any thread.
 bool IsTemporalUpscalerActive();
 void SetTemporalUpscalerActive(bool active);
+// The height of the surface the presenter shows the guest output on, 0
+// before it connects (the native-resolution HUD is drawn to fit it).
+uint32_t GetPresentationHeight();
+void SetPresentationHeight(uint32_t height);
 
 // The texture LOD bias that makes a temporal upscale's render size pick the mips the output
 // size would (DLSS guide 3.5: log2(render / output) is its least negative bias; it recommends
