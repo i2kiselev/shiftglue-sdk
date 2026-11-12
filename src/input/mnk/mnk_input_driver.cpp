@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <numbers>
 #include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
@@ -82,6 +83,12 @@ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x
 
 std::atomic<bool> mouse_look_active{true};
 
+std::atomic<bool> hold_look_enabled{false};
+std::atomic<double> hold_look_degrees_per_count{0.15};
+std::atomic<bool> hold_look_hide_cursor{false};
+std::atomic<bool> hold_look_engaged{false};
+std::atomic<bool> host_dialog_open{false};
+
 }  // namespace
 
 void SetMouseLookActive(bool active) {
@@ -90,6 +97,20 @@ void SetMouseLookActive(bool active) {
 
 bool IsMouseLookActive() {
   return mouse_look_active.load(std::memory_order_relaxed);
+}
+
+void SetHoldLook(const HoldLookSettings& settings) {
+  hold_look_degrees_per_count.store(settings.degrees_per_count, std::memory_order_relaxed);
+  hold_look_hide_cursor.store(settings.hide_cursor, std::memory_order_relaxed);
+  hold_look_enabled.store(settings.enabled, std::memory_order_relaxed);
+}
+
+void SetHostDialogOpen(bool open) {
+  host_dialog_open.store(open, std::memory_order_relaxed);
+}
+
+bool IsHoldLookEngaged() {
+  return hold_look_engaged.load(std::memory_order_relaxed);
 }
 
 using rex::ui::VirtualKey;
@@ -241,13 +262,21 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Mouse look is opt in. Without this gate, keyboard input alone would hide
-  // and lock the cursor, breaking the ImGui overlays.
-  QueueMouseCaptureUpdate(IsEnabled() &&
-                          (REXCVAR_GET(mnk_mouse) || REXCVAR_GET(mnk_mouse_steering)) &&
-                          IsMouseLookActive() && has_focus_ && is_active());
+  const bool other_mouse_modes = REXCVAR_GET(mnk_mouse) || REXCVAR_GET(mnk_mouse_steering);
+  // The guest input stays open with an unhovered dialog, but the player needs the
+  // pointer to reach it.
+  const bool look_active =
+      IsMouseLookActive() && !host_dialog_open.load(std::memory_order_relaxed);
 
   if (!is_active() || !has_focus_) {
+    {
+      std::lock_guard lock(state_mutex_);
+      hold_look_engaged_ = false;
+      hold_look_radians_ = 0.0;
+      right_button_was_down_ = key_down_[static_cast<uint16_t>(VirtualKey::kRButton)];
+    }
+    hold_look_engaged.store(false, std::memory_order_relaxed);
+    QueueMouseCaptureUpdate(MouseCapture::kNone);
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -255,7 +284,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_SUCCESS;
   }
 
-  std::lock_guard lock(state_mutex_);
+  std::unique_lock lock(state_mutex_);
 
   const auto overrides = KeybindOverrides();
   const bool exact_modifiers = REXCVAR_GET(mnk_exact_modifiers);
@@ -333,7 +362,7 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   const double elapsed = std::min(
       0.1, std::chrono::duration<double>(now - last_state_time_).count());
   last_state_time_ = now;
-  if (REXCVAR_GET(mnk_mouse_steering) && IsMouseLookActive()) {
+  if (REXCVAR_GET(mnk_mouse_steering) && look_active) {
     // A virtual wheel: the mouse turns it, and it eases back to centre.
     constexpr double kCountsPerLock = 400.0;
     steering_ += double(mouse_dx_) * REXCVAR_GET(mnk_sensitivity) / kCountsPerLock;
@@ -344,13 +373,39 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     lx += static_cast<int32_t>(steering_ * INT16_MAX);
   } else {
     steering_ = 0.0;
-    if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+    if (REXCVAR_GET(mnk_mouse) && look_active) {
       double sensitivity = REXCVAR_GET(mnk_sensitivity);
       constexpr double kBaseScale = 200.0;
       rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
       ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
     }
   }
+  // The game reads the stick's direction as the camera's angle around the car
+  // and any strength from about 0.7 as full, so a full stick at the summed
+  // angle follows the mouse without lag. A press made where look was not
+  // allowed (a menu) stays inert until released.
+  const bool right_down = key_down_[static_cast<uint16_t>(VirtualKey::kRButton)];
+  const bool hold_allowed =
+      hold_look_enabled.load(std::memory_order_relaxed) && !other_mouse_modes && look_active;
+  const bool was_engaged = hold_look_engaged_;
+  hold_look_engaged_ =
+      hold_allowed && right_down && (hold_look_engaged_ || !right_button_was_down_);
+  right_button_was_down_ = right_down;
+  if (!hold_look_engaged_) {
+    hold_look_radians_ = 0.0;
+  } else {
+    // On the engaging poll the travel since the last poll came before the press.
+    if (was_engaged) {
+      hold_look_radians_ = std::remainder(
+          hold_look_radians_ + double(mouse_dx_) *
+                                   hold_look_degrees_per_count.load(std::memory_order_relaxed) *
+                                   std::numbers::pi / 180.0,
+          2.0 * std::numbers::pi);
+    }
+    rx = static_cast<int32_t>(std::lround(std::sin(hold_look_radians_) * INT16_MAX));
+    ry = static_cast<int32_t>(std::lround(std::cos(hold_look_radians_) * INT16_MAX));
+  }
+  hold_look_engaged.store(hold_look_engaged_, std::memory_order_relaxed);
   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
   // mouse is off, and toggling it on would otherwise dump the whole backlog
   // into one frame as a camera snap.
@@ -373,6 +428,14 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     out_state->gamepad.thumb_rx = clamp16(rx);
     out_state->gamepad.thumb_ry = clamp16(ry);
   }
+  const bool locked = look_active && (other_mouse_modes || hold_look_engaged_);
+  lock.unlock();
+  // Mouse look is opt in. Without this gate, keyboard input alone would hide
+  // and lock the cursor, breaking the ImGui overlays.
+  QueueMouseCaptureUpdate(locked ? MouseCapture::kLocked
+                          : look_active && hold_look_hide_cursor.load(std::memory_order_relaxed)
+                              ? MouseCapture::kHidden
+                              : MouseCapture::kNone);
   return X_ERROR_SUCCESS;
 }
 
@@ -410,8 +473,8 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
   keystroke_queue_.push(ks);
 }
 
-void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
-  mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
+void MnkInputDriver::QueueMouseCaptureUpdate(MouseCapture capture) {
+  mouse_capture_requested_.store(capture, std::memory_order_relaxed);
   bool already_queued = false;
   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
     return;
@@ -433,20 +496,33 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
   if (!window) {
     return;
   }
-  bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
-  if (should_capture == mouse_captured_) {
+  const MouseCapture requested = mouse_capture_requested_.load(std::memory_order_relaxed);
+  if (requested == mouse_capture_) {
     return;
   }
-  if (!should_capture) {
+  if (requested == MouseCapture::kNone) {
     ReleaseMouseCaptureFromUIThread(window);
     return;
   }
-  mouse_captured_ = true;
-  precapture_cursor_visibility_ = window->GetCursorVisibility();
-  window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+  if (mouse_capture_ == MouseCapture::kNone) {
+    precapture_cursor_visibility_ = window->GetCursorVisibility();
+    window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+  }
+  if (requested == MouseCapture::kHidden) {
+    if (mouse_capture_ == MouseCapture::kLocked) {
+      window->SetRelativeMouseMode(false);
+      relative_mouse_mode_ = false;
+      window->ReleaseMouse();
+    }
+    mouse_capture_ = requested;
+    return;
+  }
+  mouse_capture_ = requested;
   window->CaptureMouse();
   relative_mouse_mode_ = window->SetRelativeMouseMode(true);
-  if (!relative_mouse_mode_) {
+  // Hold look locks at every press: warn once.
+  static std::atomic_bool warned{false};
+  if (!relative_mouse_mode_ && !warned.exchange(true)) {
     REXLOG_WARN("Pointer lock unavailable, mouse look falls back to recentering the cursor");
   }
   // Reset deltas to avoid a spike on capture start
@@ -456,14 +532,17 @@ void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
 }
 
 void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
-  if (!mouse_captured_) {
+  if (mouse_capture_ == MouseCapture::kNone) {
     return;
   }
-  mouse_captured_ = false;
+  const bool locked = mouse_capture_ == MouseCapture::kLocked;
+  mouse_capture_ = MouseCapture::kNone;
   window->SetCursorVisibility(precapture_cursor_visibility_);
-  window->SetRelativeMouseMode(false);
-  relative_mouse_mode_ = false;
-  window->ReleaseMouse();
+  if (locked) {
+    window->SetRelativeMouseMode(false);
+    relative_mouse_mode_ = false;
+    window->ReleaseMouse();
+  }
 }
 
 void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
@@ -593,7 +672,7 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
   // Without a pointer lock the cursor still has to be kept off the edges.
-  if (mouse_captured_ && !relative_mouse_mode_) {
+  if (mouse_capture_ == MouseCapture::kLocked && !relative_mouse_mode_) {
     RecenterCursorFromUIThread(x, y);
   }
 }
@@ -602,7 +681,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   has_focus_ = false;
   // Withdraw the request too, or an update queued before the focus loss grabs
   // the cursor straight back.
-  mouse_capture_requested_.store(false, std::memory_order_relaxed);
+  mouse_capture_requested_.store(MouseCapture::kNone, std::memory_order_relaxed);
   {
     std::lock_guard lock(state_mutex_);
     bool expected = false;

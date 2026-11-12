@@ -26,6 +26,23 @@ namespace rex::input::mnk {
 
 void SetMouseLookActive(bool active);
 bool IsMouseLookActive();
+// A host dialog the player clicks in (console, settings, achievements) is open:
+// mouse look is off and the cursor free until it closes.
+void SetHostDialogOpen(bool open);
+
+// Hold look: while the right mouse button is held and mouse look is active,
+// horizontal mouse travel turns a full-strength right stick around from
+// straight up, and the pointer is locked. Off while mnk_mouse or
+// mnk_mouse_steering owns the mouse.
+struct HoldLookSettings {
+  bool enabled = false;
+  double degrees_per_count = 0.15;
+  // Hide the cursor whenever mouse look is active, held or not.
+  bool hide_cursor = false;
+};
+void SetHoldLook(const HoldLookSettings& settings);
+// Whether the last state poll sent the hold-look stick.
+bool IsHoldLookEngaged();
 
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
@@ -64,9 +81,11 @@ class MnkInputDriver final : public InputDriver,
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
 
+  enum class MouseCapture : uint8_t { kNone, kHidden, kLocked };
+
   // Called from the guest thread. The rest of the capture path stays on the UI
   // thread, since every Window call in it reaches SDL.
-  void QueueMouseCaptureUpdate(bool should_capture);
+  void QueueMouseCaptureUpdate(MouseCapture capture);
   void ApplyMouseCaptureFromUIThread();
   void ReleaseMouseCaptureFromUIThread(rex::ui::Window* window);
   void RecenterCursorFromUIThread(int32_t x, int32_t y);
@@ -92,11 +111,15 @@ class MnkInputDriver final : public InputDriver,
   // Mouse steering position in [-1, 1] and when it was last advanced.
   double steering_ = 0.0;
   std::chrono::steady_clock::time_point last_state_time_ = std::chrono::steady_clock::now();
+  // Hold look: engaged only by a press made while it was allowed.
+  bool hold_look_engaged_ = false;
+  bool right_button_was_down_ = false;
+  double hold_look_radians_ = 0.0;
 
   // UI thread only.
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
-  bool mouse_captured_ = false;
+  MouseCapture mouse_capture_ = MouseCapture::kNone;
   // Whether the window has the pointer locked and is reporting relative motion.
   bool relative_mouse_mode_ = false;
   // Cursor visibility to restore on capture release - the window owner may run
@@ -105,7 +128,7 @@ class MnkInputDriver final : public InputDriver,
       rex::ui::Window::CursorVisibility::kVisible;
 
   // Guest thread to UI thread. The queued flag coalesces the posts.
-  std::atomic<bool> mouse_capture_requested_{false};
+  std::atomic<MouseCapture> mouse_capture_requested_{MouseCapture::kNone};
   std::atomic<bool> mouse_capture_update_queued_{false};
 
   std::atomic<bool> has_focus_{true};

@@ -34,6 +34,7 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
+#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/kernel/init.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/string/numeric.h>
@@ -559,26 +560,34 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
   });
-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
+  // The debug overlay only shows numbers; these three take clicks.
+  const auto dialogs_changed = [this] {
+    rex::input::mnk::SetHostDialogOpen(console_overlay_ || settings_overlay_ ||
+                                       achievements_overlay_);
+  };
+  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this, dialogs_changed] {
     if (console_overlay_) {
       console_overlay_.reset();
     } else {
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
+    dialogs_changed();
   });
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
+  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this, dialogs_changed] {
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
+    dialogs_changed();
   });
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this, dialogs_changed] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
     } else {
       achievements_overlay_ = CreateAchievementsOverlay();
     }
+    dialogs_changed();
   });
 
   OnCreateDialogs(imgui_drawer_.get());
