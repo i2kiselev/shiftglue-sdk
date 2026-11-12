@@ -15,6 +15,7 @@
 #include <atomic>
 
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/content_override.h>
 #include <rex/kernel/xboxkrnl/io.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -209,6 +210,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
 
   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
   if (XSUCCEEDED(result)) {
+    vfs_file = rex::filesystem::ApplyContentOverride(target_path, desired_access, vfs_file);
     // If true, desired_access SYNCHRONIZE flag must be set.
     bool synchronous = (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
                        (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
