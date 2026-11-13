@@ -199,6 +199,11 @@ class VulkanDevice {
 
     bool pipelineFragmentShadingRate = false;
 
+    // VK_KHR_compute_shader_derivatives, for AMD's FidelityFX SDK 2.x shaders.
+
+    bool computeDerivativeGroupQuads = false;
+    bool computeDerivativeGroupLinear = false;
+
     // VK_EXT_device_fault (#342); the vendor binary only with
     // vulkan_device_address_bindings.
 
@@ -269,6 +274,8 @@ class VulkanDevice {
     bool ext_KHR_pipeline_executable_properties = false;  // #270
     // Has optional features not implied by this being true.
     bool ext_KHR_fragment_shading_rate = false;  // #227
+    // Has optional features not implied by this being true.
+    bool ext_KHR_compute_shader_derivatives = false;
     // Has optional features not implied by this being true.
     bool ext_EXT_device_fault = false;  // #342
     // Only with vulkan_device_address_bindings.

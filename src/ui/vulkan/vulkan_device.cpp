@@ -534,6 +534,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
     }
   }
+  if (get_physical_device_properties2_supported) {
+    // AMD's FidelityFX SDK 2.x runtime declares it in its upscalers' compute
+    // shaders, FSR 2 and 3 included.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_compute_shader_derivatives)
+  }
 
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
 #undef XE_UI_VULKAN_LOCAL_EXTENSION
@@ -654,6 +659,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
       features_KHR_fragment_shading_rate;
+  VulkanFeatures<VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR>
+      features_KHR_compute_shader_derivatives;
   VulkanFeatures<VkPhysicalDeviceFaultFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT>
       features_EXT_device_fault;
@@ -725,6 +733,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_fragment_shading_rate) {
       features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_compute_shader_derivatives) {
+      features_KHR_compute_shader_derivatives.Link(supported_features_2, device_create_info);
     }
     if (device->extensions_.ext_EXT_device_fault) {
       features_EXT_device_fault.Link(supported_features_2, device_create_info);
@@ -1133,6 +1144,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_fragment_shading_rate) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_fragment_shading_rate, pipelineFragmentShadingRate)
+  }
+  if (device->extensions_.ext_KHR_compute_shader_derivatives) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupQuads)
+    XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupLinear)
   }
   if (device->extensions_.ext_EXT_device_fault) {
     XE_UI_VULKAN_FEATURE_2(features_EXT_device_fault, deviceFault)

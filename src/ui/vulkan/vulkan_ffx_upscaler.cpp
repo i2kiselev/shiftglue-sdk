@@ -13,7 +13,7 @@
  * FSR 3.1.4 provider accepts, became FFX_API_BACKEND_ID_VK | 0x3) without
  * changing its layout, and lists FSR 4 only when the version query carries
  * the device (a VkDeviceContext). The providers query with the device and
- * create with the new type, falling back to the old one for SDK 1.1.4.
+ * create with the type of the runtime that loaded.
  */
 
 #include <rex/ui/vulkan/upscaler.h>
@@ -67,6 +67,9 @@ struct FfxRuntime {
   PfnFfxDispatch dispatch = nullptr;
   std::string source;
   std::string error;
+  // SDK 2.x's loader, which takes the 2.x backend descriptor type and the
+  // upscale version descriptor.
+  bool sdk2 = false;
   bool loaded() const { return create_context && destroy_context && query && dispatch; }
 };
 
@@ -168,6 +171,7 @@ const FfxRuntime& GetFfxRuntime() {
       if (runtime.loaded()) {
         runtime.source = path.string();
         runtime.error.clear();
+        runtime.sdk2 = path.filename() == kNames[0] && std::size(kNames) > 1;
         break;
       }
       runtime.error = path.string() + " lacks the FidelityFX API entry points";
@@ -233,6 +237,15 @@ struct FfxBackendVkDesc {
 static_assert(sizeof(FfxBackendVkDesc) ==
                   sizeof(ffxCreateContextDescHeader) + 3 * sizeof(void*),
               "the FidelityFX Vulkan backend descriptor is a header and three pointers");
+
+// SDK 2.x's ffxCreateContextDescUpscaleVersion, chained to the upscale
+// context's creation with the upscaler API version (FFX_UPSCALER_VERSION).
+constexpr uint64_t kFfxCreateContextDescTypeUpscaleVersion = 0x0001000bu;
+constexpr uint32_t kFfxUpscalerApiVersion = (4u << 22) | (1u << 12) | 2u;
+struct FfxCreateContextDescUpscaleVersion {
+  ffxCreateContextDescHeader header;
+  uint32_t version;
+};
 
 FfxVkDeviceContext GetFfxDeviceContext(const VulkanDevice* device) {
   const VulkanInstance* instance = device->vulkan_instance();
@@ -357,7 +370,8 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     create_desc.fpMessage = LogFfxMessage;
 
     FfxBackendVkDesc backend_desc = {};
-    backend_desc.header.type = kFfxBackendVkDescTypeSdk2;
+    backend_desc.header.type =
+        runtime.sdk2 ? kFfxBackendVkDescTypeSdk2 : kFfxBackendVkDescTypeSdk1;
     backend_desc.device_context = GetFfxDeviceContext(device_);
     create_desc.header.pNext = &backend_desc.header;
 
@@ -366,15 +380,18 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     override_desc.versionId = version_id_;
     backend_desc.header.pNext = &override_desc.header;
 
-    ffxContext context = nullptr;
-    ffxReturnCode_t created = runtime.create_context(&context, &create_desc.header, nullptr);
-    if (created != FFX_API_RETURN_OK && major_ != 4) {
-      // SDK 1.1.4, and the FSR 3.1.4 provider in any SDK, know only the old
-      // descriptor type.
-      context = nullptr;
-      backend_desc.header.type = kFfxBackendVkDescTypeSdk1;
-      created = runtime.create_context(&context, &create_desc.header, nullptr);
+    // AMD requires it on context creation since SDK 2.1; the upscale
+    // structures this file passes are unchanged up to 4.1.2.
+    FfxCreateContextDescUpscaleVersion upscale_version = {};
+    upscale_version.header.type = kFfxCreateContextDescTypeUpscaleVersion;
+    upscale_version.version = kFfxUpscalerApiVersion;
+    if (runtime.sdk2) {
+      override_desc.header.pNext = &upscale_version.header;
     }
+
+    ffxContext context = nullptr;
+    const ffxReturnCode_t created =
+        runtime.create_context(&context, &create_desc.header, nullptr);
     if (created != FFX_API_RETURN_OK) {
       REXLOG_WARN("FidelityFX: could not create the FSR {} context ({}x{} to {}x{}): error {}",
                   info_.version, max_render_width, max_render_height, max_output_width,
