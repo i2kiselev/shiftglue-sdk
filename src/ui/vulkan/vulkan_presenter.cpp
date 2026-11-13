@@ -529,6 +529,9 @@ VulkanUpscaler* VulkanPresenter::GetTemporalUpscaler(const GuestOutputPaintConfi
     case GuestOutputPaintConfig::Effect::kFsr3:
       id = "fsr3";
       break;
+    case GuestOutputPaintConfig::Effect::kFsr4:
+      id = "fsr4";
+      break;
     case GuestOutputPaintConfig::Effect::kDlss:
       id = "dlss";
       break;

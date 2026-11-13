@@ -12,6 +12,13 @@
 # Sets REXGLUE_FFX_API_INCLUDE_DIR when the headers are present, and on
 # Windows REXGLUE_FFX_RUNTIME_DLL when the signed runtime is (the game
 # stages it in upscalers/fidelityfx/1.1.4/, rexglue_helpers.cmake).
+#
+# On Windows it also fetches AMD's signed SDK 2.4.0 Vulkan runtime (the loader
+# and the upscaler DLL: FSR 4.1.2, 3.1.6 and 2.3.4) from AMD's repository and
+# sets REXGLUE_FFX_SDK2_RUNTIME_DLLS; the game stages them in
+# upscalers/fidelityfx/2.4.0/, which the provider tries first. The 1.1.4
+# runtime stays as the fallback. The headers stay at 1.1.4: the provider
+# declares the one SDK 2.x descriptor it needs.
 
 option(REXGLUE_FFX_API_LOADER
     "Build the FSR 2/3 provider that loads the FidelityFX runtime at run time" ON)
@@ -93,4 +100,40 @@ if(WIN32 AND REXGLUE_FIDELITYFX_RUNTIME AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     if(_rexglue_ffx_runtime_ok)
         set(REXGLUE_FFX_RUNTIME_DLL "${_rexglue_ffx_runtime}" CACHE INTERNAL "")
     endif()
+endif()
+
+# AMD's signed SDK 2.4.0 Vulkan runtime (MIT, redistributable with the
+# notice), from Kits/FidelityFX/signedbin of the v2.4.0 tag.
+set(REXGLUE_FFX_SDK2_RUNTIME_DLLS "" CACHE INTERNAL "")
+if(WIN32 AND REXGLUE_FIDELITYFX_RUNTIME AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_rexglue_ffx_sdk2_url
+        "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin")
+    set(_rexglue_ffx_sdk2_files
+        "amd_fidelityfx_loader_vk.dll|38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9"
+        "amd_fidelityfx_upscaler_vk.dll|4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7")
+    set(_rexglue_ffx_sdk2_paths "")
+    foreach(_entry IN LISTS _rexglue_ffx_sdk2_files)
+        string(REPLACE "|" ";" _entry "${_entry}")
+        list(GET _entry 0 _file)
+        list(GET _entry 1 _hash)
+        set(_path "${_rexglue_ffx_api_dir}/runtime-2.4.0/${_file}")
+        set(_actual "")
+        if(EXISTS "${_path}")
+            file(SHA256 "${_path}" _actual)
+        endif()
+        if(NOT _actual STREQUAL _hash)
+            file(DOWNLOAD "${_rexglue_ffx_sdk2_url}/${_file}" "${_path}"
+                EXPECTED_HASH SHA256=${_hash} STATUS _status TLS_VERIFY ON)
+            list(GET _status 0 _code)
+            if(NOT _code EQUAL 0)
+                file(REMOVE "${_path}")
+                message(WARNING "Could not download AMD's FidelityFX SDK 2.4.0 runtime "
+                    "${_file} (${_status}); FSR 4 shows as unavailable.")
+                set(_rexglue_ffx_sdk2_paths "")
+                break()
+            endif()
+        endif()
+        list(APPEND _rexglue_ffx_sdk2_paths "${_path}")
+    endforeach()
+    set(REXGLUE_FFX_SDK2_RUNTIME_DLLS "${_rexglue_ffx_sdk2_paths}" CACHE INTERNAL "")
 endif()

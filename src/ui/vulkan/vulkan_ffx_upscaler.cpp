@@ -1,13 +1,19 @@
 /**
- * FSR 2 and FSR 3 temporal upscalers through the FidelityFX API.
+ * FSR 2, FSR 3 and FSR 4 temporal upscalers through the FidelityFX API.
  *
  * The API is five C entry points. They come from the SDK when it is built
  * from source (REX_HAS_FIDELITYFX_RUNTIME), otherwise from AMD's signed
- * runtime, amd_fidelityfx_vk.dll, loaded at run time from the folder setup
- * fetches it to (docs/LEGAL.md in Pinyon Shift: nothing vendor-made is
- * committed or shipped). One runtime holds several upscaler versions (1.1.4:
- * FSR 3.1.4 and 2.3.3); each provider here pins one through the API's version
- * override.
+ * runtime, loaded at run time from the folder setup fetches it to
+ * (docs/LEGAL.md in Pinyon Shift: nothing vendor-made is committed or
+ * shipped): SDK 2.4's amd_fidelityfx_loader_vk.dll (FSR 4.1, 3.1.6, 2.3.4) or
+ * SDK 1.1.4's amd_fidelityfx_vk.dll (FSR 3.1.4, 2.3.3). Each provider here
+ * pins one version through the API's version override.
+ *
+ * SDK 2.x changed the Vulkan backend descriptor's type (0x3, which only the
+ * FSR 3.1.4 provider accepts, became FFX_API_BACKEND_ID_VK | 0x3) without
+ * changing its layout, and lists FSR 4 only when the version query carries
+ * the device (a VkDeviceContext). The providers query with the device and
+ * create with the new type, falling back to the old one for SDK 1.1.4.
  */
 
 #include <rex/ui/vulkan/upscaler.h>
@@ -41,8 +47,9 @@
 #endif
 
 REXCVAR_DEFINE_STRING(present_ffx_runtime, "", "UI/Presenter",
-                      "Path to the FidelityFX runtime (amd_fidelityfx_vk.dll, or "
-                      "libamd_fidelityfx_vk.so/.dylib) for FSR 2 and 3; empty searches "
+                      "Path to the FidelityFX runtime (amd_fidelityfx_loader_vk.dll or "
+                      "amd_fidelityfx_vk.dll, or libamd_fidelityfx_vk.so/.dylib) for FSR 2, "
+                      "3 and 4; empty searches "
                       "upscalers/fidelityfx/<version> next to the executable, newest first "
                       "(and the package's libraries on Android)");
 
@@ -91,12 +98,14 @@ const FfxRuntime& GetFfxRuntime() {
     runtime.source = "linked";
 #else
 #if REX_PLATFORM_WIN32
-    const char* const kName = "amd_fidelityfx_vk.dll";
+    // SDK 2.x ships a loader beside the per-effect DLLs; SDK 1.1.4 one DLL.
+    const char* const kNames[] = {"amd_fidelityfx_loader_vk.dll", "amd_fidelityfx_vk.dll"};
 #elif defined(__APPLE__)
-    const char* const kName = "libamd_fidelityfx_vk.dylib";
+    const char* const kNames[] = {"libamd_fidelityfx_vk.dylib"};
 #else
-    const char* const kName = "libamd_fidelityfx_vk.so";
+    const char* const kNames[] = {"libamd_fidelityfx_vk.so"};
 #endif
+    const char* const kName = kNames[std::size(kNames) - 1];
     std::vector<std::filesystem::path> candidates;
     const std::string configured = REXCVAR_GET(present_ffx_runtime);
     if (!configured.empty()) {
@@ -117,10 +126,16 @@ const FfxRuntime& GetFfxRuntime() {
         return VersionLess(b.filename().string(), a.filename().string());
       });
       for (const std::filesystem::path& version : versions) {
-        candidates.push_back(version / kName);
+        for (const char* name : kNames) {
+          candidates.push_back(version / name);
+        }
       }
-      candidates.push_back(provider_folder / kName);
-      candidates.push_back(folder / kName);
+      for (const char* name : kNames) {
+        candidates.push_back(provider_folder / name);
+      }
+      for (const char* name : kNames) {
+        candidates.push_back(folder / name);
+      }
 #if defined(__ANDROID__)
       // The package's native library folder, which the linker searches for
       // a bare name (thirdparty/fidelityfx-vk builds it for arm64).
@@ -199,6 +214,35 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddrCompat(VkDevice device
   return nullptr;
 }
 
+// The Vulkan backend descriptor. SDK 1.1.4 calls it ffxCreateBackendVKDesc
+// with type 0x3; SDK 2.x keeps that type only for the FSR 3.1.4 provider and
+// gives ffxCreateBackendVKDesc type FFX_API_BACKEND_ID_VK | 0x3 with the same
+// fields in a VkDeviceContext. Declared here so the code builds against
+// either SDK's headers.
+constexpr uint64_t kFfxBackendVkDescTypeSdk1 = 0x00000003u;
+constexpr uint64_t kFfxBackendVkDescTypeSdk2 = 0x01000003u;
+struct FfxVkDeviceContext {
+  VkDevice device;
+  VkPhysicalDevice physical_device;
+  PFN_vkGetDeviceProcAddr get_device_proc_addr;
+};
+struct FfxBackendVkDesc {
+  ffxCreateContextDescHeader header;
+  FfxVkDeviceContext device_context;
+};
+static_assert(sizeof(FfxBackendVkDesc) ==
+                  sizeof(ffxCreateContextDescHeader) + 3 * sizeof(void*),
+              "the FidelityFX Vulkan backend descriptor is a header and three pointers");
+
+FfxVkDeviceContext GetFfxDeviceContext(const VulkanDevice* device) {
+  const VulkanInstance* instance = device->vulkan_instance();
+  g_get_device_proc_addr.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                                   instance->functions().vkGetInstanceProcAddr(
+                                       instance->instance(), "vkGetDeviceProcAddr")),
+                               std::memory_order_relaxed);
+  return {device->device(), device->physical_device(), GetDeviceProcAddrCompat};
+}
+
 void LogFfxMessage(uint32_t type, const wchar_t* message) {
   if (!message) {
     return;
@@ -216,10 +260,10 @@ void LogFfxMessage(uint32_t type, const wchar_t* message) {
 
 class VulkanFfxUpscaler final : public VulkanUpscaler {
  public:
-  // major: 2 or 3, the FSR version this provider pins.
+  // major: 2, 3 or 4, the FSR version this provider pins.
   VulkanFfxUpscaler(const VulkanDevice* device, uint32_t major)
       : device_(device), major_(major) {
-    info_.id = major == 2 ? "fsr2" : "fsr3";
+    info_.id = "fsr" + std::to_string(major);
     info_.name = "AMD FidelityFX Super Resolution " + std::to_string(major);
     info_.kind = UpscalerKind::kTemporal;
     info_.mode_mask = (1u << uint32_t(UpscalerMode::kCount)) - 1;
@@ -235,15 +279,23 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     uint64_t count = 8;
     uint64_t ids[8] = {};
     const char* names[8] = {};
+    // SDK 2.x lists FSR 4 only for a device that runs it, so the query
+    // carries the device; SDK 1.1.4 ignores it. Without the device, ask again.
+    FfxVkDeviceContext device_context = GetFfxDeviceContext(device_);
     ffxQueryDescGetVersions query = {};
     query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
     query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    query.device = &device_context;
     query.outputCount = &count;
     query.versionIds = ids;
     query.versionNames = names;
     if (runtime.query(nullptr, &query.header) != FFX_API_RETURN_OK) {
-      info_.unavailable_reason = "the runtime lists no upscaler versions";
-      return;
+      count = 8;
+      query.device = nullptr;
+      if (runtime.query(nullptr, &query.header) != FFX_API_RETURN_OK) {
+        info_.unavailable_reason = "the runtime lists no upscaler versions";
+        return;
+      }
     }
     // Names are "3.1.4" and the like, newest first.
     for (uint64_t i = 0; i < std::min<uint64_t>(count, 8); ++i) {
@@ -262,7 +314,9 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
       }
     }
     if (!info_.available) {
-      info_.unavailable_reason = "the runtime has no FSR " + std::to_string(major_) + " version";
+      info_.unavailable_reason =
+          major_ == 4 ? "needs AMD's FidelityFX SDK 2.4 runtime and a GPU that runs FSR 4"
+                      : "the runtime has no FSR " + std::to_string(major_) + " version";
     }
   }
 
@@ -302,16 +356,9 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     create_desc.maxUpscaleSize.height = max_output_height;
     create_desc.fpMessage = LogFfxMessage;
 
-    ffxCreateBackendVKDesc backend_desc = {};
-    backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-    backend_desc.vkDevice = device_->device();
-    backend_desc.vkPhysicalDevice = device_->physical_device();
-    const VulkanInstance* instance = device_->vulkan_instance();
-    g_get_device_proc_addr.store(reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-                                     instance->functions().vkGetInstanceProcAddr(
-                                         instance->instance(), "vkGetDeviceProcAddr")),
-                                 std::memory_order_relaxed);
-    backend_desc.vkDeviceProcAddr = GetDeviceProcAddrCompat;
+    FfxBackendVkDesc backend_desc = {};
+    backend_desc.header.type = kFfxBackendVkDescTypeSdk2;
+    backend_desc.device_context = GetFfxDeviceContext(device_);
     create_desc.header.pNext = &backend_desc.header;
 
     ffxOverrideVersion override_desc = {};
@@ -320,7 +367,14 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
     backend_desc.header.pNext = &override_desc.header;
 
     ffxContext context = nullptr;
-    const ffxReturnCode_t created = runtime.create_context(&context, &create_desc.header, nullptr);
+    ffxReturnCode_t created = runtime.create_context(&context, &create_desc.header, nullptr);
+    if (created != FFX_API_RETURN_OK && major_ != 4) {
+      // SDK 1.1.4, and the FSR 3.1.4 provider in any SDK, know only the old
+      // descriptor type.
+      context = nullptr;
+      backend_desc.header.type = kFfxBackendVkDescTypeSdk1;
+      created = runtime.create_context(&context, &create_desc.header, nullptr);
+    }
     if (created != FFX_API_RETURN_OK) {
       REXLOG_WARN("FidelityFX: could not create the FSR {} context ({}x{} to {}x{}): error {}",
                   info_.version, max_render_width, max_render_height, max_output_width,
@@ -558,6 +612,7 @@ std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(
     upscalers.push_back(std::move(dlss));
   }
 #if defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
+  upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 4));
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 3));
   upscalers.push_back(std::make_unique<VulkanFfxUpscaler>(device, 2));
 #endif
