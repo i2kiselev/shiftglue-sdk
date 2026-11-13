@@ -228,6 +228,9 @@ class Presenter {
       // where available; currently still experimental due to limited temporal
       // inputs in the presenter path.
       kFsr3,
+      // FidelityFX FSR 4 selection (SDK 2.4 runtime, GPUs that run it). Same
+      // temporal path as FSR 3.
+      kFsr4,
       // NVIDIA DLSS Super Resolution through NGX (FSR 1 without it).
       kDlss,
 #endif
@@ -236,7 +239,8 @@ class Presenter {
 #if defined(REX_HAS_FIDELITYFX_SDK)
     // The effects fed to a temporal upscaler provider.
     static constexpr bool IsTemporalEffect(Effect effect) {
-      return effect == Effect::kFsr2 || effect == Effect::kFsr3 || effect == Effect::kDlss;
+      return effect == Effect::kFsr2 || effect == Effect::kFsr3 ||
+             effect == Effect::kFsr4 || effect == Effect::kDlss;
     }
 #endif
 

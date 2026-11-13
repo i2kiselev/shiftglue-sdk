@@ -32,6 +32,11 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/upscaler.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_frame_generation_queues, true, "UI/Vulkan",
+                    "Create the spare queues AMD's frame generation swapchain presents and "
+                    "composes on (present_frame_generation needs them)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
                     "passes with VK_NV_device_diagnostic_checkpoints and log the last ones the "
@@ -839,6 +844,56 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
+  }
+
+  // Spare queues for AMD's frame generation swapchain: a second queue that can
+  // present (and copy), one for async compute and one for image acquisition.
+  // New indices only, so nothing else in the SDK uses them.
+  if (with_swapchain && REXCVAR_GET(vulkan_frame_generation_queues)) {
+    auto reserve = [&](uint32_t family) -> QueueSlot {
+      QueueFamily& queue_family = device->queue_families_[family];
+      if (queue_family.queues.size() >= queue_families[family].queueCount) {
+        return {};
+      }
+      QueueSlot slot;
+      slot.family = family;
+      slot.index = uint32_t(queue_family.queues.size());
+      queue_family.queues.resize(queue_family.queues.size() + 1);
+      return slot;
+    };
+    const uint32_t graphics_family = device->queue_family_graphics_compute_;
+    FrameGenerationQueues& fg = device->frame_generation_queues_;
+    if (device->queue_families_[graphics_family].may_support_presentation) {
+      fg.present = reserve(graphics_family);
+    }
+    for (uint32_t family = 0; !fg.present.valid() && family < queue_family_count; ++family) {
+      if (family != graphics_family && device->queue_families_[family].may_support_presentation &&
+          (queue_families[family].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))) {
+        fg.present = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.async_compute.valid() && family < queue_family_count; ++family) {
+      const VkQueueFlags flags = queue_families[family].queueFlags;
+      if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT)) {
+        fg.async_compute = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.image_acquire.valid() && family < queue_family_count; ++family) {
+      const VkQueueFlags flags = queue_families[family].queueFlags;
+      if (!(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+        fg.image_acquire = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.image_acquire.valid() && family < queue_family_count; ++family) {
+      fg.image_acquire = reserve(family);
+    }
+    if (!fg.async_compute.valid()) {
+      fg.async_compute = reserve(graphics_family);
+    }
+    REXLOG_INFO(
+        "Vulkan frame generation queues: present {}:{}, async compute {}:{}, image acquire {}:{}",
+        int32_t(fg.present.family), fg.present.index, int32_t(fg.async_compute.family),
+        fg.async_compute.index, int32_t(fg.image_acquire.family), fg.image_acquire.index);
   }
 
   size_t max_enabled_queues_per_family = 0;

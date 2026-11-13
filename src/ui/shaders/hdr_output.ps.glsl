@@ -32,6 +32,11 @@ layout(push_constant) uniform HdrOutputConstants {
   // to rotated stand-in pixels.
   uint output_flags;
   vec2 size;  // The stand-in's (unrotated) size.  // The swapchain's size, for the patterns.
+  // present_hdr_native: where the guest output is in the stand-in, and whether its HDR gain
+  // map (how much brighter than the SDR picture each scene pixel is) replaces the expansion.
+  vec2 gain_offset;
+  vec2 gain_size_inv;
+  uint gain_enabled;
 } constants;
 
 const uint kOutputPq = 1u;
@@ -46,6 +51,8 @@ const uint kPatternPaperWhite = 2u;
 const uint kPatternPeak = 3u;
 
 layout(set = 0, binding = 0) uniform texture2D stand_in;
+layout(set = 1, binding = 0) uniform texture2D gain_map;
+layout(set = 1, binding = 1) uniform sampler gain_sampler;
 
 layout(location = 0) out vec4 output_color;
 
@@ -172,6 +179,15 @@ void main() {
   // Smooth from the knee, reaching the peak at SDR white. Scaling all three
   // channels together keeps the hue.
   float boost = 1.0 + constants.highlight_scale * t * t * (1.0 - ui);
+  if (constants.gain_enabled != 0u) {
+    vec2 uv = (frag - constants.gain_offset) * constants.gain_size_inv;
+    float gain = 1.0;
+    if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+      gain = max(texture(sampler2D(gain_map, gain_sampler), uv).r, 1.0);
+    }
+    // The HUD and host UI stay at the paper white.
+    boost = mix(gain, 1.0, ui);
+  }
   vec3 color = linear * (constants.paper_white_scale * boost);
   if (constants.pattern != kPatternNone) {
     // The pattern replaces the image; the menu stays on top of it.
