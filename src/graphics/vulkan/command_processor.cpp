@@ -3576,7 +3576,7 @@ bool VulkanCommandProcessor::EnsureSwapHudMask() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(uint32_t) * 2};
+                                             sizeof(uint32_t) * 3};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -4299,6 +4299,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   const bool camera_wanted = presenter->WantsGuestOutputCamera();
   const bool plain_ground_motion = presenter->GuestOutputPlainGroundMotion();
   VkImageView camera_depth_view = VK_NULL_HANDLE;
+  VkImage native_hud_image = VK_NULL_HANDLE;
+  uint32_t native_hud_width = 0, native_hud_height = 0;
   Fh1NativeExecutor::Camera camera = {};
   const bool scene_fxaa =
       swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
@@ -4310,6 +4312,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                                 hudless_wanted);
     hud_snapshot_view =
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
+    native_hud_image =
+        fh1_native_executor_->TakeHudLayer(native_hud_width, native_hud_height);
     fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
@@ -4343,7 +4347,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
       [this, guest_output_width, guest_output_height, display_width, display_height,
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
-       camera, plain_ground_motion](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       camera, plain_ground_motion, native_hud_image, native_hud_width,
+       native_hud_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4787,7 +4792,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             deferred_command_buffer_.CmdVkBindDescriptorSets(
                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
                 &hud_mask_set, 0, nullptr);
-            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
+            // The mask marks the HUD here (no_hud is 0).
+            const uint32_t hud_mask_size[3] = {guest_output_width, guest_output_height, 0};
             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hud_mask_size), hud_mask_size);
@@ -4802,6 +4808,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           // then the HUD's coverage into its alpha. Not where a frame has no
           // snapshot (menus), whose guest output is all HUD.
           bool hudless_written = false;
+          bool native_hud_destination_ready = false;
           VkPipeline hudless_gamma_pipeline = use_pwl_gamma_ramp
                                                   ? swap_apply_gamma_compute_pwl_pipeline_
                                                   : swap_apply_gamma_compute_256_entry_table_pipeline_;
@@ -4879,7 +4886,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             deferred_command_buffer_.CmdVkBindDescriptorSets(
                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
                 &hudless_mask_set, 0, nullptr);
-            const uint32_t hudless_mask_size[2] = {guest_output_width, guest_output_height};
+            // fh1_native_hud: the HUD comes in its own image (below), so the
+            // HUD-less image's alpha is left to the mirror glass.
+            native_hud_destination_ready =
+                native_hud_image != VK_NULL_HANDLE &&
+                vulkan_context.EnsureNativeHudImage(native_hud_width, native_hud_height);
+            const uint32_t hudless_mask_size[3] = {guest_output_width, guest_output_height,
+                                                   uint32_t(native_hud_destination_ready)};
             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hudless_mask_size),
@@ -4898,6 +4911,33 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
             vulkan_context.SetHudlessWritten();
             hudless_written = true;
+          }
+
+          // fh1_native_hud: the HUD drawn at the presentation's resolution,
+          // beside the HUD-less image it goes with.
+          if (hudless_written && native_hud_destination_ready) {
+            const VkImage native_hud_destination = vulkan_context.native_hud_image();
+            PushImageMemoryBarrier(native_hud_destination, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            SubmitBarriers(true);
+            VkImageCopy native_hud_region = {};
+            native_hud_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            native_hud_region.dstSubresource = native_hud_region.srcSubresource;
+            native_hud_region.extent = {native_hud_width, native_hud_height, 1};
+            deferred_command_buffer_.CmdVkCopyImage(
+                native_hud_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, native_hud_destination,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, native_hud_region);
+            PushImageMemoryBarrier(native_hud_destination, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            vulkan_context.SetNativeHudWritten();
           }
 
           // UP-1.3 and UP-1.4: the depth and camera motion beside it.
@@ -7751,6 +7791,18 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_native_executor_->VisEnd(vis_query);
     fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
+    // fh1_native_hud: the HUD draw again, at the presentation's resolution.
+    if ((fh1_native_executor_->IsHudDraw() || fh1_native_executor_->IsHudDepthDraw()) &&
+        fh1_native_executor_->HudLayerEnabled() &&
+        !REXCVAR_GET(fh1_debug_skip_draw_calls) && program_probe == 0) {
+      fh1_native_executor_->NoteHudLayerDraw(IssueHudLayerDraw(
+          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask,
+          !(primitive_processing_result.index_buffer_type ==
+                PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+            shader_32bit_index_dma),
+          primitive_processing_result.host_draw_vertex_count, pipeline_render_pass_key));
+    }
   }
 
   // Invalidate textures in memexported memory and watch for changes.
@@ -10226,6 +10278,107 @@ void VulkanCommandProcessor::DestroySwapFxaaSourceImage() {
   swap_fxaa_source_stage_mask_ = 0;
   swap_fxaa_source_access_mask_ = 0;
   swap_fxaa_source_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+bool VulkanCommandProcessor::IssueHudLayerDraw(
+    VulkanShader::VulkanTranslation* vertex_shader, VulkanShader::VulkanTranslation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask, bool indexed,
+    uint32_t vertex_count, VulkanRenderTargetCache::RenderPassKey draw_render_pass_key) {
+  const RegisterFile& regs = *register_file_;
+  if (normalized_color_mask & ~uint32_t(0b1111)) {
+    return false;
+  }
+  const bool depth_only = !normalized_color_mask;
+  if (!depth_only && !(normalized_color_mask & 0b0111)) {
+    return false;
+  }
+  // Only "over" blending composes into a transparent layer as premultiplied
+  // colour and coverage.
+  const auto blend =
+      regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+  // An opaque draw (ONE, ZERO) replaces the colour; its coverage is the
+  // shader's alpha, 1 for the opaque panels FM4 draws so.
+  const bool opaque = blend.color_srcblend == xenos::BlendFactor::kOne &&
+                      blend.color_destblend == xenos::BlendFactor::kZero;
+  if (!depth_only && !opaque &&
+      (blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+       blend.color_destblend != xenos::BlendFactor::kOneMinusSrcAlpha ||
+       (blend.color_srcblend != xenos::BlendFactor::kSrcAlpha &&
+        blend.color_srcblend != xenos::BlendFactor::kOne))) {
+    return false;
+  }
+  // The layer's own depth and stencil, in the draw's depth format (or the
+  // one every host has), so the guest's tests run among the HUD's draws.
+  VulkanRenderTargetCache::RenderPassKey key;
+  key.msaa_samples = xenos::MsaaSamples::k1X;
+  key.depth_and_color_used = 0b11;
+  key.depth_format = (draw_render_pass_key.depth_and_color_used & 1)
+                         ? draw_render_pass_key.depth_format
+                         : xenos::DepthRenderTargetFormat::kD24FS8;
+  key.color_0_view_format = xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT;
+  const uint32_t depth_clear = regs[XE_GPU_REG_RB_DEPTH_CLEAR];
+  const float clear_depth =
+      key.depth_format == xenos::DepthRenderTargetFormat::kD24FS8
+          ? xenos::Float20e4To32(depth_clear >> 8)
+          : float(depth_clear >> 8) * (1.0f / float(0xFFFFFF));
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  const VulkanPipelineCache::PipelineLayoutProvider* layout = nullptr;
+  void* handle = nullptr;
+  hud_layer_pass_ = true;
+  hud_layer_pass_untested_ = !(draw_render_pass_key.depth_and_color_used & 1);
+  const bool configured = pipeline_cache_->ConfigurePipeline(
+      vertex_shader, pixel_shader, primitive, normalized_depth_control, normalized_color_mask,
+      key, pipeline, layout, &handle);
+  hud_layer_pass_ = false;
+  hud_layer_pass_untested_ = false;
+  if (!configured) {
+    return false;
+  }
+  bool placeholder = false;
+  pipeline_cache_->GetPipelineAndLayoutByHandle(handle, pipeline, layout, &placeholder);
+  if (placeholder || pipeline == VK_NULL_HANDLE) {
+    return false;
+  }
+  if (!fh1_native_executor_->BeginHudLayerRendering(
+          render_target_cache_->GetDepthVulkanFormat(key.depth_format), clear_depth,
+          depth_clear & 0xFF)) {
+    return false;
+  }
+  const uint32_t render_scale =
+      std::max(texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1u, 1u);
+  const float factor = float(fh1_native_executor_->hud_layer_scale()) / float(render_scale);
+  VkViewport viewport = dynamic_viewport_;
+  viewport.x *= factor;
+  viewport.y *= factor;
+  viewport.width *= factor;
+  viewport.height *= factor;
+  VkRect2D scissor;
+  const float left = std::floor(float(dynamic_scissor_.offset.x) * factor);
+  const float top = std::floor(float(dynamic_scissor_.offset.y) * factor);
+  const float right = std::ceil(
+      float(dynamic_scissor_.offset.x + int32_t(dynamic_scissor_.extent.width)) * factor);
+  const float bottom = std::ceil(
+      float(dynamic_scissor_.offset.y + int32_t(dynamic_scissor_.extent.height)) * factor);
+  scissor.offset.x = std::max(int32_t(left), 0);
+  scissor.offset.y = std::max(int32_t(top), 0);
+  scissor.extent.width = uint32_t(std::max(right - float(scissor.offset.x), 0.0f));
+  scissor.extent.height = uint32_t(std::max(bottom - float(scissor.offset.y), 0.0f));
+  deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  deferred_command_buffer_.CmdVkSetViewport(0, 1, &viewport);
+  deferred_command_buffer_.CmdVkSetScissor(0, 1, &scissor);
+  if (indexed) {
+    deferred_command_buffer_.CmdVkDrawIndexed(vertex_count, 1, 0, 0, 0);
+  } else {
+    deferred_command_buffer_.CmdVkDraw(vertex_count, 1, 0, 0);
+  }
+  fh1_native_executor_->EndHudLayerRendering();
+  // The next draw binds its pipeline and sets its viewport and scissor again.
+  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  deferred_command_buffer_.CmdVkSetViewport(0, 1, &dynamic_viewport_);
+  deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
+  return true;
 }
 
 void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,

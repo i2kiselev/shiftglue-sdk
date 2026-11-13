@@ -404,6 +404,7 @@ bool Fh1NativeExecutor::AbsorbClear(const SurfaceKey& key, uint32_t length, uint
     }
   }
   Count(key.is_depth ? "clear_absorbed_depth" : "clear_absorbed_color");
+  if (key.is_depth) NoteHudLayerDepthClear(key.base_tiles, word);
   return true;
 }
 
