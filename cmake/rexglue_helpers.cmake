@@ -49,6 +49,10 @@ function(_rexglue_stage_fidelityfx_runtime target_name)
             _rexglue_stage_upscaler_files(${target_name} "fidelityfx/1.1.4"
                 "${REXGLUE_FFX_RUNTIME_DLL}" "${_source}/LICENSE.txt")
         endif()
+        if(REXGLUE_FIDELITYFX_RUNTIME AND REXGLUE_USE_VULKAN AND REXGLUE_FFX_SDK2_RUNTIME_DLLS)
+            _rexglue_stage_upscaler_files(${target_name} "fidelityfx/2.4.0"
+                ${REXGLUE_FFX_SDK2_RUNTIME_DLLS} "${_source}/LICENSE.txt")
+        endif()
         return()
     endif()
     if(NOT REXGLUE_FIDELITYFX_RUNTIME OR ANDROID OR NOT REXGLUE_USE_VULKAN
