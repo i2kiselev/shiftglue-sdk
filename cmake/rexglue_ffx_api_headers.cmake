@@ -13,9 +13,9 @@
 # Windows REXGLUE_FFX_RUNTIME_DLL when the signed runtime is (the game
 # stages it in upscalers/fidelityfx/1.1.4/, rexglue_helpers.cmake).
 #
-# On Windows it also fetches AMD's signed SDK 2.4.0 Vulkan runtime (the loader
-# and the upscaler DLL: FSR 4.1.2, 3.1.6 and 2.3.4) from AMD's repository and
-# sets REXGLUE_FFX_SDK2_RUNTIME_DLLS; the game stages them in
+# On Windows it also fetches AMD's signed SDK 2.4.0 Vulkan runtime (the loader,
+# the upscaler DLL: FSR 4.1.2, 3.1.6 and 2.3.4, and the frame generation DLL)
+# from AMD's repository and sets REXGLUE_FFX_SDK2_RUNTIME_DLLS; the game stages them in
 # upscalers/fidelityfx/2.4.0/, which the provider tries first. The 1.1.4
 # runtime stays as the fallback. The headers stay at 1.1.4: the provider
 # declares the one SDK 2.x descriptor it needs.
@@ -110,7 +110,8 @@ if(WIN32 AND REXGLUE_FIDELITYFX_RUNTIME AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin")
     set(_rexglue_ffx_sdk2_files
         "amd_fidelityfx_loader_vk.dll|38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9"
-        "amd_fidelityfx_upscaler_vk.dll|4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7")
+        "amd_fidelityfx_upscaler_vk.dll|4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"
+        "amd_fidelityfx_framegeneration_vk.dll|d002dabff8c5e71eaa715fc99438cd4dc81230262a7897b16bc402efec3498b4")
     set(_rexglue_ffx_sdk2_paths "")
     foreach(_entry IN LISTS _rexglue_ffx_sdk2_files)
         string(REPLACE "|" ";" _entry "${_entry}")

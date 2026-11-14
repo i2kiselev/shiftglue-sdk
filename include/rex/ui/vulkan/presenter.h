@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/frame_generation.h>
 #include <rex/ui/vulkan/instance.h>
 #include <rex/ui/vulkan/submission_tracker.h>
 #include <rex/ui/vulkan/ui_samplers.h>
@@ -497,7 +499,8 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& hdr_out, bool& ui_surface_unusable_out);
+        bool& hdr_out, bool& ui_surface_unusable_out,
+        VkSwapchainCreateInfoKHR* create_info_out = nullptr);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -606,6 +609,43 @@ class VulkanPresenter final : public Presenter {
     std::string swapchain_present_mode = "auto";
     // Per swapchain image when swapchain_hdr.
     std::vector<HdrImage> hdr_images;
+
+    // present_frame_generation: AMD's frame generation, wrapping `swapchain`
+    // while frame_generation->wraps_swapchain().
+    std::unique_ptr<VulkanFrameGeneration> frame_generation;
+    // The present_frame_generation the swapchain was connected for.
+    bool swapchain_frame_generation = false;
+    // Frame generation could not run: the rest of the session presents
+    // without it.
+    bool frame_generation_failed = false;
+    // This paint recorded the frame generation preparation.
+    bool frame_generation_prepared = false;
+    // This paint draws host UI: frame generation pauses, the HUD goes back
+    // into the frame.
+    bool frame_generation_ui_paused = false;
+    // The game's HUD as a layer for frame generation's present callback
+    // (RGBA8, straight alpha, at the swapchain's size), one image per
+    // submission in flight, the last drawn at frame_generation_hud_current;
+    // and whether the upscaled guest output it goes with holds no HUD of its
+    // own (also on repaints of that output).
+    static constexpr size_t kFrameGenerationHudImageCount = kSubmissionCount;
+    std::array<VkImage, kFrameGenerationHudImageCount> frame_generation_hud_images = {};
+    std::array<VkDeviceMemory, kFrameGenerationHudImageCount> frame_generation_hud_memories = {};
+    std::array<VkImageView, kFrameGenerationHudImageCount> frame_generation_hud_views = {};
+    std::atomic<size_t> frame_generation_hud_current{0};
+    // The present callback's copies of presented frames, in the swapchain's
+    // format (written through RGBA8 views), one per callback in flight.
+    static constexpr size_t kFrameGenerationComposeImageCount = 8;
+    std::array<VkImage, kFrameGenerationComposeImageCount> frame_generation_compose_images = {};
+    std::array<VkDeviceMemory, kFrameGenerationComposeImageCount>
+        frame_generation_compose_memories = {};
+    std::array<VkImageView, kFrameGenerationComposeImageCount> frame_generation_compose_views = {};
+    VkFormat frame_generation_compose_format = VK_FORMAT_UNDEFINED;
+    std::atomic<uint32_t> frame_generation_compose_next{0};
+    uint32_t frame_generation_hud_width = 0;
+    uint32_t frame_generation_hud_height = 0;
+    bool frame_generation_hud_in_layer = false;
+    void DestroyFrameGenerationHudLayer();
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -733,10 +773,30 @@ class VulkanPresenter final : public Presenter {
   // UP-1.2: draws the HUD over the upscale of the HUD-less copy
   // (upscale_hud_composite.cs.glsl), created on first use.
   bool EnsureUpscaleHudComposite();
+  // present_frame_generation: draws the game's HUD into frame generation's
+  // HUD layer in place of upscale_hud_composite; false if the HUD should be
+  // composited into the frame instead.
+  bool RecordFrameGenerationHudLayer(VkCommandBuffer command_buffer,
+                                     const GuestOutputImage& source, uint32_t output_width,
+                                     uint32_t output_height, uint32_t input_width,
+                                     uint32_t input_height, uint64_t submission_index);
   bool upscale_hud_composite_failed_ = false;
   VkDescriptorSetLayout upscale_hud_composite_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout upscale_hud_composite_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline upscale_hud_composite_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline upscale_hud_layer_pipeline_ = VK_NULL_HANDLE;
+  // Frame generation's present callback (its own objects: it may run on the
+  // swapchain's thread).
+  bool EnsureFrameGenerationCompose();
+  bool ComposeFrameGenerationHud(VkCommandBuffer command_buffer,
+                                 const VulkanFrameGeneration::PresentImage& back_buffer,
+                                 const VulkanFrameGeneration::PresentImage& output);
+  VkDescriptorSetLayout frame_generation_compose_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout frame_generation_compose_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline frame_generation_compose_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool frame_generation_compose_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, PaintContext::kFrameGenerationComposeImageCount>
+      frame_generation_compose_sets_ = {};
   // present_upscaler_view (upscale_debug_view.cs.glsl), same layout.
   VkPipeline upscale_debug_view_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool upscale_hud_composite_descriptor_pool_ = VK_NULL_HANDLE;
