@@ -2564,6 +2564,28 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     }
   }
 
+  // fh1_native_hud: the HUD draw again into the HUD layer (RGBA16F with its
+  // own depth and stencil, so the guest's tests stay): alpha becomes
+  // premultiplied coverage. Not stored like the inspection views.
+  if (command_processor_.hud_layer_pass()) {
+    description_out.inspection_view = 3;
+    // Without depth bound on the guest the draw's tests do nothing there.
+    if (command_processor_.hud_layer_pass_untested()) {
+      description_out.depth_write_enable = 0;
+      description_out.depth_compare_op = xenos::CompareFunction::kAlways;
+      description_out.stencil_test_enable = 0;
+    }
+    PipelineRenderTarget& target = description_out.render_targets[0];
+    target.src_alpha_blend_factor = PipelineBlendFactor::kOne;
+    target.dst_alpha_blend_factor = PipelineBlendFactor::kOneMinusSrcAlpha;
+    target.alpha_blend_op = xenos::BlendOp::kAdd;
+    // Coverage goes to alpha with the colour; a depth or stencil draw
+    // writes neither.
+    if (target.color_write_mask) {
+      target.color_write_mask = 0b1111;
+    }
+  }
+
   const auto inspection = command_processor_.inspection_view();
   if (inspection == Fh1InspectionView::kWireframe && primitive_polygonal &&
       device_properties.fillModeNonSolid) {

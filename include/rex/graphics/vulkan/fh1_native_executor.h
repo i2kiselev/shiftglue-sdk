@@ -144,6 +144,28 @@ class Fh1NativeExecutor {
   // the front buffer's 2_10_10_10_AS_10_10_10_10 view after the scene was
   // composited there this frame (menus over a game world included).
   bool IsHudDraw() const { return hud_draw_; }
+  // A draw into the HUD's target in the HUD's part of the frame that writes
+  // no colour, only depth or stencil (masks, depth resets): the HUD layer
+  // repeats it in its own depth and stencil.
+  bool IsHudDepthDraw() const { return hud_depth_draw_; }
+  // fh1_native_hud: each HUD draw is drawn again into the HUD layer, at
+  // 1280x720 times hud_layer_scale() (the presentation height over 720,
+  // rounded up), with premultiplied coverage in alpha.
+  bool HudLayerEnabled() const;
+  uint32_t hud_layer_scale() const { return hud_layer_scale_; }
+  // Ends the open rendering and begins one on the HUD layer and its own
+  // depth and stencil (`depth_format`), cleared at the frame's first HUD draw
+  // (depth and stencil to the guest's RB_DEPTH_CLEAR); false if the layer
+  // cannot be made.
+  bool BeginHudLayerRendering(VkFormat depth_format, float clear_depth, uint32_t clear_stencil);
+  void EndHudLayerRendering();
+  // At the swap: the last frame's HUD layer, in TRANSFER_SRC_OPTIMAL after
+  // the caller submits the barriers, if every HUD draw of it went into the
+  // layer; VK_NULL_HANDLE otherwise.
+  VkImage TakeHudLayer(uint32_t& width_out, uint32_t& height_out);
+  // Whether a HUD draw went into the layer: one that did not leaves the
+  // frame to the guest output's HUD.
+  void NoteHudLayerDraw(bool drawn);
   // Whether render target 0 is that HUD view now, before
   // MaybeSnapshotBeforeHud sees the draw (for its samplers).
   bool IsHudTarget() const;
@@ -577,6 +599,31 @@ class Fh1NativeExecutor {
   bool hud_snapshot_taken_ = false;
   bool hud_snapshot_ready_ = false;
   Surface hud_snapshot_;
+  Surface hud_layer_;
+  Surface hud_layer_depth_;
+  uint32_t hud_layer_scale_ = 0;
+  bool hud_layer_cleared_ = false;
+  bool hud_depth_draw_ = false;
+  // A depth clear of the guest during the frame's HUD: the layer's depth and
+  // stencil are cleared to it before its next draw.
+  bool hud_layer_depth_clear_pending_ = false;
+  uint32_t hud_layer_depth_clear_ = 0;
+  // The frame's HUD draws all went into the layer (so far / at the swap).
+  bool hud_layer_complete_ = true;
+  bool hud_layer_ready_ = false;
+  void DestroyHudLayer();
+  // Creates the layer for the presentation's size and this depth format, or
+  // keeps it; false if it cannot be made.
+  bool EnsureHudLayer(VkFormat depth_format);
+  // A depth clear of the guest (a resolve's, or a draw absorbed as one, which
+  // no surface shows until it is materialized): the HUD layer's depth starts
+  // from the frame's last one of the HUD's depth base, and takes those made
+  // between the HUD's draws.
+  void NoteHudLayerDepthClear(uint32_t base_tiles, uint32_t word);
+  bool hud_layer_last_depth_clear_valid_ = false;
+  uint32_t hud_layer_last_depth_clear_ = 0;
+  uint32_t hud_layer_last_depth_clear_base_ = 0;
+  uint32_t hud_layer_depth_clear_base_ = 0;
   void DestroyHudSnapshot();
 
   // UP-1.3 camera tracking (fh1_camera.cpp).

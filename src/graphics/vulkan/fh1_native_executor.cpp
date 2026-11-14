@@ -1,3 +1,4 @@
+#include <rex/ui/upscaler.h>
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 
 #include <algorithm>
@@ -29,6 +30,12 @@
 #include <rex/system/thread_state.h>
 #include <rex/ui/vulkan/util.h>
 
+
+REXCVAR_DEFINE_BOOL(fh1_native_hud, false, "GPU",
+                    "Draw each HUD draw a second time into a layer at the presentation's "
+                    "resolution, which the presenter puts over a temporal upscale in place of "
+                    "the upscaled HUD (native-resolution HUD)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_STRING(vulkan_shader_discovery_dir, "", "GPU/Vulkan",
                       "Local output directory for one frame's translated shaders and draws.jsonl")
@@ -3487,6 +3494,7 @@ bool Fh1NativeExecutor::Resolve(uint32_t* written_address, uint32_t* written_len
   if (resolve_info.IsClearingDepth()) {
     clear(MakeDepthKey(depth_info.depth_base, pitch_tiles, msaa, depth_info.depth_format),
           regs[XE_GPU_REG_RB_DEPTH_CLEAR], 0);
+    NoteHudLayerDepthClear(depth_info.depth_base, regs[XE_GPU_REG_RB_DEPTH_CLEAR]);
   }
   return succeeded;
 }
@@ -3497,6 +3505,11 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
   hud_scene_base_ = UINT32_MAX;
+  hud_layer_ready_ = hud_layer_cleared_ && hud_layer_complete_;
+  hud_layer_cleared_ = false;
+  hud_layer_depth_clear_pending_ = false;
+  hud_layer_last_depth_clear_valid_ = false;
+  hud_layer_complete_ = true;
   camera_depth_rows_ready_ = camera_depth_rows_;
   camera_depth_rows_ = 0;
   FinishCameraFrame();
@@ -3540,20 +3553,36 @@ bool Fh1NativeExecutor::IsHudTarget() const {
 
 void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
   hud_draw_ = false;
+  hud_depth_draw_ = false;
   if (!initialized_ || draw.memexport || !draw.rasterization_done ||
       !(draw.normalized_color_mask & 0xF)) {
+    // Depth or stencil alone into the HUD's target, after the HUD began.
+    if (initialized_ && hud_layer_cleared_ && !draw.memexport && draw.rasterization_done &&
+        !draw.normalized_color_mask &&
+        (draw.normalized_depth_control.z_write_enable ||
+         draw.normalized_depth_control.stencil_enable)) {
+      const auto rt0 =
+          register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      hud_depth_draw_ = rt0.color_base == hud_scene_base_;
+    }
     NoteCameraDraw(draw);
     return;
   }
   const auto color_info =
       register_file_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
-  if (color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+  // Once the HUD began, a draw into the front buffer through its plain
+  // 2_10_10_10 view is part of the HUD too (FM4 draws menu buttons so): it
+  // goes into the HUD layer, not the scene.
+  const bool hud_began = hud_layer_cleared_ || hud_snapshot_taken_;
+  if (color_info.color_format == xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
+      !(hud_began && color_info.color_base == hud_scene_base_)) {
     // FH1 composites the scene into the front buffer last in this format.
     hud_scene_base_ = color_info.color_base;
     NoteCameraDraw(draw);
     return;
   }
-  if (color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 ||
+  if ((color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10 &&
+       color_info.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10) ||
       color_info.color_base != hud_scene_base_) {
     NoteCameraDraw(draw);
     return;
@@ -3642,6 +3671,213 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
       surface->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hud_snapshot_.image,
       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
   Count("hud_snapshot");
+}
+
+bool Fh1NativeExecutor::HudLayerEnabled() const {
+  return initialized_ && REXCVAR_GET(fh1_native_hud);
+}
+
+bool Fh1NativeExecutor::EnsureHudLayer(VkFormat depth_format) {
+  const uint32_t presentation_height = ui::GetPresentationHeight();
+  uint32_t layer_scale = presentation_height ? (presentation_height + 719) / 720 : scale_;
+  layer_scale = std::clamp(layer_scale, 1u, 4u);
+  const uint32_t width = 1280 * layer_scale;
+  const uint32_t height = 720 * layer_scale;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  hud_layer_scale_ = layer_scale;
+  if (hud_layer_.image != VK_NULL_HANDLE &&
+      (hud_layer_.width != width || hud_layer_.height != height ||
+       hud_layer_depth_.format != depth_format)) {
+    // Earlier frames may still read it; only on a resolution change.
+    command_processor_.Fh1AwaitAllQueueOperations();
+    DestroyHudLayer();
+  }
+  if (hud_layer_.image == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    image_info.extent = {width, height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_layer_.image, hud_layer_.memory)) {
+      return false;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = hud_layer_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = image_info.format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_layer_.view) != VK_SUCCESS) {
+      DestroyHudLayer();
+      return false;
+    }
+    hud_layer_.format = image_info.format;
+    hud_layer_.width = width;
+    hud_layer_.height = height;
+    hud_layer_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // Its own depth and stencil: the HUD's 3D parts (the map, the dials) test
+    // depth among themselves, menus clip by stencil.
+    image_info.format = depth_format;
+    image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            hud_layer_depth_.image, hud_layer_depth_.memory)) {
+      DestroyHudLayer();
+      return false;
+    }
+    view_info.image = hud_layer_depth_.image;
+    view_info.format = depth_format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0,
+                                  1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &hud_layer_depth_.view) !=
+        VK_SUCCESS) {
+      DestroyHudLayer();
+      return false;
+    }
+    hud_layer_depth_.format = depth_format;
+    hud_layer_depth_.width = width;
+    hud_layer_depth_.height = height;
+    hud_layer_depth_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    REXLOG_INFO("FH1 native executor: native HUD layer {}x{} ({}x)", width, height, layer_scale);
+  }
+  hud_layer_scale_ = layer_scale;
+  return true;
+}
+
+bool Fh1NativeExecutor::BeginHudLayerRendering(VkFormat depth_format, float clear_depth,
+                                                uint32_t clear_stencil) {
+  command_processor_.EndRenderPass();
+  if (!EnsureHudLayer(depth_format)) {
+    return false;
+  }
+  const uint32_t width = hud_layer_.width;
+  const uint32_t height = hud_layer_.height;
+  const bool clear = !hud_layer_cleared_;
+  hud_layer_cleared_ = true;
+  // Clears of another depth buffer than the HUD's do not count.
+  const uint32_t hud_depth_base = register_file_.Get<reg::RB_DEPTH_INFO>().depth_base;
+  if (hud_layer_depth_clear_pending_ && hud_layer_depth_clear_base_ != hud_depth_base) {
+    hud_layer_depth_clear_pending_ = false;
+  }
+  // The frame's first HUD draw starts from the last clear of the HUD's depth.
+  if (clear && hud_layer_last_depth_clear_valid_ &&
+      hud_layer_last_depth_clear_base_ == hud_depth_base) {
+    hud_layer_depth_clear_pending_ = true;
+    hud_layer_depth_clear_ = hud_layer_last_depth_clear_;
+  }
+  const bool depth_clear = clear || hud_layer_depth_clear_pending_;
+  if (hud_layer_depth_clear_pending_) {
+    // The guest's clear value: depth in the upper 24 bits, stencil below.
+    const uint32_t value = hud_layer_depth_clear_;
+    clear_depth = depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT
+                      ? xenos::Float20e4To32(value >> 8)
+                      : float(value >> 8) * (1.0f / float(0xFFFFFF));
+    clear_stencil = value & 0xFF;
+  }
+  hud_layer_depth_clear_pending_ = false;
+  if (clear) {
+    hud_layer_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  }
+  if (depth_clear) {
+    hud_layer_depth_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  }
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  Transition(hud_layer_depth_, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+  VkRenderingAttachmentInfo color = {};
+  color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  color.imageView = hud_layer_.view;
+  color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.resolveMode = VK_RESOLVE_MODE_NONE;
+  color.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+  color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  color.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+  VkRenderingAttachmentInfo depth = {};
+  depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  depth.imageView = hud_layer_depth_.view;
+  depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  depth.resolveMode = VK_RESOLVE_MODE_NONE;
+  depth.loadOp = depth_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+  depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  depth.clearValue.depthStencil = {clear_depth, clear_stencil};
+  VkRenderingInfo info = {};
+  info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  info.renderArea.extent = {width, height};
+  info.layerCount = 1;
+  info.colorAttachmentCount = 1;
+  info.pColorAttachments = &color;
+  info.pDepthAttachment = &depth;
+  info.pStencilAttachment = &depth;
+  // An id no surface rendering has: the next draw begins its own again.
+  command_processor_.SubmitBarriersAndBeginFh1Rendering(info, UINT64_C(0x4855444C41594552));
+  return true;
+}
+
+void Fh1NativeExecutor::EndHudLayerRendering() { command_processor_.EndRenderPass(); }
+
+void Fh1NativeExecutor::NoteHudLayerDepthClear(uint32_t base_tiles, uint32_t word) {
+  hud_layer_last_depth_clear_valid_ = true;
+  hud_layer_last_depth_clear_ = word;
+  hud_layer_last_depth_clear_base_ = base_tiles;
+  // fh1_native_hud: a clear between the HUD's draws clears the layer's depth
+  // and stencil too.
+  if (hud_layer_cleared_) {
+    hud_layer_depth_clear_pending_ = true;
+    hud_layer_depth_clear_ = word;
+    hud_layer_depth_clear_base_ = base_tiles;
+  }
+}
+
+void Fh1NativeExecutor::NoteHudLayerDraw(bool drawn) {
+  Count(drawn ? "hud_layer_draw" : "hud_layer_draw_skipped");
+  if (!drawn) hud_layer_complete_ = false;
+}
+
+VkImage Fh1NativeExecutor::TakeHudLayer(uint32_t& width_out, uint32_t& height_out) {
+  const bool ready = hud_layer_ready_;
+  hud_layer_ready_ = false;
+  if (!ready || hud_layer_.image == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  Transition(hud_layer_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+             VK_ACCESS_TRANSFER_READ_BIT);
+  width_out = hud_layer_.width;
+  height_out = hud_layer_.height;
+  return hud_layer_.image;
+}
+
+void Fh1NativeExecutor::DestroyHudLayer() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hud_layer_.view);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hud_layer_.image);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hud_layer_.memory);
+  hud_layer_.width = hud_layer_.height = 0;
+  hud_layer_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hud_layer_depth_.view);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hud_layer_depth_.image);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hud_layer_depth_.memory);
+  hud_layer_depth_.width = hud_layer_depth_.height = 0;
+  hud_layer_depth_.format = VK_FORMAT_UNDEFINED;
+  hud_layer_depth_.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
 VkImageView Fh1NativeExecutor::TakeHudSnapshot(uint32_t width, uint32_t height) {

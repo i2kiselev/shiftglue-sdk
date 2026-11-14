@@ -33,6 +33,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/fm4_lighting.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -3574,6 +3575,29 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             }
           }
         }
+        // FM4's LIGHTING settings (fm4_lighting.cpp), restored after the draw.
+        std::vector<std::pair<uint32_t, uint32_t>> lighting_saved;
+        if (active_pixel_shader_) {
+          std::vector<std::pair<uint32_t, uint32_t>> lighting_patches;
+          const Shader::ConstantRegisterMap* vertex_constants =
+              active_vertex_shader_ ? &active_vertex_shader_->constant_register_map() : nullptr;
+          const Shader::ConstantRegisterMap& pixel_constants =
+              active_pixel_shader_->constant_register_map();
+          Fm4LightingPatches(active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
+                             active_pixel_shader_->ucode_data_hash(), register_file_->values,
+                             lighting_patches,
+                             vertex_constants && !vertex_constants->float_dynamic_addressing
+                                 ? vertex_constants->float_bitmap
+                                 : nullptr,
+                             pixel_constants.float_dynamic_addressing
+                                 ? nullptr
+                                 : pixel_constants.float_bitmap);
+          for (const auto& [lighting_register, lighting_value] : lighting_patches) {
+            lighting_saved.emplace_back(lighting_register,
+                                        register_file_->values[lighting_register]);
+            WriteRegister(lighting_register, lighting_value);
+          }
+        }
         const auto& [vs_constant_hash, vs_constant_index, vs_constant_value] = vs_constant;
         const bool override_vs_constant = vs_constant_hash && active_vertex_shader_ &&
                                           active_vertex_shader_->ucode_data_hash() == vs_constant_hash;
@@ -3601,6 +3625,9 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
           for (uint32_t i = 0; i < 4; ++i) {
             WriteRegister(saved->first + i, saved->second[i]);
           }
+        }
+        for (auto saved = lighting_saved.rbegin(); saved != lighting_saved.rend(); ++saved) {
+          WriteRegister(saved->first, saved->second);
         }
         if (override_vs_constant) {
           for (uint32_t i = 0; i < 4; ++i) {
