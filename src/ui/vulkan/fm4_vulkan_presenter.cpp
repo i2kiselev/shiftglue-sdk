@@ -29,6 +29,7 @@ REXCVAR_DEFINE_BOOL(vulkan_present_via_dxgi, false, "UI/Vulkan",
                     "immediate to tearing, mailbox to no vsync without tearing, else vsync")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(bool, present_hdr);
+REXCVAR_DECLARE(bool, present_frame_generation);
 #endif
 
 namespace rex::ui::vulkan {
@@ -88,11 +89,23 @@ bool VulkanPresenter::ConnectDxgiSwapchain(Surface& surface, uint32_t width, uin
   paint_context_.hwnd = hwnd;
   // HDR output needs the Vulkan swapchain's color spaces, and Resize keeps the
   // present mode the DXGI swapchain was made for.
-  if (paint_context_.dxgi_swapchain && (REXCVAR_GET(present_hdr) || present_mode_changed)) {
+  // Frame generation replaces the Vulkan swapchain, so it presents without DXGI.
+  const bool frame_generation = REXCVAR_GET(present_frame_generation) &&
+                                !paint_context_.frame_generation_failed;
+  if (paint_context_.dxgi_swapchain &&
+      (REXCVAR_GET(present_hdr) || present_mode_changed || frame_generation)) {
     paint_context_.DestroySwapchainAndVulkanSurface();
   }
+  // Once HDR presented through the Vulkan swapchain, a DXGI swapchain on the same window
+  // stalled for seconds and then failed to resize its buffers (E_OUTOFMEMORY) when HDR was
+  // turned off: the Vulkan swapchain stays for the rest of the session.
+  if (REXCVAR_GET(present_hdr) && win32_surface && !paint_context_.dxgi_swapchain_failed) {
+    REXLOG_INFO("VulkanPresenter: HDR presents through the Vulkan swapchain, which stays for "
+                "the rest of the session");
+    paint_context_.dxgi_swapchain_failed = true;
+  }
   if (!REXCVAR_GET(vulkan_present_via_dxgi) || REXCVAR_GET(present_hdr) ||
-      paint_context_.dxgi_swapchain_failed || !win32_surface) {
+      paint_context_.dxgi_swapchain_failed || !win32_surface || frame_generation) {
     return false;
   }
   bool connected;

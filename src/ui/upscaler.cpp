@@ -45,11 +45,20 @@ const char* GetUpscalerModeName(UpscalerMode mode) {
 
 namespace {
 std::atomic<bool> temporal_upscaler_active = false;
+std::atomic<uint32_t> presentation_height = 0;
 std::atomic<float> temporal_upscaler_mip_bias = 0.0f;
 }  // namespace
 
 bool IsTemporalUpscalerActive() {
   return temporal_upscaler_active.load(std::memory_order_relaxed);
+}
+
+uint32_t GetPresentationHeight() {
+  return presentation_height.load(std::memory_order_relaxed);
+}
+
+void SetPresentationHeight(uint32_t height) {
+  presentation_height.store(height, std::memory_order_relaxed);
 }
 
 void SetTemporalUpscalerActive(bool active) {

@@ -7,20 +7,16 @@
 // the PQ curve) where the swapchain is HDR10. The
 // stand-in's alpha is how much of the pixel is UI: the HUD of the guest output
 // and the host UI stay at the paper white, and only the scene's highlights
-// are expanded towards the highlight peak.
+// (FM4's HDR map or HDR scene, fh1_hdr_gain.cpp) go towards the highlight peak.
 
 layout(push_constant) uniform HdrOutputConstants {
   // After the rectangle constants of the vertex shader.
   layout(offset = 16) float paper_white_scale;  // Paper white nits / 80.
-  float highlight_scale;  // Highlight peak / paper white - 1, 0 for none.
-  float knee;             // Brightness where the expansion starts.
-  float knee_range_inv;   // 1 / (1 - knee).
+  float reserved0[3];
   // 0 decodes the stand-in as piecewise sRGB, otherwise as this power, as an
   // SDR display with that gamma would show it.
   float gamma;
-  // The brightness the expansion follows: 0 is the luminance, 1 the largest
-  // channel, so that saturated lights (red brake lights) expand too.
-  float max_channel_weight;
+  float reserved1;
   // Pixels left of it show the SDR image as Windows composes SDR content
   // (piecewise sRGB at the paper white), with a divider; negative for none.
   float compare_x;
@@ -32,6 +28,19 @@ layout(push_constant) uniform HdrOutputConstants {
   // to rotated stand-in pixels.
   uint output_flags;
   vec2 size;  // The stand-in's (unrotated) size.  // The swapchain's size, for the patterns.
+  // present_hdr_native: where the guest output is in the stand-in, and whether its HDR map
+  // (fh1_hdr_gain.cpp: per channel, hdr = (sdr + a) * rgb - a) brightens the scene.
+  vec2 gain_offset;
+  vec2 gain_size_inv;
+  uint gain_enabled;
+  // The upscale holds the HDR scene (rex/ui/vulkan/hdr_scene_encoding.h): per channel, the
+  // SDR brightness up to the knee, then a logarithm up to the peak (both over paper white).
+  uint scene_encoded;
+  float scene_knee;
+  float scene_peak;
+  float scene_log_scale;
+  // present_hdr_shadow_lift: 2^stops - 1, the deepest shadows' extra gain (0 for none).
+  float shadow_lift;
 } constants;
 
 const uint kOutputPq = 1u;
@@ -39,6 +48,8 @@ const uint kRotationShift = 1u;
 const uint kRotationNone = 0u;
 const uint kRotation90 = 1u;
 const uint kRotation270 = 2u;
+// Bit 3: present_hdr_debug_nits, the picture's brightness in bands of colour.
+const uint kOutputNitsBands = 8u;
 
 const uint kPatternNone = 0u;
 const uint kPatternBlack = 1u;
@@ -46,6 +57,8 @@ const uint kPatternPaperWhite = 2u;
 const uint kPatternPeak = 3u;
 
 layout(set = 0, binding = 0) uniform texture2D stand_in;
+layout(set = 1, binding = 0) uniform texture2D gain_map;
+layout(set = 1, binding = 1) uniform sampler gain_sampler;
 
 layout(location = 0) out vec4 output_color;
 
@@ -135,6 +148,42 @@ vec3 Pattern(vec2 pixel) {
   return vec3(0.0);
 }
 
+// present_hdr_debug_nits: grey below 100 nits, then blue to 200, green to 400, yellow to
+// 600, orange to 800 and red above, each band's brightness rising within it; the UI as is.
+vec3 NitsBands(vec3 scrgb, float ui) {
+  float nits = max3(scrgb) * 80.0;
+  vec3 band;
+  float t;
+  if (nits < 100.0) {
+    band = vec3(1.0); t = nits / 100.0;
+  } else if (nits < 200.0) {
+    band = vec3(0.2, 0.4, 1.0); t = (nits - 100.0) / 100.0;
+  } else if (nits < 400.0) {
+    band = vec3(0.2, 1.0, 0.3); t = (nits - 200.0) / 200.0;
+  } else if (nits < 600.0) {
+    band = vec3(1.0, 1.0, 0.2); t = (nits - 400.0) / 200.0;
+  } else if (nits < 800.0) {
+    band = vec3(1.0, 0.5, 0.1); t = (nits - 600.0) / 200.0;
+  } else {
+    band = vec3(1.0, 0.1, 0.1); t = clamp((nits - 800.0) / 400.0, 0.0, 1.0);
+  }
+  // At most 100 nits, so the bands read the same on any display.
+  vec3 shown = band * (0.25 + 0.75 * t) * (100.0 / 80.0);
+  return mix(shown, scrgb, ui);
+}
+
+// The HDR scene's brightness (1 = paper white) from its encoded brightness.
+vec3 DecodeScene(vec3 e) {
+  float k = constants.scene_knee;
+  if (constants.scene_peak <= 1.0) {
+    return e;
+  }
+  float l = constants.scene_log_scale;
+  float span = log(1.0 + (constants.scene_peak - k) * l);
+  vec3 above = k + (exp(clamp((e - k) / (1.0 - k), 0.0, 1.0) * span) - 1.0) / l;
+  return mix(e, above, greaterThan(e, vec3(k)));
+}
+
 // The stand-in pixel a swapchain pixel shows.
 ivec2 StandInPixel(ivec2 pixel) {
   ivec2 size = ivec2(constants.size);
@@ -166,16 +215,39 @@ void main() {
   if (constants.gamma > 0.0) {
     linear = pow(SrgbEncode(linear), vec3(constants.gamma));
   }
-  float luminance = dot(linear, vec3(0.2126, 0.7152, 0.0722));
-  float brightness = mix(luminance, max3(linear), constants.max_channel_weight);
-  float t = clamp((brightness - constants.knee) * constants.knee_range_inv, 0.0, 1.0);
-  // Smooth from the knee, reaching the peak at SDR white. Scaling all three
-  // channels together keeps the hue.
-  float boost = 1.0 + constants.highlight_scale * t * t * (1.0 - ui);
-  vec3 color = linear * (constants.paper_white_scale * boost);
+  // Without the frame's HDR scene or map (menus, the showroom), the SDR picture at the paper
+  // white.
+  vec3 scene = linear;
+  if (constants.scene_encoded != 0u) {
+    // The HUD and host UI stay at the paper white; their blends decode the SDR way.
+    scene = mix(DecodeScene(linear), linear, ui);
+  } else if (constants.gain_enabled != 0u) {
+    vec2 uv = (frag - constants.gain_offset) * constants.gain_size_inv;
+    vec3 hdr = linear;
+    if (all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+      // The gain map (fh1_hdr_gain.cpp; a = 0 there).
+      vec4 map = texture(sampler2D(gain_map, gain_sampler), uv);
+      hdr = max((linear + map.a) * map.rgb - map.a, vec3(0.0));
+    }
+    // The HUD and host UI stay at the paper white.
+    scene = mix(hdr, linear, ui);
+  }
+  if (constants.shadow_lift > 0.0) {
+    // The deepest shadows up to 2^stops brighter, fading out above a pivot of 1 % of the paper
+    // white: mid grey moves a few percent, the highlights not at all, so the picture keeps
+    // its contrast (unlike a lower gamma). Monotonic; one gain for the three channels keeps
+    // the hue. The HUD and host UI stay as they are.
+    const float kPivot = 0.01;
+    float y = max(dot(scene, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+    scene *= 1.0 + constants.shadow_lift * (kPivot / (kPivot + y)) * (1.0 - ui);
+  }
+  vec3 color = scene * constants.paper_white_scale;
   if (constants.pattern != kPatternNone) {
     // The pattern replaces the image; the menu stays on top of it.
     color = mix(Pattern(frag), linear * constants.paper_white_scale, ui);
+  }
+  if ((constants.output_flags & kOutputNitsBands) != 0u) {
+    color = NitsBands(color, ui);
   }
   output_color = Output(color);
 }
