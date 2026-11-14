@@ -314,6 +314,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // The label of the next FH1 rendering begun (a string literal), instead of
   // the one its id implies.
   void SetNextRenderingLabel(const char* label) { next_rendering_label_ = label; }
+  // fh1_native_hud: ConfigurePipeline describes the HUD layer's variant.
+  bool hud_layer_pass() const { return hud_layer_pass_; }
+  // The HUD draw has no depth and stencil bound on the guest, so its tests
+  // do nothing there: none in the layer either.
+  bool hud_layer_pass_untested() const { return hud_layer_pass_untested_; }
   bool IsFh1RenderingOpen(uint64_t id) const {
     return in_render_pass_ && id && current_fh1_rendering_id_ == id;
   }
@@ -519,6 +524,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   void RecordCheckpoint(CheckpointKind kind, uint32_t value, std::string_view detail);
   void RecordNoteCheckpoint(std::string_view detail);
   bool checkpoints_enabled_ = false;
+  // fh1_native_hud: set while ConfigurePipeline makes the HUD layer variant.
+  bool hud_layer_pass_ = false;
+  bool hud_layer_pass_untested_ = false;
+  // fh1_native_hud: the HUD draw just recorded, again into the HUD layer;
+  // false if it cannot go there.
+  bool IssueHudLayerDraw(VulkanShader::VulkanTranslation* vertex_shader,
+                                VulkanShader::VulkanTranslation* pixel_shader,
+                                const PrimitiveProcessor::ProcessingResult& primitive,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask, bool indexed,
+                                uint32_t vertex_count,
+                                VulkanRenderTargetCache::RenderPassKey draw_render_pass_key);
   // What each recent checkpoint serial was, for the device-loss report.
   struct CheckpointRecord {
     uint64_t serial = 0;

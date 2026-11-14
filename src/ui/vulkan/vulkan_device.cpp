@@ -32,6 +32,11 @@
 #include <rex/ui/vulkan/device.h>
 #include <rex/ui/vulkan/upscaler.h>
 
+REXCVAR_DEFINE_BOOL(vulkan_frame_generation_queues, true, "UI/Vulkan",
+                    "Create the spare queues AMD's frame generation swapchain presents and "
+                    "composes on (present_frame_generation needs them)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_diagnostic_checkpoints, false, "UI/Vulkan",
                     "Diagnostics: on NVIDIA, mark draws, copies, texture loads and executor "
                     "passes with VK_NV_device_diagnostic_checkpoints and log the last ones the "
@@ -538,6 +543,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // AMD's FidelityFX SDK 2.x runtime declares it in its upscalers' compute
     // shaders, FSR 2 and 3 included.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_compute_shader_derivatives)
+    // FidelityFX SDK 2.x frame generation's shaders use 64-bit integer atomics
+    // on storage images.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_image_atomic_int64)
   }
 
 #undef XE_UI_VULKAN_STRUCT_EXTENSION
@@ -609,6 +617,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 
+  VulkanFeatures<VkPhysicalDeviceVulkan11Features,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
+      features_1_1;
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
@@ -662,6 +673,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR>
       features_KHR_compute_shader_derivatives;
+  VulkanFeatures<VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_IMAGE_ATOMIC_INT64_FEATURES_EXT>
+      features_EXT_shader_image_atomic_int64;
   VulkanFeatures<VkPhysicalDeviceFaultFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT>
       features_EXT_device_fault;
@@ -671,6 +685,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      // VkPhysicalDeviceVulkan11Features may be chained only from Vulkan 1.2.
+      features_1_1.Link(supported_features_2, device_create_info);
       features_1_2.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
@@ -736,6 +752,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_KHR_compute_shader_derivatives) {
       features_KHR_compute_shader_derivatives.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_shader_image_atomic_int64) {
+      features_EXT_shader_image_atomic_int64.Link(supported_features_2, device_create_info);
     }
     if (device->extensions_.ext_EXT_device_fault) {
       features_EXT_device_fault.Link(supported_features_2, device_create_info);
@@ -850,6 +869,56 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
+  }
+
+  // Spare queues for AMD's frame generation swapchain: a second queue that can
+  // present (and copy), one for async compute and one for image acquisition.
+  // New indices only, so nothing else in the SDK uses them.
+  if (with_swapchain && REXCVAR_GET(vulkan_frame_generation_queues)) {
+    auto reserve = [&](uint32_t family) -> QueueSlot {
+      QueueFamily& queue_family = device->queue_families_[family];
+      if (queue_family.queues.size() >= queue_families[family].queueCount) {
+        return {};
+      }
+      QueueSlot slot;
+      slot.family = family;
+      slot.index = uint32_t(queue_family.queues.size());
+      queue_family.queues.resize(queue_family.queues.size() + 1);
+      return slot;
+    };
+    const uint32_t graphics_family = device->queue_family_graphics_compute_;
+    FrameGenerationQueues& fg = device->frame_generation_queues_;
+    if (device->queue_families_[graphics_family].may_support_presentation) {
+      fg.present = reserve(graphics_family);
+    }
+    for (uint32_t family = 0; !fg.present.valid() && family < queue_family_count; ++family) {
+      if (family != graphics_family && device->queue_families_[family].may_support_presentation &&
+          (queue_families[family].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT))) {
+        fg.present = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.async_compute.valid() && family < queue_family_count; ++family) {
+      const VkQueueFlags flags = queue_families[family].queueFlags;
+      if ((flags & VK_QUEUE_COMPUTE_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT)) {
+        fg.async_compute = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.image_acquire.valid() && family < queue_family_count; ++family) {
+      const VkQueueFlags flags = queue_families[family].queueFlags;
+      if (!(flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) {
+        fg.image_acquire = reserve(family);
+      }
+    }
+    for (uint32_t family = 0; !fg.image_acquire.valid() && family < queue_family_count; ++family) {
+      fg.image_acquire = reserve(family);
+    }
+    if (!fg.async_compute.valid()) {
+      fg.async_compute = reserve(graphics_family);
+    }
+    REXLOG_INFO(
+        "Vulkan frame generation queues: present {}:{}, async compute {}:{}, image acquire {}:{}",
+        int32_t(fg.present.family), fg.present.index, int32_t(fg.async_compute.family),
+        fg.async_compute.index, int32_t(fg.image_acquire.family), fg.image_acquire.index);
   }
 
   size_t max_enabled_queues_per_family = 0;
@@ -1048,6 +1117,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // FidelityFX creates shaders with 16-bit types on devices that support them.
     features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
     enabled_features.shaderInt16 = supported_features.shaderInt16;
+    // FidelityFX SDK 2.x: 16-bit storage buffer members (FSR 4), the Vulkan
+    // memory model (FSR 4) and 64-bit integers (frame generation's image
+    // atomics), where the device supports them.
+    features_1_1.enabled.storageBuffer16BitAccess = features_1_1.supported.storageBuffer16BitAccess;
+    features_1_2.enabled.vulkanMemoryModel = features_1_2.supported.vulkanMemoryModel;
+    features_1_2.enabled.vulkanMemoryModelDeviceScope =
+        features_1_2.supported.vulkanMemoryModelDeviceScope;
+    enabled_features.shaderInt64 = supported_features.shaderInt64;
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
@@ -1148,6 +1225,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_KHR_compute_shader_derivatives) {
     XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupQuads)
     XE_UI_VULKAN_FEATURE_2(features_KHR_compute_shader_derivatives, computeDerivativeGroupLinear)
+  }
+  if (device->extensions_.ext_EXT_shader_image_atomic_int64) {
+    features_EXT_shader_image_atomic_int64.enabled.shaderImageInt64Atomics =
+        features_EXT_shader_image_atomic_int64.supported.shaderImageInt64Atomics;
   }
   if (device->extensions_.ext_EXT_device_fault) {
     XE_UI_VULKAN_FEATURE_2(features_EXT_device_fault, deviceFault)
