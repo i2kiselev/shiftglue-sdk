@@ -122,6 +122,12 @@ void InputSystem::SetKeyboardStateFilter(
   keyboard_state_filter_ = std::move(filter);
 }
 
+void InputSystem::SetPadStateFilter(
+    std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& gamepad)> filter) {
+  std::lock_guard<std::mutex> lock(devices_mutex_);
+  pad_state_filter_ = std::move(filter);
+}
+
 void InputSystem::RefreshDevices() {
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
@@ -386,6 +392,9 @@ X_RESULT InputSystem::GetMergedState(uint32_t user_index, bool host_pads_only,
       ApplyPadChord(g_pad_chord_game_menu, REXCVAR_GET(pad_chord_game_menu), user_index,
                     state.gamepad);
       ApplyPadRemap(state.gamepad);
+      if (pad_state_filter_) {
+        pad_state_filter_(user_index, state.gamepad);
+      }
     }
     if (!host_pads_only && driver->is_keyboard_and_mouse() && keyboard_state_filter_) {
       keyboard_state_filter_(user_index, state.gamepad);

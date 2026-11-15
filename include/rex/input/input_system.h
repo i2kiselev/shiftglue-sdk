@@ -54,6 +54,10 @@ class InputSystem : public system::IInputSystem {
   /// the pads (FM4's smoothed keyboard driving).
   void SetKeyboardStateFilter(std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& gamepad)>
                                   filter);
+  /// The same for each controller state the title reads, after the remap and
+  /// before the merge (FM4: D-pad up/down off the pad while it steers).
+  void SetPadStateFilter(std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& gamepad)>
+                             filter);
 
   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
@@ -114,6 +118,7 @@ class InputSystem : public system::IInputSystem {
 
   std::function<bool()> active_callback_;
   std::function<void(uint32_t, X_INPUT_GAMEPAD&)> keyboard_state_filter_;
+  std::function<void(uint32_t, X_INPUT_GAMEPAD&)> pad_state_filter_;
 
   // DualSense feedback, per guest user.
   std::array<dualsense::TriggerModel, kMaxGuestUsers> trigger_models_;
