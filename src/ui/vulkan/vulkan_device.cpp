@@ -609,6 +609,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 
+  VulkanFeatures<VkPhysicalDeviceVulkan11Features,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
+      features_1_1;
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
@@ -671,6 +674,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      // VkPhysicalDeviceVulkan11Features may be chained only from Vulkan 1.2.
+      features_1_1.Link(supported_features_2, device_create_info);
       features_1_2.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
@@ -1048,6 +1053,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // FidelityFX creates shaders with 16-bit types on devices that support them.
     features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
     enabled_features.shaderInt16 = supported_features.shaderInt16;
+    // FSR 4 (FidelityFX SDK 2.x): 16-bit storage buffer members and the Vulkan
+    // memory model, where the device supports them.
+    features_1_1.enabled.storageBuffer16BitAccess = features_1_1.supported.storageBuffer16BitAccess;
+    features_1_2.enabled.vulkanMemoryModel = features_1_2.supported.vulkanMemoryModel;
+    features_1_2.enabled.vulkanMemoryModelDeviceScope =
+        features_1_2.supported.vulkanMemoryModelDeviceScope;
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
       XE_UI_VULKAN_FEATURE_IMPLIED(samplerMirrorClampToEdge)
