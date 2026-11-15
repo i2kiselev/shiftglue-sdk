@@ -66,9 +66,11 @@ struct SaveMount {
   File* Open(const char* path, FileDisposition disposition, bool directory = false) {
     File* file = nullptr;
     FileAction action;
+    // POSIX refuses write access to a directory (EISDIR); a guest deleting one asks for none.
+    const uint32_t access =
+        directory ? FileAccess::kGenericRead : FileAccess::kGenericRead | FileAccess::kGenericWrite;
     auto status =
-        vfs.OpenFile(nullptr, path, disposition, FileAccess::kGenericRead | FileAccess::kGenericWrite,
-                     directory, !directory, &file, &action);
+        vfs.OpenFile(nullptr, path, disposition, access, directory, !directory, &file, &action);
     REQUIRE(status == X_STATUS_SUCCESS);
     REQUIRE(file != nullptr);
     return file;
