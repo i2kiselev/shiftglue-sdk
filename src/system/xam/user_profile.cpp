@@ -52,9 +52,10 @@ std::string UserProfile::SanitizeGamertag(std::string_view requested) {
 
 uint64_t UserProfile::ParseXuid(std::string_view requested) {
   constexpr uint64_t kDefault = 0xB13EBABEBABEBABE;
-  // Accept exactly 16 hex digits, optionally prefixed with 0x. Zero and XUIDs
-  // carrying the 0x00C0000000000000 bits (refused by titles, see below) fall
-  // back to the default rather than locking the player out.
+  // Accept exactly 16 hex digits, optionally prefixed with 0x. Zero falls back
+  // to the default. XUIDs carrying the 0x00C0000000000000 bits are kept with a
+  // warning: one title refuses them (see below), but a console profile can carry
+  // them, and a title ties its saves to the profile that made them.
   if (requested.size() == 18 && requested[0] == '0' && (requested[1] == 'x' || requested[1] == 'X')) {
     requested.remove_prefix(2);
   }
@@ -74,9 +75,13 @@ uint64_t UserProfile::ParseXuid(std::string_view requested) {
     }
     value = (value << 4) | digit;
   }
-  if (!value || (value & 0x00C0000000000000ull)) {
-    REXSYS_WARN("user_xuid {:016X} is not a usable offline XUID; using the default", value);
+  if (!value) {
+    REXSYS_WARN("user_xuid must not be zero; using the default");
     return kDefault;
+  }
+  if (value & 0x00C0000000000000ull) {
+    REXSYS_WARN("user_xuid {:016X} carries the 0x00C0000000000000 bits, which some titles refuse",
+                value);
   }
   return value;
 }
