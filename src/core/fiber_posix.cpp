@@ -247,9 +247,12 @@ void Fiber::SwitchTo(Fiber* target) {
 #endif  // REX_FIBER_STACK_SWITCH
 
 void Fiber::Destroy() {
-  // Thread fibers are destroyed from the owning thread itself.
+  // ~XThread runs on whichever host thread drops the last reference, so a thread fiber can be
+  // destroyed from another thread: only clear the current fiber if it is this one.
   if (is_thread_fiber_) {
-    tls_current_ = nullptr;
+    if (tls_current_ == this) {
+      tls_current_ = nullptr;
+    }
   } else {
     assert(this != tls_current_ && "Destroy called on the currently running fiber");
   }
