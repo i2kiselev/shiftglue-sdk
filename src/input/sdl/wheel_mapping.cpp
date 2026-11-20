@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstdlib>
 
 #include <rex/input/pad_remap.h>
@@ -437,9 +438,35 @@ int64_t ApplyGain(int64_t value, uint32_t gain, int strength_percent) {
 
 }  // namespace
 
+int16_t CentreCurve(int16_t level, int centre_percent) {
+  if (centre_percent <= 0 || level == 0) {
+    return level;
+  }
+  const double x = std::min(std::abs(int32_t(level)), 32767) / 32767.0;
+  const double g = 3.0 * std::min(centre_percent, 100) / 100.0;
+  const double y = x * (1.0 + g * (1.0 - x) * (1.0 - x));
+  const auto magnitude = static_cast<int16_t>(std::min<long>(std::lround(y * 32767.0), 32767));
+  return level < 0 ? static_cast<int16_t>(-magnitude) : magnitude;
+}
+
+int16_t LimitForceStep(int16_t target, int16_t previous, int jolt_percent) {
+  if (jolt_percent <= 0) {
+    return target;
+  }
+  const int32_t max_step = 32767 * (100 - std::min(jolt_percent, 100) * 4 / 5) / 100;
+  const int32_t step = int32_t(target) - int32_t(previous);
+  if (std::abs(step) <= max_step) {
+    return target;
+  }
+  return static_cast<int16_t>(step > 0 ? previous + max_step : previous - max_step);
+}
+
 int16_t EffectConstantLevel(const xinputd_ffb::Effect& effect, const WheelEffectScale& scale) {
   int64_t level = ScaleSigned(effect.magnitude, scale.magnitude_max, 32767);
   level = ApplyGain(level, effect.gain, 100);
+  level = std::clamp<int64_t>(level * std::clamp(scale.constant_percent, 0, 200) / 100, -32767,
+                              32767);
+  level = CentreCurve(static_cast<int16_t>(level), scale.centre_percent);
   if (level != 0 && scale.min_force_percent > 0) {
     const int64_t floor = int64_t(32767) * std::clamp(scale.min_force_percent, 0, 100) / 100;
     const int64_t magnitude = floor + std::abs(level) * (32767 - floor) / 32767;

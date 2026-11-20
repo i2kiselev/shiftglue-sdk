@@ -234,6 +234,7 @@ class SDLInputDriver final : public InputDriver,
     bool dirty = false;       // an update waits for the rate limit
     uint64_t applied_ms = 0;  // when it was last sent to the wheel
     xinputd_ffb::Effect sent;  // what was last sent, for the felt-step check
+    int16_t last_level = 0;    // the constant force last sent, for the jolt limiter
   };
   WheelEffectScale EffectScaleLocked() const;
   bool GameEffectsEnabled() const;

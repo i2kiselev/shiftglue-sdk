@@ -352,3 +352,40 @@ TEST_CASE("Minimum force lifts small constant forces; condition gains scale coef
   cs.condition_percent = 0;
   CHECK(EffectCondition(spring, cs).right_coeff == 0);
 }
+
+TEST_CASE("Centre curve lifts small forces smoothly", "[input][wheel][ffb]") {
+  CHECK(CentreCurve(1548, 100) == 5764);
+  CHECK(CentreCurve(1548, 50) == 3656);
+  CHECK(CentreCurve(-1548, 100) == -5764);
+  CHECK(CentreCurve(16384, 100) == 28671);
+  CHECK(CentreCurve(32767, 100) == 32767);
+  CHECK(CentreCurve(1548, 0) == 1548);
+  CHECK(CentreCurve(0, 100) == 0);
+}
+
+TEST_CASE("Jolt limiter only touches large steps", "[input][wheel][ffb]") {
+  CHECK(LimitForceStep(30000, 0, 0) == 30000);
+  CHECK(LimitForceStep(30000, 0, 100) == 6553);
+  CHECK(LimitForceStep(-30000, 0, 100) == -6553);
+  CHECK(LimitForceStep(30000, 0, 50) == 19660);
+  CHECK(LimitForceStep(3000, 0, 100) == 3000);
+  CHECK(LimitForceStep(9000, 6000, 100) == 9000);
+}
+
+TEST_CASE("Steering weight and centre apply before strength", "[input][wheel][ffb]") {
+  xinputd_ffb::Effect e;
+  e.type = xinputd_ffb::kConstant;
+  e.gain = 255;
+  e.magnitude = 6;
+  WheelEffectScale s;
+  s.magnitude_max = 127;
+  s.strength_percent = 100;
+  CHECK(EffectConstantLevel(e, s) == 1548);
+  s.centre_percent = 100;
+  CHECK(EffectConstantLevel(e, s) == 5764);
+  s.centre_percent = 0;
+  s.constant_percent = 200;
+  CHECK(EffectConstantLevel(e, s) == 3096);
+  s.constant_percent = 0;
+  CHECK(EffectConstantLevel(e, s) == 0);
+}

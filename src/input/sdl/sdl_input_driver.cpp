@@ -145,6 +145,16 @@ REXCVAR_DEFINE_INT32(wheel_ffb_min_force, 0, "Input",
                      "get past a geared or belted wheel's friction (a direct-drive base needs 0)")
     .range(0, 30)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(wheel_ffb_constant, 100, "Input", "The title's steering force, in percent")
+    .range(0, 200)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(wheel_ffb_centre, 0, "Input",
+                     "Lifts small steering forces on a smooth curve")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(wheel_ffb_jolt, 0, "Input", "Limits single-update force jumps; 0 off")
+    .range(0, 100)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(wheel_ffb_spring, 100, "Input",
                      "Strength in percent of the title's centring spring effect")
     .range(0, 200)
@@ -1534,6 +1544,7 @@ void SDLInputDriver::CloseWheelHapticLocked(WheelState& wheel) {
     }
     game.sdl_id = -1;
     game.sdl_running = false;
+    game.last_level = 0;
   }
   if (wheel.rumble_effect >= 0) {
     SDL_DestroyHapticEffect(wheel.haptic, wheel.rumble_effect);
@@ -2006,6 +2017,8 @@ WheelEffectScale SDLInputDriver::EffectScaleLocked() const {
   // (pinyon-shift PR #605 found the same on a Thrustmaster T248).
   scale.invert = !REXCVAR_GET(wheel_ffb_invert);
   scale.min_force_percent = REXCVAR_GET(wheel_ffb_min_force);
+  scale.constant_percent = REXCVAR_GET(wheel_ffb_constant);
+  scale.centre_percent = REXCVAR_GET(wheel_ffb_centre);
   return scale;
 }
 
@@ -2014,6 +2027,7 @@ void SDLInputDriver::StopGameEffectLocked(GameEffect& game) {
     SDL_StopHapticEffect(wheel_->haptic, game.sdl_id);
   }
   game.sdl_running = false;
+  game.last_level = 0;
 }
 
 void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
@@ -2036,13 +2050,16 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
     return;
   }
   WheelEffectScale scale = EffectScaleLocked();
+  bool limited = false;
   SDL_HapticEffect effect;
   SDL_zero(effect);
   if (e.type == xinputd_ffb::kConstant) {
     effect.type = SDL_HAPTIC_CONSTANT;
     effect.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
     effect.constant.length = SDL_HAPTIC_INFINITY;
-    effect.constant.level = EffectConstantLevel(e, scale);
+    const int16_t target = EffectConstantLevel(e, scale);
+    effect.constant.level = LimitForceStep(target, game.last_level, REXCVAR_GET(wheel_ffb_jolt));
+    limited = effect.constant.level != target;
     ffb_trace::NoteWheelOutput(effect.constant.level, "effects");
   } else {
     if (scale.saturation_max <= 0) {
@@ -2089,9 +2106,13 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
   } else if (!SDL_UpdateHapticEffect(haptic, game.sdl_id, &effect)) {
     return;
   }
-  game.dirty = false;
+  // A limited jump goes on in steps at the next flushes until it reaches the title's force.
+  game.dirty = limited;
   game.applied_ms = SDL_GetTicks();
   game.sent = e;
+  if (e.type == xinputd_ffb::kConstant) {
+    game.last_level = effect.constant.level;
+  }
   if (game.running && !game.sdl_running) {
     game.sdl_running = SDL_RunHapticEffect(haptic, game.sdl_id, 1);
   } else if (!game.running && game.sdl_running) {
@@ -2200,6 +2221,7 @@ void SDLInputDriver::SetEffect(const xinputd_ffb::Effect& effect) {
     SDL_DestroyHapticEffect(wheel_->haptic, game.sdl_id);
     game.sdl_id = -1;
     game.sdl_running = false;
+    game.last_level = 0;
   }
   game.effect = effect;
   game.unsupported = false;

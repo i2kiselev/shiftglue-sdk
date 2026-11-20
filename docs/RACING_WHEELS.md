@@ -85,6 +85,9 @@ gate held the wheel is in neutral.
 | `wheel_ffb_effects` | `true` | Play the title's own XInputdFF effects. |
 | `wheel_ffb_strength` | `25` | Overall strength in percent; start low on a direct-drive base. |
 | `wheel_ffb_invert` | `false` | Reverse the force direction. |
+| `wheel_ffb_constant` | `100` | The title's steering force, in percent (0 to 200). |
+| `wheel_ffb_centre` | `0` | Lifts small steering forces on a smooth curve (0 to 100), so the wheel's centre is not empty; full force stays full. |
+| `wheel_ffb_jolt` | `0` | Limits single-update force jumps (gear changes, landings) to a few updates; smaller steps pass untouched. `0` is off. |
 | `wheel_ffb_min_force` | `0` | Lift any non-zero force to at least this percent, for geared or belted wheels. |
 | `wheel_ffb_spring`, `_damper`, `_friction`, `_inertia` | `100` | Strength of each of the title's condition effects, in percent. |
 | `wheel_ffb_rumble` | `50` | Strength of the title's rumble, played as a vibration. |
@@ -96,8 +99,9 @@ gate held the wheel is in neutral.
 | `wheel_log_inputs` | `false` | Log raw axis, button and hat changes, to find input numbers. |
 
 Effect updates are rate-limited (constant force 10 ms, conditions 40 ms, keeping
-the latest value) and effects a wheel stops are restarted. The force's sign follows
-DirectInput's convention.
+the latest value) and effects a wheel stops are restarted. The steering force is
+shaped in this order: steering weight, centre curve, minimum force, strength, then
+the jolt limiter. The force's sign follows DirectInput's convention.
 
 ## Tests
 

@@ -139,10 +139,23 @@ struct WheelEffectScale {
   int min_force_percent = 0;
   // Condition effects only: a further scale on their coefficients (the spring's, the damper's).
   int condition_percent = 100;
+  // Constant force only: the title's steering force, before the centre curve (0..200).
+  int constant_percent = 100;
+  // Constant force only: CentreCurve's lift of small forces (0..100).
+  int centre_percent = 0;
 };
 
-// SDL's constant-force level for a constant effect: magnitude x gain x strength, reversed by
-// invert.
+// Lifts small forces on y = x * (1 + g * (1 - x)^2), g = 3 x centre / 100 (g <= 3 keeps it
+// monotonic), so the wheel's centre is not empty; full scale stays full scale.
+int16_t CentreCurve(int16_t level, int centre_percent);
+
+// Moves from `previous` toward `target` by at most 32767 x (100 - jolt x 4/5) / 100 per update,
+// so a single jump (a gear change, a landing) is spread over a few updates. Not a low-pass: steps
+// below that pass untouched. 0 is off.
+int16_t LimitForceStep(int16_t target, int16_t previous, int jolt_percent);
+
+// SDL's constant-force level for a constant effect: magnitude x gain x steering weight, through
+// the centre curve and the minimum force, x strength, reversed by invert.
 int16_t EffectConstantLevel(const xinputd_ffb::Effect& effect, const WheelEffectScale& scale);
 
 struct WheelCondition {
