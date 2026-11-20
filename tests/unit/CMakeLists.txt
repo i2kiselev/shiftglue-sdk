@@ -32,6 +32,7 @@ add_executable(unit_tests
     input/fm4_mnk_bind_test.cpp
     input/xinputd_ffb_test.cpp
     input/haptic_backoff_test.cpp
+    input/joystick_probe_test.cpp
     input/rumble_sender_test.cpp
     input/mnk_inactive_keys_test.cpp
     input/mnk_hold_look_test.cpp
@@ -101,6 +102,9 @@ target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/graphics/flags.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
     ${PROJECT_SOURCE_DIR}/src/graphics/pipeline/texture/cache.cpp
+    # Built in, so the probe and the test's virtual joystick share the test's SDL copy (the
+    # runtime DLL has its own).
+    ${PROJECT_SOURCE_DIR}/src/input/sdl/joystick_probe.cpp
 )
 
 if(APPLE)

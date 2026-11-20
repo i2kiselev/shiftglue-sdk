@@ -111,6 +111,16 @@ steering force is shaped in this order: steering weight, centre curve, minimum
 force, strength, then the jolt limiter. The force's sign follows DirectInput's
 convention.
 
+## Joystick probe
+
+`rex::input::sdl::RunJoystickProbe` (`rex/input/sdl/joystick_probe.h`) streams the
+connected joysticks as JSON lines for a launcher's wheel set-up: a `device` line per
+joystick (id, name, path, USB IDs, whether it is a wheel, each axis's resting value,
+button and hat counts), `{"ready":true}` after the first enumeration, a `state` line
+whenever its axes, buttons or hats change (every 33 ms at most) and `removed` when it
+is unplugged. A title exposes it as a tool mode that runs until its standard input
+closes.
+
 ## Tests
 
 `unit_tests` covers the descriptor decoding (`[xinputd_ffb]`) and the wheel
