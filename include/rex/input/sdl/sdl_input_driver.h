@@ -153,8 +153,8 @@ class SDLInputDriver final : public InputDriver,
 
   // The binding cvars, parsed again only when their text changes.
   struct WheelBindings {
-    std::string throttle_text, brake_text, clutch_text, buttons_text;
-    std::optional<WheelAxisBinding> throttle, brake, clutch;
+    std::string throttle_text, brake_text, clutch_text, handbrake_text, buttons_text;
+    std::optional<WheelAxisBinding> throttle, brake, clutch, handbrake;
     std::vector<WheelButtonBinding> buttons;
   };
 

@@ -389,3 +389,9 @@ TEST_CASE("Steering weight and centre apply before strength", "[input][wheel][ff
   s.constant_percent = 0;
   CHECK(EffectConstantLevel(e, s) == 0);
 }
+
+TEST_CASE("Pedals reach a stick axis from 0 up", "[input][wheel]") {
+  CHECK(StickFromPedal(0) == 0);
+  CHECK(StickFromPedal(128) == 16447);
+  CHECK(StickFromPedal(255) == 32767);
+}

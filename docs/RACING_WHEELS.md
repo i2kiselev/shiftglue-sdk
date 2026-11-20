@@ -54,6 +54,8 @@ gate held the wheel is in neutral.
   left trigger.
 - The clutch pedal on the right stick's vertical axis, where Forza Horizon's wheel
   layouts read an analog clutch (`wheel_clutch_button` can also press a button).
+- An analog handbrake (`wheel_handbrake`) on the left stick's vertical axis, where
+  Forza Motorsport 4's wheel layouts read it.
 - Capabilities of an XInput wheel with the force feedback flag; with
   `wheel_900_degree`, the 900-degree flag (left stick X of 900), so Forza Horizon
   uses its linear 900-degree steering instead of the pad's reduction at speed. The
@@ -74,10 +76,10 @@ gate held the wheel is in neutral.
 | `wheel_steering_scale` | `100` | Steering sensitivity in percent; 200 reaches full lock at half the wheel's rotation. |
 | `wheel_steering_deadzone` | `0` | Steering dead zone in percent of half travel. |
 | `wheel_900_degree` | `true` | Report the 900-degree flag. |
-| `wheel_throttle`, `wheel_brake`, `wheel_clutch` | `""` | Pedal axes, `[device|][+|-]axisN`. |
+| `wheel_throttle`, `wheel_brake`, `wheel_clutch`, `wheel_handbrake` | `""` | Pedal and handbrake axes, `[device|][+|-]axisN`. |
 | `wheel_clutch_button` | `""` | Pad button the clutch pedal also presses past half travel. |
 | `wheel_pedal_deadzone` | `3` | Pedal dead zone at rest, in percent, for pedals without their own. |
-| `wheel_throttle_deadzone_bottom` / `_top` (also `brake`, `clutch`) | `-1` / `0` | Per-pedal dead zones: at rest (`-1` uses `wheel_pedal_deadzone`) and at full travel (past it reads fully pressed). |
+| `wheel_throttle_deadzone_bottom` / `_top` (also `brake`, `clutch`, `handbrake`) | `-1` / `0` | Per-pedal dead zones: at rest (`-1` uses `wheel_pedal_deadzone`) and at full travel (past it reads fully pressed). |
 | `wheel_buttons` | the hat as the D-pad | Button bindings, as above. |
 | `wheel_hide_gamepads` | `true` | While a wheel is connected, hide other gamepads so none takes player one. |
 | `wheel_ffb_device` | `""` | Device that receives force feedback; empty for the steering device. |

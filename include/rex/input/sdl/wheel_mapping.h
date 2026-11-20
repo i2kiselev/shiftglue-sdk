@@ -92,6 +92,10 @@ uint8_t PedalFromAxis(int16_t raw, AxisDirection direction, int deadzone_percent
 // pedal out), and what lies between is spread over 0..255.
 uint8_t PedalFromAxis(int16_t raw, AxisDirection direction, int bottom_percent, int top_percent);
 
+// A pedal value (0..255) on a stick axis, 0 at rest and 32767 fully pressed: the clutch on the
+// right stick's vertical axis, the handbrake on the left's.
+int16_t StickFromPedal(uint8_t pedal);
+
 // Pad buttons for an SDL hat value (SDL_HAT_UP = 1, RIGHT = 2, DOWN = 4,
 // LEFT = 8).
 uint16_t DpadFromHat(uint8_t hat);

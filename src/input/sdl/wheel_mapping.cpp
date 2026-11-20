@@ -359,6 +359,10 @@ uint8_t PedalFromAxis(int16_t raw, AxisDirection direction, int deadzone_percent
   return static_cast<uint8_t>(std::clamp(value, 0, 255));
 }
 
+int16_t StickFromPedal(uint8_t pedal) {
+  return static_cast<int16_t>(int32_t(pedal) * 32767 / 255);
+}
+
 uint16_t DpadFromHat(uint8_t hat) {
   uint16_t buttons = 0;
   if (hat & 0x01)

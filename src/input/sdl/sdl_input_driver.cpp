@@ -84,6 +84,10 @@ REXCVAR_DEFINE_STRING(wheel_clutch, "", "Input",
                       "Clutch axis, as wheel_throttle. A wheel's clutch is analog on the right "
                       "stick's vertical axis, where FH1's wheel layouts read it")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(wheel_handbrake, "", "Input",
+                      "Handbrake axis, as wheel_throttle: analog on the left stick's vertical "
+                      "axis, where FM4's wheel layouts read it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_STRING(wheel_clutch_button, "", "Input",
                       "Pad button the clutch pedal also presses past half travel; empty for none. "
                       "In FH1's wheel layout 1 LB shifts down, so leave it empty there")
@@ -105,6 +109,7 @@ REXCVAR_DEFINE_INT32(wheel_pedal_deadzone, 3, "Input", "Pedal deadzone in percen
 REX_WHEEL_PEDAL_DEADZONES(throttle, "Throttle")
 REX_WHEEL_PEDAL_DEADZONES(brake, "Brake")
 REX_WHEEL_PEDAL_DEADZONES(clutch, "Clutch")
+REX_WHEEL_PEDAL_DEADZONES(handbrake, "Handbrake")
 #undef REX_WHEEL_PEDAL_DEADZONES
 REXCVAR_DEFINE_STRING(wheel_buttons, "UP=h0.up,DOWN=h0.down,LEFT=h0.left,RIGHT=h0.right", "Input",
                       "Wheel buttons as pad controls: \"NAME=[device|]N\" pairs separated by "
@@ -1362,7 +1367,7 @@ bool SDLInputDriver::IsWheelPart(SDL_JoystickID instance_id) {
   }
   const auto& b = wheel_bindings_;
   if ((b.throttle && names(b.throttle->device)) || (b.brake && names(b.brake->device)) ||
-      (b.clutch && names(b.clutch->device))) {
+      (b.clutch && names(b.clutch->device)) || (b.handbrake && names(b.handbrake->device))) {
     return true;
   }
   return std::any_of(b.buttons.begin(), b.buttons.end(),
@@ -1457,8 +1462,9 @@ void SDLInputDriver::OnJoystickAddedLocked(const SDL_Event& event) {
               wheel_joysticks_.back().name, static_cast<uint64_t>(wheel_->id));
   if (REXCVAR_GET(wheel_throttle).empty() || REXCVAR_GET(wheel_brake).empty()) {
     REXLOG_INFO(
-        "SDL wheel: set wheel_throttle and wheel_brake (and wheel_clutch, wheel_buttons) for the "
-        "pedals and buttons; wheel_log_inputs prints the numbers as you press them.");
+        "SDL wheel: set wheel_throttle and wheel_brake (and wheel_clutch, wheel_handbrake, "
+        "wheel_buttons) for the pedals and buttons; wheel_log_inputs prints the numbers as you "
+        "press them.");
   }
 }
 
@@ -1628,6 +1634,11 @@ void SDLInputDriver::RefreshWheelBindingsLocked() {
     b.clutch_text = clutch;
     b.clutch = ParseWheelAxisBinding(clutch);
   }
+  const std::string& handbrake = REXCVAR_GET(wheel_handbrake);
+  if (handbrake != b.handbrake_text) {
+    b.handbrake_text = handbrake;
+    b.handbrake = ParseWheelAxisBinding(handbrake);
+  }
   const std::string& buttons = REXCVAR_GET(wheel_buttons);
   if (buttons != b.buttons_text) {
     b.buttons_text = buttons;
@@ -1710,7 +1721,10 @@ void SDLInputDriver::ReadWheelStateLocked() {
   // pinyon-shift PR #605).
   const uint8_t clutch = ReadWheelPedalLocked(b.clutch, REXCVAR_GET(wheel_clutch_deadzone_bottom),
                                               REXCVAR_GET(wheel_clutch_deadzone_top));
-  pad.thumb_ry = static_cast<int16_t>(int32_t(clutch) * 32767 / 255);
+  pad.thumb_ry = StickFromPedal(clutch);
+  pad.thumb_ly =
+      StickFromPedal(ReadWheelPedalLocked(b.handbrake, REXCVAR_GET(wheel_handbrake_deadzone_bottom),
+                                          REXCVAR_GET(wheel_handbrake_deadzone_top)));
   if (clutch >= 128) {
     buttons |= PadChordButtons(REXCVAR_GET(wheel_clutch_button));
   }
