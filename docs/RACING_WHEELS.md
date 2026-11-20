@@ -99,9 +99,15 @@ gate held the wheel is in neutral.
 | `wheel_log_inputs` | `false` | Log raw axis, button and hat changes, to find input numbers. |
 
 Effect updates are rate-limited (constant force 10 ms, conditions 40 ms, keeping
-the latest value) and effects a wheel stops are restarted. The steering force is
-shaped in this order: steering weight, centre curve, minimum force, strength, then
-the jolt limiter. The force's sign follows DirectInput's convention.
+the latest value), each update starts the effect again (Thrustmaster's driver stops
+an effect that keeps being updated otherwise), and effects a wheel stops are
+restarted. When the wheel refuses a call, nothing is sent and its force feedback is
+opened again every 2 seconds; after 5 failed reopens it is left alone until it is
+plugged in again. A host can hold the title's forces outside driving
+(`xinputd_ffb::SetForcesHeld`): the effects stop and play again once released. The
+steering force is shaped in this order: steering weight, centre curve, minimum
+force, strength, then the jolt limiter. The force's sign follows DirectInput's
+convention.
 
 ## Tests
 

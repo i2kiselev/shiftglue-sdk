@@ -75,3 +75,10 @@ TEST_CASE("XInputdFF effect types follow the HID PID ordinals", "[input][xinputd
 TEST_CASE("XInputdFF has no driver until one registers", "[input][xinputd_ffb]") {
   CHECK(ffb::GetSink() == nullptr);
 }
+
+TEST_CASE("Forces can be held by the host", "[input][ffb]") {
+  CHECK_FALSE(ffb::ForcesHeld());
+  ffb::SetForcesHeld(true);
+  CHECK(ffb::ForcesHeld());
+  ffb::SetForcesHeld(false);
+}

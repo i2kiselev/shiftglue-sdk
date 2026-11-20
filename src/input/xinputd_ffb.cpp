@@ -7,6 +7,7 @@
 
 #include <rex/input/xinputd_ffb.h>
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -18,6 +19,7 @@ namespace {
 
 std::shared_mutex g_sink_mutex;
 Sink* g_sink = nullptr;
+std::atomic<bool> g_forces_held{false};
 
 uint32_t LoadBE32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
@@ -110,6 +112,14 @@ Sink* GetSink() {
 void WithSink(const std::function<void(Sink*)>& fn) {
   std::shared_lock lock(g_sink_mutex);
   fn(g_sink);
+}
+
+void SetForcesHeld(bool held) {
+  g_forces_held.store(held, std::memory_order_relaxed);
+}
+
+bool ForcesHeld() {
+  return g_forces_held.load(std::memory_order_relaxed);
 }
 
 }  // namespace rex::input::xinputd_ffb

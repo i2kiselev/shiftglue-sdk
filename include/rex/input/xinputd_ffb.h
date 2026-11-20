@@ -99,4 +99,9 @@ Sink* GetSink();
 // fn must not call SetSink.
 void WithSink(const std::function<void(Sink*)>& fn);
 
+// The host holds the title's forces (outside driving: menus, pause): the wheel driver stops its
+// effects while held and plays them again once released.
+void SetForcesHeld(bool held);
+bool ForcesHeld();
+
 }  // namespace rex::input::xinputd_ffb

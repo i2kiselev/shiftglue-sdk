@@ -1401,6 +1401,8 @@ void SDLInputDriver::OnJoystickAddedLocked(const SDL_Event& event) {
   if (wheel_) {
     // A separate force feedback device can arrive after the steering base.
     if (!wheel_->haptic && IsFfbTarget(wheel_joysticks_.back())) {
+      wheel_->backoff.Reset();
+      wheel_->haptic_lost = 0;
       OpenWheelHapticLocked(*wheel_, wheel_joysticks_.back());
       SyncGameEffectsLocked();
     }
@@ -1574,6 +1576,41 @@ void SDLInputDriver::CloseWheelLocked() {
   wheel_.reset();
 }
 
+void SDLInputDriver::NoteHapticFailureLocked() {
+  HapticBackoff& backoff = wheel_->backoff;
+  const bool was_failing = backoff.Failing();
+  backoff.OnFailure(SDL_GetTicks());
+  if (backoff.GaveUp()) {
+    REXLOG_WARN("SDL wheel: the wheel keeps refusing forces; unplug it and plug it in again.");
+    // Effects it still plays would keep their last force until the replug.
+    CloseWheelHapticLocked(*wheel_);
+    wheel_->haptic_lost = 0;
+  } else if (!was_failing) {
+    REXLOG_INFO("SDL wheel: the wheel refused a force ({}); trying again in 2 seconds.",
+                SDL_GetError());
+  }
+}
+
+void SDLInputDriver::ReopenWheelHapticLocked() {
+  WheelState& wheel = *wheel_;
+  const SDL_JoystickID source = wheel.haptic ? wheel.haptic_source : wheel.haptic_lost;
+  CloseWheelHapticLocked(wheel);
+  wheel.backoff.NoteReopened(SDL_GetTicks());
+  for (const auto& joystick : wheel_joysticks_) {
+    if (joystick.instance_id == source) {
+      OpenWheelHapticLocked(wheel, joystick);
+      break;
+    }
+  }
+  if (!wheel.haptic) {
+    wheel.haptic_lost = source;
+    NoteHapticFailureLocked();
+    return;
+  }
+  wheel.haptic_lost = 0;
+  SyncGameEffectsLocked();
+}
+
 void SDLInputDriver::RefreshWheelBindingsLocked() {
   auto& b = wheel_bindings_;
   const std::string& throttle = REXCVAR_GET(wheel_throttle);
@@ -1628,6 +1665,25 @@ void SDLInputDriver::RefreshWheelStateLocked() {
   if (!wheel_) {
     return;
   }
+  if ((wheel_->haptic || wheel_->haptic_lost) && wheel_->backoff.ShouldReopen(SDL_GetTicks())) {
+    ReopenWheelHapticLocked();
+  }
+  // The title polls from several threads many times between pumps, and the
+  // joysticks only change when SDL pumps: read them once per pump. The effect
+  // work below is time-gated and runs on every call, pump or not.
+  const uint64_t generation = pump_generation_.load(std::memory_order_relaxed);
+  if (generation != wheel_->refreshed_generation) {
+    wheel_->refreshed_generation = generation;
+    ReadWheelStateLocked();
+    if (REXCVAR_GET(wheel_log_inputs)) {
+      LogWheelInputsLocked();
+    }
+  }
+  UpdateWheelSpringLocked();
+  FlushGameEffectsLocked();
+}
+
+void SDLInputDriver::ReadWheelStateLocked() {
   RefreshWheelBindingsLocked();
   X_INPUT_GAMEPAD pad = {};
 
@@ -1703,11 +1759,6 @@ void SDLInputDriver::RefreshWheelStateLocked() {
     wheel_->state.gamepad = pad;
     wheel_->state_changed = true;
   }
-  UpdateWheelSpringLocked();
-  FlushGameEffectsLocked();
-  if (REXCVAR_GET(wheel_log_inputs)) {
-    LogWheelInputsLocked();
-  }
 }
 
 void SDLInputDriver::LogWheelInputsLocked() {
@@ -1750,7 +1801,7 @@ X_RESULT SDLInputDriver::SetWheelVibrationLocked(const X_INPUT_VIBRATION& vibrat
   // Once the title drives the wheel with its own effects (XInputdFF), its
   // motor values are rumble and arrive through SetRumble; turning them into a
   // constant force as well would fight the title's.
-  if (!game_effects_.empty() && GameEffectsEnabled()) {
+  if ((!game_effects_.empty() && GameEffectsEnabled()) || wheel.backoff.Failing()) {
     return X_ERROR_SUCCESS;
   }
 
@@ -1792,15 +1843,18 @@ X_RESULT SDLInputDriver::SetWheelVibrationLocked(const X_INPUT_VIBRATION& vibrat
       wheel.haptic_features &= ~uint32_t(SDL_HAPTIC_CONSTANT);
       return X_ERROR_FUNCTION_FAILED;
     }
-    SDL_RunHapticEffect(wheel.haptic, wheel.constant_effect, 1);
-  } else {
-    if (!SDL_UpdateHapticEffect(wheel.haptic, wheel.constant_effect, &effect)) {
+    if (!SDL_RunHapticEffect(wheel.haptic, wheel.constant_effect, 1)) {
+      NoteHapticFailureLocked();
       return X_ERROR_FUNCTION_FAILED;
     }
-    if (wheel.last_force == 0) {
-      SDL_RunHapticEffect(wheel.haptic, wheel.constant_effect, 1);
+  } else {
+    if (!SDL_UpdateHapticEffect(wheel.haptic, wheel.constant_effect, &effect) ||
+        (wheel.last_force == 0 && !SDL_RunHapticEffect(wheel.haptic, wheel.constant_effect, 1))) {
+      NoteHapticFailureLocked();
+      return X_ERROR_FUNCTION_FAILED;
     }
   }
+  wheel.backoff.OnSuccess();
   if (level == 0) {
     SDL_StopHapticEffect(wheel.haptic, wheel.constant_effect);
   }
@@ -1823,7 +1877,7 @@ void SDLInputDriver::UpdateWheelSpringLocked() {
     applied_condition_gains_ = condition_gains;
     SyncGameEffectsLocked();
   }
-  if (!wheel.haptic || !(wheel.haptic_features & SDL_HAPTIC_SPRING)) {
+  if (!wheel.haptic || !(wheel.haptic_features & SDL_HAPTIC_SPRING) || wheel.backoff.Failing()) {
     return;
   }
   const int percent = std::clamp(REXCVAR_GET(wheel_ffb_centering), 0, 100);
@@ -1855,10 +1909,15 @@ void SDLInputDriver::UpdateWheelSpringLocked() {
       wheel.haptic_features &= ~uint32_t(SDL_HAPTIC_SPRING);
       return;
     }
-  } else {
-    SDL_UpdateHapticEffect(wheel.haptic, wheel.spring_effect, &effect);
+  } else if (!SDL_UpdateHapticEffect(wheel.haptic, wheel.spring_effect, &effect)) {
+    NoteHapticFailureLocked();
+    return;
   }
-  SDL_RunHapticEffect(wheel.haptic, wheel.spring_effect, 1);
+  if (!SDL_RunHapticEffect(wheel.haptic, wheel.spring_effect, 1)) {
+    NoteHapticFailureLocked();
+    return;
+  }
+  wheel.backoff.OnSuccess();
 }
 
 // ---------------------------------------------------------------------------
@@ -2038,6 +2097,14 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
     StopGameEffectLocked(game);
     return;
   }
+  // Waiting for the haptic device's reopen, or held outside driving: sent again once that ends.
+  if (wheel_->backoff.Failing() || xinputd_ffb::ForcesHeld()) {
+    if (!wheel_->backoff.Failing()) {
+      StopGameEffectLocked(game);
+    }
+    game.dirty = true;
+    return;
+  }
   SDL_Haptic* haptic = wheel_->haptic;
   const xinputd_ffb::Effect& e = game.effect;
   const uint16_t sdl_type = SdlEffectType(e.type);
@@ -2051,6 +2118,7 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
   }
   WheelEffectScale scale = EffectScaleLocked();
   bool limited = false;
+  bool updated = false;
   SDL_HapticEffect effect;
   SDL_zero(effect);
   if (e.type == xinputd_ffb::kConstant) {
@@ -2104,7 +2172,11 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
     }
     game.sdl_running = false;
   } else if (!SDL_UpdateHapticEffect(haptic, game.sdl_id, &effect)) {
+    game.dirty = true;
+    NoteHapticFailureLocked();
     return;
+  } else {
+    updated = true;
   }
   // A limited jump goes on in steps at the next flushes until it reaches the title's force.
   game.dirty = limited;
@@ -2113,15 +2185,35 @@ void SDLInputDriver::ApplyGameEffectLocked(GameEffect& game) {
   if (e.type == xinputd_ffb::kConstant) {
     game.last_level = effect.constant.level;
   }
-  if (game.running && !game.sdl_running) {
+  // Thrustmaster's driver stops an effect that keeps being updated unless it is started again
+  // after each update, as DirectInput's DIEP_START does.
+  if (game.running && (!game.sdl_running || updated)) {
     game.sdl_running = SDL_RunHapticEffect(haptic, game.sdl_id, 1);
+    if (!game.sdl_running) {
+      game.dirty = true;
+      NoteHapticFailureLocked();
+      return;
+    }
   } else if (!game.running && game.sdl_running) {
     StopGameEffectLocked(game);
   }
+  wheel_->backoff.OnSuccess();
 }
 
 void SDLInputDriver::FlushGameEffectsLocked() {
   if (!wheel_ || !wheel_->haptic || game_effects_.empty()) {
+    return;
+  }
+  if (wheel_->backoff.Failing()) {
+    return;
+  }
+  if (xinputd_ffb::ForcesHeld()) {
+    for (auto& [id, game] : game_effects_) {
+      if (game.sdl_running) {
+        StopGameEffectLocked(game);
+        game.dirty = true;
+      }
+    }
     return;
   }
   const uint64_t now = SDL_GetTicks();
@@ -2244,7 +2336,7 @@ void SDLInputDriver::UpdateEffect(const xinputd_ffb::Effect& effect, uint32_t) {
   // second while still reporting it playing; FH1 retunes its spring's gain
   // with speed, up to 30 times a second. Conditions change only by a felt step.
   if (effect.type != xinputd_ffb::kConstant && game.sdl_id >= 0 &&
-      ConditionClose(effect, game.sent)) {
+      !(game.running && !game.sdl_running) && ConditionClose(effect, game.sent)) {
     game.dirty = false;
     return;
   }
@@ -2423,6 +2515,7 @@ void SDLInputDriver::QueueControllerUpdate() {
     sdl_pumpevents_last_ns_.store(now, std::memory_order_relaxed);
     attached_window_->app_context().CallInUIThread([this]() {
       SDL_PumpEvents();
+      pump_generation_.fetch_add(1, std::memory_order_relaxed);
       sdl_pumpevents_queued_ = false;
     });
   }

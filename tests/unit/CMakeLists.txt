@@ -31,6 +31,7 @@ add_executable(unit_tests
     input/dualsense_test.cpp
     input/fm4_mnk_bind_test.cpp
     input/xinputd_ffb_test.cpp
+    input/haptic_backoff_test.cpp
     input/rumble_sender_test.cpp
     input/mnk_inactive_keys_test.cpp
     input/mnk_hold_look_test.cpp

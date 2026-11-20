@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/sdl/haptic_backoff.h>
 #include <rex/input/sdl/rumble_sender.h>
 #include <rex/input/sdl/wheel_mapping.h>
 #include <rex/input/xinputd_ffb.h>
@@ -172,6 +173,10 @@ class SDLInputDriver final : public InputDriver,
     int16_t last_force = 0;
     int last_spring = 0;
     uint32_t haptic_features = 0;
+    HapticBackoff backoff;
+    // The force feedback device a failed reopen lost, to try again.
+    SDL_JoystickID haptic_lost = 0;
+    uint64_t refreshed_generation = UINT64_MAX;  // pump_generation_ at the last refresh
     // The guest's last motor values, for wheel_log_inputs.
     uint16_t logged_left = 0;
     uint16_t logged_right = 0;
@@ -213,6 +218,10 @@ class SDLInputDriver final : public InputDriver,
   void CloseWheelHapticLocked(WheelState& wheel);
   bool IsFfbTarget(const WheelJoystick& joystick) const;
   void CloseWheelLocked();
+  void NoteHapticFailureLocked();
+  // The joysticks into the wheel's pad state; once per SDL pump.
+  void ReadWheelStateLocked();
+  void ReopenWheelHapticLocked();
   void RefreshWheelBindingsLocked();
   void RefreshWheelStateLocked();
   void LogWheelInputsLocked();
@@ -269,6 +278,7 @@ class SDLInputDriver final : public InputDriver,
   std::atomic<bool> sdl_pumpevents_queued_;
   // steady_clock nanoseconds of the last queued pump (QueueControllerUpdate).
   std::atomic<int64_t> sdl_pumpevents_last_ns_{0};
+  std::atomic<uint64_t> pump_generation_{0};
   // Appended in connection order, never re-sorted, and unbounded: the
   // assignment decides how many the guest sees.
   std::vector<ControllerState> controllers_;
