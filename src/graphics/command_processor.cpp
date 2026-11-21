@@ -47,6 +47,7 @@
 #include <rex/system/d3d_census.h>
 #include <rex/system/d3d_draw.h>
 #include <rex/system/d3d_program.h>
+#include <rex/system/flags.h>
 #include <rex/system/gpu_write_signal.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
@@ -88,6 +89,11 @@ REXCVAR_DEFINE_BOOL(gpu_record_thread, false, "GPU",
                     "thread while a second applies register writes and records draws "
                     "(backends that support it; Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(gpu_recorder_own_core, true, "GPU",
+                    "Windows: run the GPU recorder alone on one physical core and keep the "
+                    "process's other threads off it (fewer slow frames on CPUs with SMT)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(bool, latency_critical_thread_placement);
 REXCVAR_DEFINE_BOOL(gpu_record_elide_unchanged_registers, true, "GPU",
                     "With gpu_record_thread, the decoder drops register writes that leave a "
                     "plain state register or shader constant unchanged, so the recorder neither "
@@ -628,6 +634,17 @@ void CommandProcessor::StopRecordThread() {
 
 void CommandProcessor::RecordThreadMain() {
   if (session_probe::Enabled()) session_probe::SetHostRole(4);
+  if (REXCVAR_GET(gpu_recorder_own_core)) {
+    // Threads placed by the title keep their own CPU sets or hard masks, which
+    // a process default would not move.
+    if (REXCVAR_GET(latency_critical_thread_placement)) {
+      REXGPU_INFO("GPU recorder: no core of its own: latency_critical_thread_placement is on");
+    } else if (!REXCVAR_GET(ignore_thread_affinities)) {
+      REXGPU_INFO("GPU recorder: no core of its own: ignore_thread_affinities is off");
+    } else {
+      rex::thread::ReserveCoreForCurrentThread();
+    }
+  }
   // The thread's CPU time is a system call (GetThreadTimes cost 2 % of the
   // recorder when read around every batch), and it does not advance while the
   // thread waits, so read it before waiting and at most once a millisecond.

@@ -15,6 +15,7 @@ add_executable(unit_tests
     core/stream_test.cpp
     core/chrono_test.cpp
     core/threading_wait_test.cpp
+    core/reserved_core_test.cpp
     codegen/resume_entry_test.cpp
     codegen/resume_template_test.cpp
     ppc/import_function_test.cpp

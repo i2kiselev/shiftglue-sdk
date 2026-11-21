@@ -537,6 +537,10 @@ uint64_t GuestCpuAffinityMask(uint8_t) {
   return 0;
 }
 
+bool ReserveCoreForCurrentThread() {
+  return false;
+}
+
 #if !defined(__APPLE__)
 namespace {
 // The cores whose capacity (the kernel's relative performance, 1024 for the

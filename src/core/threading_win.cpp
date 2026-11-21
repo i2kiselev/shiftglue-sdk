@@ -8,6 +8,7 @@
  */
 
 #include <rex/platform.h>
+#include <rex/reserved_core.h>
 #include <rex/thread.h>
 
 static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
@@ -16,6 +17,7 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include <algorithm>
 #include <bit>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -584,6 +586,87 @@ const std::vector<ULONG>& PerformanceCpuSetIds() {
 uint64_t GuestCpuAffinityMask(uint8_t guest_cpu) {
   const std::vector<HostCore>& cores = HostCores();
   return cores.empty() ? 0 : cores[guest_cpu % cores.size()].mask;
+}
+
+bool ReserveCoreForCurrentThread() {
+  HANDLE process = GetCurrentProcess();
+  HANDLE thread = GetCurrentThread();
+
+  std::map<std::pair<WORD, BYTE>, uint64_t> l3_bytes;
+  DWORD cache_length = 0;
+  GetLogicalProcessorInformationEx(RelationCache, nullptr, &cache_length);
+  std::vector<uint8_t> cache_buffer(cache_length);
+  if (cache_length &&
+      GetLogicalProcessorInformationEx(
+          RelationCache,
+          reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(cache_buffer.data()),
+          &cache_length)) {
+    for (DWORD offset = 0; offset < cache_length;) {
+      auto* entry = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+          cache_buffer.data() + offset);
+      const CACHE_RELATIONSHIP& cache = entry->Cache;
+      if (cache.Level == 3) {
+        const WORD masks = cache.GroupCount ? cache.GroupCount : 1;
+        for (WORD i = 0; i < masks; ++i) {
+          const GROUP_AFFINITY& group = cache.GroupMasks[i];
+          for (BYTE logical = 0; logical < 64; ++logical) {
+            if ((uint64_t(group.Mask) >> logical) & 1) {
+              l3_bytes[{group.Group, logical}] = cache.CacheSize;
+            }
+          }
+        }
+      }
+      offset += entry->Size;
+    }
+  }
+
+  std::vector<CpuSetEntry> sets;
+  ULONG length = 0;
+  GetSystemCpuSetInformation(nullptr, 0, &length, process, 0);
+  std::vector<uint8_t> buffer(length);
+  if (length && GetSystemCpuSetInformation(
+                    reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()), length,
+                    &length, process, 0)) {
+    for (ULONG offset = 0; offset < length;) {
+      auto* entry = reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+      if (entry->Type == CpuSetInformation) {
+        const auto& set = entry->CpuSet;
+        const auto l3 = l3_bytes.find({set.Group, set.LogicalProcessorIndex});
+        sets.push_back({set.Id, set.Group, set.LogicalProcessorIndex, set.CoreIndex,
+                        set.LastLevelCacheIndex, set.EfficiencyClass,
+                        l3 == l3_bytes.end() ? 0 : l3->second});
+      }
+      offset += entry->Size;
+    }
+  }
+
+  GROUP_AFFINITY thread_group{};
+  GetThreadGroupAffinity(thread, &thread_group);
+  DWORD_PTR process_mask = 0, system_mask = 0;
+  GetProcessAffinityMask(process, &process_mask, &system_mask);
+
+  const CoreChoice choice = ChooseReservedCore(sets, thread_group.Group, process_mask);
+  if (!choice.reserved) {
+    spdlog::info("GPU recorder: no core of its own: {}", choice.skip_reason);
+    return false;
+  }
+
+  const std::vector<ULONG> others(choice.others.begin(), choice.others.end());
+  ULONG own = choice.own;
+  if (!SetProcessDefaultCpuSets(process, others.data(), ULONG(others.size())) ||
+      !SetThreadSelectedCpuSets(thread, &own, 1)) {
+    const DWORD error = GetLastError();
+    SetProcessDefaultCpuSets(process, nullptr, 0);
+    SetThreadSelectedCpuSets(thread, nullptr, 0);
+    spdlog::warn("GPU recorder: no core of its own: CPU set call failed (error {})", error);
+    return false;
+  }
+  spdlog::info(
+      "GPU recorder: own core {} (cpu set {}, efficiency class {}, cache {}, L3 {} MB), {} sets "
+      "for the other threads",
+      choice.core, choice.own, choice.efficiency, choice.cache, choice.l3_bytes / (1024 * 1024),
+      others.size());
+  return true;
 }
 
 class Win32Thread : public Win32Handle<Thread> {

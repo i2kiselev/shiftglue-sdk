@@ -100,6 +100,11 @@ void SetLogicalProcessorCountOverride(uint32_t count);
 // when the topology is unknown.
 uint64_t GuestCpuAffinityMask(uint8_t guest_cpu);
 
+// Windows: gives the calling thread one physical core of its own (CPU sets) and
+// keeps the process's other threads off it; logs the choice or why it skipped.
+// False when nothing was placed (always on POSIX).
+bool ReserveCoreForCurrentThread();
+
 // Enables the current process to set thread affinity.
 // Must be called at startup before attempting to set thread affinity.
 void EnableAffinityConfiguration();
