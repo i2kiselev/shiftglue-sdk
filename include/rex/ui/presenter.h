@@ -233,6 +233,8 @@ class Presenter {
       kFsr4,
       // NVIDIA DLSS Super Resolution through NGX (FSR 1 without it).
       kDlss,
+      // Apple MetalFX temporal scaling on MoltenVK (FSR 1 without it).
+      kMetalFx,
 #endif
     };
 
@@ -240,7 +242,8 @@ class Presenter {
     // The effects fed to a temporal upscaler provider.
     static constexpr bool IsTemporalEffect(Effect effect) {
       return effect == Effect::kFsr2 || effect == Effect::kFsr3 ||
-             effect == Effect::kFsr4 || effect == Effect::kDlss;
+             effect == Effect::kFsr4 || effect == Effect::kDlss ||
+             effect == Effect::kMetalFx;
     }
 #endif
 
