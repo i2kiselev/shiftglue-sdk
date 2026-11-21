@@ -416,7 +416,11 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
         const int loaded = LoadUserMappings(user_mappings);
         REXLOG_INFO("SDL: loaded {} user mappings.", loaded);
       }
-      xinputd_ffb::SetSink(this);
+      // The title's XInputdFF calls reach a wheel this driver reads (wheel_enabled). Without
+      // one the sink is left to the host, which may play them on a wheel of its own.
+      if (REXCVAR_GET(wheel_enabled)) {
+        xinputd_ffb::SetSink(this);
+      }
       REXLOG_INFO("SDL input driver initialized successfully");
     });
   }
